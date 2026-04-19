@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc\shm_reader_c.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc\shm_reader_c.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{5A54FB91-A301-3345-A1B2-50B69CE62219}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{50BE8CC5-1954-3A81-B355-473C8DDE0090}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

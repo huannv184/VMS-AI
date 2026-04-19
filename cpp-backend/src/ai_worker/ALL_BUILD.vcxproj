@@ -1,0 +1,225 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ResolveNugetPackages>false</ResolveNugetPackages>
+  </PropertyGroup>
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="MinSizeRel|x64">
+      <Configuration>MinSizeRel</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="RelWithDebInfo|x64">
+      <Configuration>RelWithDebInfo</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{C0D3FBAB-3DD1-3F7F-8630-DD0B038662F9}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <Platform>x64</Platform>
+    <ProjectName>ALL_BUILD</ProjectName>
+    <VCProjectUpgraderObjectName>NoUpgrade</VCProjectUpgraderObjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <_ProjectFileVersion>10.0.20506.1</_ProjectFileVersion>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Midl>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Midl>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
+    <Midl>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
+    <Midl>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\CMakeLists.txt">
+      <UseUtf8Encoding>Always</UseUtf8Encoding>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Building Custom Rule D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/buidC/ai2.1/AI-Camera-System/cpp-backend -BD:/buidC/ai2.1/AI-Camera-System/cpp-backend --check-stamp-file D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">C:\Program Files\CMake\share\cmake-3.31\Modules\CMakeFindDependencyMacro.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindCUDAToolkit.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindPackageMessage.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\cppzmq\cppzmqConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\cppzmq\cppzmqConfigVersion.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\nlohmann_json\nlohmann_jsonConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\nlohmann_json\nlohmann_jsonConfigVersion.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\opencv4\OpenCVConfig-version.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\opencv4\OpenCVConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\unofficial-sqlite3\unofficial-sqlite3-config.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\unofficial-sqlite3\unofficial-sqlite3-targets.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\zeromq\ZeroMQConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\zeromq\ZeroMQConfigVersion.cmake;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Building Custom Rule D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/buidC/ai2.1/AI-Camera-System/cpp-backend -BD:/buidC/ai2.1/AI-Camera-System/cpp-backend --check-stamp-file D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">C:\Program Files\CMake\share\cmake-3.31\Modules\CMakeFindDependencyMacro.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindCUDAToolkit.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindPackageMessage.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\cppzmq\cppzmqConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\cppzmq\cppzmqConfigVersion.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\nlohmann_json\nlohmann_jsonConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\nlohmann_json\nlohmann_jsonConfigVersion.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\opencv4\OpenCVConfig-version.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\opencv4\OpenCVConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\unofficial-sqlite3\unofficial-sqlite3-config.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\unofficial-sqlite3\unofficial-sqlite3-targets.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\zeromq\ZeroMQConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\zeromq\ZeroMQConfigVersion.cmake;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">Building Custom Rule D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/buidC/ai2.1/AI-Camera-System/cpp-backend -BD:/buidC/ai2.1/AI-Camera-System/cpp-backend --check-stamp-file D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">C:\Program Files\CMake\share\cmake-3.31\Modules\CMakeFindDependencyMacro.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindCUDAToolkit.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindPackageMessage.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\cppzmq\cppzmqConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\cppzmq\cppzmqConfigVersion.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\nlohmann_json\nlohmann_jsonConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\nlohmann_json\nlohmann_jsonConfigVersion.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\opencv4\OpenCVConfig-version.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\opencv4\OpenCVConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\unofficial-sqlite3\unofficial-sqlite3-config.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\unofficial-sqlite3\unofficial-sqlite3-targets.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\zeromq\ZeroMQConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\zeromq\ZeroMQConfigVersion.cmake;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">Building Custom Rule D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/buidC/ai2.1/AI-Camera-System/cpp-backend -BD:/buidC/ai2.1/AI-Camera-System/cpp-backend --check-stamp-file D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">C:\Program Files\CMake\share\cmake-3.31\Modules\CMakeFindDependencyMacro.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindCUDAToolkit.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-3.31\Modules\FindPackageMessage.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\cppzmq\cppzmqConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\cppzmq\cppzmqConfigVersion.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\nlohmann_json\nlohmann_jsonConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\nlohmann_json\nlohmann_jsonConfigVersion.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\opencv4\OpenCVConfig-version.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\opencv4\OpenCVConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\unofficial-sqlite3\unofficial-sqlite3-config.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\unofficial-sqlite3\unofficial-sqlite3-targets.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\zeromq\ZeroMQConfig.cmake;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\share\zeromq\ZeroMQConfigVersion.cmake;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">false</LinkObjects>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+  </ItemGroup>
+  <ItemGroup />
+  <ItemGroup>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\ZERO_CHECK.vcxproj">
+      <Project>{C1AD8FBF-4349-3D6C-98CF-72BBC4A56DB3}</Project>
+      <Name>ZERO_CHECK</Name>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\ai_worker_v2.vcxproj">
+      <Project>{89311E81-8BED-3930-A82D-275C24AECD6B}</Project>
+      <Name>ai_worker_v2</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\common\common.vcxproj">
+      <Project>{49C396A3-880D-327E-9FB1-0014AC89ACC1}</Project>
+      <Name>common</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\custom_model\custom_model.vcxproj">
+      <Project>{95C461B2-9571-36C6-A9F1-4B33E73E4D49}</Project>
+      <Name>custom_model</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\face_infer\face_infer.vcxproj">
+      <Project>{026E95EA-2B2F-3737-91F7-DB522608C8FD}</Project>
+      <Name>face_infer</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\inference.vcxproj">
+      <Project>{DB6350E8-FC5B-3D42-8177-6217820CA4E4}</Project>
+      <Name>inference</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\ipc\ipc.vcxproj">
+      <Project>{5D0C3358-973C-3C04-A3B9-1EBA94584A6A}</Project>
+      <Name>ipc</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\reid_infer.vcxproj">
+      <Project>{3F9590A6-167C-3636-BF95-6C43D5C93883}</Project>
+      <Name>reid_infer</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\ipc\shm_reader_c.vcxproj">
+      <Project>{9FBCB4AF-F8C7-3FD8-86C4-10D27EDDB018}</Project>
+      <Name>shm_reader_c</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\trt_engine\trt_engine.vcxproj">
+      <Project>{A9A95B9D-A99D-3EB5-88EA-A4C5431F3F74}</Project>
+      <Name>trt_engine</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\ipc\video_publisher.vcxproj">
+      <Project>{8E3E960B-D21D-3299-9F97-15A9E9D88348}</Project>
+      <Name>video_publisher</Name>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\yolo_infer\yolo_infer.vcxproj">
+      <Project>{446C23C8-1111-332E-8835-3B84745FA5BA}</Project>
+      <Name>yolo_infer</Name>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

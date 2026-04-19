@@ -1,0 +1,305 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+  </PropertyGroup>
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="MinSizeRel|x64">
+      <Configuration>MinSizeRel</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="RelWithDebInfo|x64">
+      <Configuration>RelWithDebInfo</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3F9590A6-167C-3636-BF95-6C43D5C93883}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <Platform>x64</Platform>
+    <ProjectName>reid_infer</ProjectName>
+    <VCProjectUpgraderObjectName>NoUpgrade</VCProjectUpgraderObjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <_ProjectFileVersion>10.0.20506.1</_ProjectFileVersion>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\Debug\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">reid_infer.dir\Debug\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">reid_infer</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">.lib</TargetExt>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\Release\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">reid_infer.dir\Release\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">reid_infer</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='Release|x64'">.lib</TargetExt>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\MinSizeRel\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">reid_infer.dir\MinSizeRel\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">reid_infer</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">.lib</TargetExt>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\RelWithDebInfo\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">reid_infer.dir\RelWithDebInfo\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">reid_infer</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">.lib</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "D:/buidC/ai2.1/AI-Camera-System/cpp-backend/vcpkg_installed/x64-windows/include/opencv4" /external:I "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/include"</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <InlineFunctionExpansion>Disabled</InlineFunctionExpansion>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <Optimization>Disabled</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;USE_TENSORRT;CMAKE_INTDIR="Debug"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <ScanSourceForModuleDependencies>false</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_DEBUG;_WINDOWS;USE_TENSORRT;CMAKE_INTDIR=\"Debug\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include\opencv4;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include\opencv4;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <Lib>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "D:/buidC/ai2.1/AI-Camera-System/cpp-backend/vcpkg_installed/x64-windows/include/opencv4" /external:I "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/include"</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <Optimization>MaxSpeed</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;USE_TENSORRT;CMAKE_INTDIR="Release"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <DebugInformationFormat>
+      </DebugInformationFormat>
+      <ScanSourceForModuleDependencies>false</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;USE_TENSORRT;CMAKE_INTDIR=\"Release\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include\opencv4;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include\opencv4;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <Lib>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "D:/buidC/ai2.1/AI-Camera-System/cpp-backend/vcpkg_installed/x64-windows/include/opencv4" /external:I "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/include"</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <Optimization>MinSpace</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;USE_TENSORRT;CMAKE_INTDIR="MinSizeRel"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <DebugInformationFormat>
+      </DebugInformationFormat>
+      <ScanSourceForModuleDependencies>false</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;USE_TENSORRT;CMAKE_INTDIR=\"MinSizeRel\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include\opencv4;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include\opencv4;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <Lib>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "D:/buidC/ai2.1/AI-Camera-System/cpp-backend/vcpkg_installed/x64-windows/include/opencv4" /external:I "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/include"</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <Optimization>MaxSpeed</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;USE_TENSORRT;CMAKE_INTDIR="RelWithDebInfo"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <ScanSourceForModuleDependencies>false</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;USE_TENSORRT;CMAKE_INTDIR=\"RelWithDebInfo\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include\opencv4;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>D:\buidC\ai2.1\AI-Camera-System\cpp-backend\.;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\video\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\third_party\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\common;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\synopsis;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\ipc;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\core_pipeline;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\custom_model;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\face_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\yolo_infer;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\inference\modules\trt_engine;\include;D:\tensorrt\TensorRT-10.14.1.48\include;D:\buidC\ai2.1\AI-Camera-System\cpp-backend\vcpkg_installed\x64-windows\include\opencv4;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <Lib>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer\CMakeLists.txt">
+      <UseUtf8Encoding>Always</UseUtf8Encoding>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Building Custom Rule D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai/inference/modules/reid_infer/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/buidC/ai2.1/AI-Camera-System/cpp-backend -BD:/buidC/ai2.1/AI-Camera-System/cpp-backend --check-stamp-file D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/inference/modules/reid_infer/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Building Custom Rule D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai/inference/modules/reid_infer/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/buidC/ai2.1/AI-Camera-System/cpp-backend -BD:/buidC/ai2.1/AI-Camera-System/cpp-backend --check-stamp-file D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/inference/modules/reid_infer/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">Building Custom Rule D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai/inference/modules/reid_infer/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/buidC/ai2.1/AI-Camera-System/cpp-backend -BD:/buidC/ai2.1/AI-Camera-System/cpp-backend --check-stamp-file D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/inference/modules/reid_infer/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">Building Custom Rule D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai/inference/modules/reid_infer/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/buidC/ai2.1/AI-Camera-System/cpp-backend -BD:/buidC/ai2.1/AI-Camera-System/cpp-backend --check-stamp-file D:/buidC/ai2.1/AI-Camera-System/cpp-backend/src/ai_worker/inference/modules/reid_infer/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\reid_infer\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">false</LinkObjects>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\reid_infer\reid_infer.cpp" />
+  </ItemGroup>
+  <ItemGroup />
+  <ItemGroup>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\ZERO_CHECK.vcxproj">
+      <Project>{C1AD8FBF-4349-3D6C-98CF-72BBC4A56DB3}</Project>
+      <Name>ZERO_CHECK</Name>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </ProjectReference>
+    <ProjectReference Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai_worker\inference\modules\trt_engine\trt_engine.vcxproj">
+      <Project>{A9A95B9D-A99D-3EB5-88EA-A4C5431F3F74}</Project>
+      <Name>trt_engine</Name>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

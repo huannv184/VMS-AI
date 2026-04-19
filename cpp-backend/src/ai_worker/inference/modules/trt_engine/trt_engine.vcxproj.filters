@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine\trt_engine.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\buidC\ai2.1\AI-Camera-System\cpp-backend\src\ai\inference\modules\trt_engine\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{50BE8CC5-1954-3A81-B355-473C8DDE0090}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
