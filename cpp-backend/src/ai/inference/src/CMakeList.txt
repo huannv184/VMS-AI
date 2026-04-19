@@ -1,0 +1,5 @@
+# Đã được link trong inference_core ở root
+target_include_directories(inference_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+

@@ -1,0 +1,14 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "default",
+      "description": "Default build configuration",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "${sourceDir}/vcpkg_installed/x64-windows"
+      },
+      "generator": "Visual Studio 17 2022"
+    }
+  ]
+}

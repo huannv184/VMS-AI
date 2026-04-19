@@ -1,0 +1,1318 @@
+#include "database/db_manager.h"
+#include "database/db_state.h"
+#include "utils/logger.h"
+#include <iostream>
+#include <filesystem>
+#include <vector>
+#include <chrono>
+#include <sstream>
+#include <nlohmann/json.hpp>
+
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QThread>
+#include <QVariant>
+#include <QString>
+
+#include <mutex>
+
+namespace vms {
+namespace database {
+
+// Global mutex to serialize access to QSqlDatabase's non-thread-safe connection registry
+static std::mutex g_db_conn_mutex;
+
+namespace {
+
+void removeDatabaseConnection(const char* connection_name) {
+    std::lock_guard<std::mutex> conn_lock(g_db_conn_mutex);
+    if (!QSqlDatabase::contains(connection_name)) {
+        return;
+    }
+
+    {
+        QSqlDatabase db = QSqlDatabase::database(connection_name, false);
+        if (db.isValid() && db.isOpen()) {
+            db.close();
+        }
+    }
+
+    QSqlDatabase::removeDatabase(connection_name);
+}
+
+} // namespace
+
+DbManager& DbManager::getInstance() {
+    static DbManager instance;
+    return instance;
+}
+
+DbManager::~DbManager() {
+    close();
+}
+
+QString DbManager::threadConnectionName() {
+    std::ostringstream oss;
+    oss << "vms_thread_" << std::this_thread::get_id();
+    return QString::fromStdString(oss.str());
+}
+
+bool DbManager::init(const Config::DatabaseConfig& config) {
+    db_ready.store(false, std::memory_order_release);
+
+    if (initialized_.load(std::memory_order_acquire)) {
+        LOG_WARN("Database already initialized");
+        db_ready.store(true, std::memory_order_release);
+        return true;
+    }
+
+    config_ = config;
+    removeDatabaseConnection(kPrimaryConnectionName);
+
+    bool initialization_failed = false;
+    bool open_failed = false;
+    std::string init_error;
+
+    {
+        QSqlDatabase primary;
+
+        {
+            std::lock_guard<std::mutex> conn_lock(g_db_conn_mutex);
+            if (config_.driver == "postgresql") {
+                primary = QSqlDatabase::addDatabase("QPSQL", kPrimaryConnectionName);
+                primary.setHostName(QString::fromStdString(config_.postgres.host));
+                primary.setPort(config_.postgres.port);
+                primary.setDatabaseName(QString::fromStdString(config_.postgres.database));
+                primary.setUserName(QString::fromStdString(config_.postgres.username));
+                primary.setPassword(QString::fromStdString(config_.postgres.password));
+                LOG_INFO("Connecting to PostgreSQL: {}@{}:{}/{}", 
+                         config_.postgres.username, config_.postgres.host, 
+                         config_.postgres.port, config_.postgres.database);
+            } else {
+                // Fallback to SQLite
+                std::filesystem::path db_path(config_.sqlite.path);
+                std::filesystem::path dir = db_path.parent_path();
+                if (!dir.empty() && !std::filesystem::exists(dir)) {
+                    std::filesystem::create_directories(dir);
+                }
+                primary = QSqlDatabase::addDatabase("QSQLITE", kPrimaryConnectionName);
+                primary.setDatabaseName(QString::fromStdString(config_.sqlite.path));
+                LOG_INFO("Connecting to SQLite: {}", config_.sqlite.path);
+            }
+
+            if (!primary.open()) {
+                open_failed = true;
+                initialization_failed = true;
+                init_error = primary.lastError().text().toStdString();
+            } else {
+                LOG_INFO("Primary database connection established successfully");
+
+                // SQLite-specific optimizations
+                if (config_.driver == "sqlite") {
+                     QSqlQuery wal_query(primary);
+                     wal_query.exec("PRAGMA journal_mode=WAL");
+                     QSqlQuery timeout_query(primary);
+                     timeout_query.exec(QString("PRAGMA busy_timeout=%1").arg(config_.sqlite.busy_timeout_ms));
+                }
+            }
+        }
+
+        if (!initialization_failed) {
+            try {
+                initializeTables(primary);
+            } catch (const std::exception& e) {
+                initialization_failed = true;
+                init_error = e.what();
+            }
+        }
+    }
+
+    if (initialization_failed) {
+        if (open_failed) {
+            LOG_ERROR("Can't open database ({}): {}", config_.driver, init_error);
+        } else {
+            LOG_ERROR("Exception during database initialization: {}", init_error);
+        }
+        removeDatabaseConnection(kPrimaryConnectionName);
+        db_ready.store(false, std::memory_order_release);
+        return false;
+    }
+
+    // Register primary connection
+    {
+        std::lock_guard<std::mutex> lock(connection_registry_mutex_);
+        registered_connections_.push_back(QString::fromLatin1(kPrimaryConnectionName));
+    }
+
+    initialized_.store(true, std::memory_order_release);
+    db_ready.store(true, std::memory_order_release);
+    startBatchWriter();
+    return true;
+}
+
+void DbManager::initializeTables(QSqlDatabase& primary) {
+    // =========================================================
+    // 1. CAMERAS
+    // =========================================================
+    const std::string sql_cameras = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS cameras (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            rtsp_url TEXT NOT NULL,
+            location TEXT,
+            description TEXT,
+            is_active INTEGER DEFAULT 1,
+            zmq_port INTEGER DEFAULT 0,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            ai_config TEXT DEFAULT '{"yolo":true,"face":true,"lpr":true,"fire":true}'
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS cameras (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            rtsp_url TEXT NOT NULL,
+            location TEXT,
+            description TEXT,
+            is_active INTEGER DEFAULT 1,
+            zmq_port INTEGER DEFAULT 0,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+            ai_config TEXT DEFAULT '{"yolo":true,"face":true,"lpr":true,"fire":true}'
+        );
+    )";
+    if (!executeOnConnection(primary, sql_cameras)) LOG_ERROR("Failed to create cameras table");
+
+    // Camera Migrations
+    safeAlterTable(primary, "ALTER TABLE cameras ADD COLUMN sub_stream_url TEXT DEFAULT ''", "sub_stream_url");
+    safeAlterTable(primary, "ALTER TABLE cameras ADD COLUMN zmq_port INTEGER DEFAULT 0", "zmq_port");
+    safeAlterTable(primary, "ALTER TABLE cameras ADD COLUMN ai_config TEXT DEFAULT '{\"yolo\":true,\"face\":true,\"lpr\":true,\"fire\":true}'", "ai_config");
+    safeAlterTable(primary, "ALTER TABLE cameras ADD COLUMN advanced_config TEXT", "advanced_config");
+
+    // =========================================================
+    // 2. ROIS
+    // =========================================================
+    const std::string sql_rois = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS rois (
+            id SERIAL PRIMARY KEY,
+            camera_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            roi_type TEXT NOT NULL,
+            points_json TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            CONSTRAINT fk_camera FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS rois (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            camera_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            roi_type TEXT NOT NULL,
+            points_json TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    )";
+    if (!executeOnConnection(primary, sql_rois)) LOG_ERROR("Failed to create rois table");
+
+    // =========================================================
+    // 3. EVENTS
+    // =========================================================
+    const std::string sql_events = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS events (
+            id TEXT PRIMARY KEY,
+            camera_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            title TEXT,
+            description TEXT,
+            severity TEXT,
+            snapshot_path TEXT,
+            image_path TEXT,
+            timestamp BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            metadata_json TEXT,
+            details_json TEXT,
+            is_read INTEGER DEFAULT 0,
+            video_path TEXT,
+            duration INTEGER DEFAULT 0,
+            CONSTRAINT fk_camera FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS events (
+            id TEXT PRIMARY KEY,
+            camera_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            title TEXT,
+            description TEXT,
+            severity TEXT,
+            snapshot_path TEXT,
+            image_path TEXT,
+            timestamp INTEGER DEFAULT (strftime('%s', 'now')),
+            metadata_json TEXT,
+            details_json TEXT,
+            is_read INTEGER DEFAULT 0,
+            FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    )";
+    if (!executeOnConnection(primary, sql_events)) LOG_ERROR("Failed to create events table");
+
+    // Event Migrations
+    safeAlterTable(primary, "ALTER TABLE events ADD COLUMN video_path TEXT", "video_path");
+    safeAlterTable(primary, "ALTER TABLE events ADD COLUMN duration INTEGER DEFAULT 0", "duration");
+    safeAlterTable(primary, "ALTER TABLE events ADD COLUMN title TEXT", "title");
+    safeAlterTable(primary, "ALTER TABLE events ADD COLUMN description TEXT", "description");
+    safeAlterTable(primary, "ALTER TABLE events ADD COLUMN snapshot_path TEXT", "snapshot_path");
+    safeAlterTable(primary, "ALTER TABLE events ADD COLUMN metadata_json TEXT", "metadata_json");
+
+    // =========================================================
+    // 4. PERSONS (Face Database)
+    // =========================================================
+    const std::string sql_persons = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS persons (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            embedding_blob BYTEA,
+            embedding_json TEXT,
+            face_image_path TEXT,
+            description TEXT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS persons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            embedding_blob BLOB,
+            embedding_json TEXT,
+            face_image_path TEXT,
+            description TEXT,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_persons)) LOG_ERROR("Failed to create persons table");
+
+    // Persons Migrations
+    safeAlterTable(primary, "ALTER TABLE persons ADD COLUMN description TEXT", "description");
+    safeAlterTable(primary, "ALTER TABLE persons ADD COLUMN embedding_json TEXT", "embedding_json");
+    safeAlterTable(primary, "ALTER TABLE persons ADD COLUMN face_image_path TEXT", "face_image_path");
+
+    // =========================================================
+    // 5. LICENSE PLATES
+    // =========================================================
+    const std::string sql_license_plates = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS license_plates (
+            id SERIAL PRIMARY KEY,
+            plate_number TEXT NOT NULL,
+            vehicle_type TEXT DEFAULT 'unknown',
+            color TEXT,
+            image_path TEXT,
+            camera_id INTEGER,
+            confidence REAL DEFAULT 0.0,
+            detected_at BIGINT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        )
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS license_plates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate_number TEXT NOT NULL,
+            vehicle_type TEXT DEFAULT 'unknown',
+            color TEXT,
+            image_path TEXT,
+            camera_id INTEGER,
+            confidence REAL DEFAULT 0.0,
+            detected_at INTEGER,
+            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+        )
+    )";
+    if (!executeOnConnection(primary, sql_license_plates)) LOG_ERROR("Failed to create license_plates table");
+
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_license_plates_number ON license_plates(plate_number)");
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_license_plates_detected_at ON license_plates(detected_at)");
+
+    // =========================================================
+    // 5.5. VEHICLES (Registered vehicles)
+    // =========================================================
+    const std::string sql_vehicles = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS vehicles (
+            id SERIAL PRIMARY KEY,
+            plate_number TEXT UNIQUE NOT NULL,
+            owner_name TEXT,
+            brand TEXT,
+            color TEXT,
+            vehicle_type TEXT,
+            description TEXT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS vehicles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate_number TEXT UNIQUE NOT NULL,
+            owner_name TEXT,
+            brand TEXT,
+            color TEXT,
+            vehicle_type TEXT,
+            description TEXT,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_vehicles)) LOG_ERROR("Failed to create vehicles table");
+
+    // =========================================================
+    // 5.7. TRAFFIC COUNTS (Phase 1 AI – vehicle counting)
+    // =========================================================
+    const std::string sql_traffic_counts = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS traffic_counts (
+            id           SERIAL PRIMARY KEY,
+            camera_id    INTEGER NOT NULL,
+            roi_id       INTEGER DEFAULT -1,
+            direction    TEXT    DEFAULT 'both',
+            vehicle_type TEXT    DEFAULT 'all',
+            count        INTEGER DEFAULT 0,
+            period_start BIGINT NOT NULL,
+            period_end   BIGINT NOT NULL,
+            created_at   BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            CONSTRAINT fk_camera FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS traffic_counts (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            camera_id    INTEGER NOT NULL,
+            roi_id       INTEGER DEFAULT -1,
+            direction    TEXT    DEFAULT 'both',
+            vehicle_type TEXT    DEFAULT 'all',
+            count        INTEGER DEFAULT 0,
+            period_start INTEGER NOT NULL,
+            period_end   INTEGER NOT NULL,
+            created_at   INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    )";
+    if (!executeOnConnection(primary, sql_traffic_counts)) LOG_ERROR("Failed to create traffic_counts table");
+
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_traffic_camera_time ON traffic_counts(camera_id, period_start)");
+
+    // =========================================================
+    // 5.8. AUDIT LOGS (Phase 4 Security & Control)
+    // =========================================================
+    const std::string sql_audit_logs = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_audit_logs)) LOG_ERROR("Failed to create audit_logs table");
+
+    // =========================================================
+    // 6. ROLES
+    // =========================================================
+    const std::string sql_roles = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS roles (
+            id SERIAL PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            permissions TEXT NOT NULL,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS roles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            permissions TEXT NOT NULL,
+            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_roles)) LOG_ERROR("Failed to create roles table");
+
+    if (config_.driver == "postgresql") {
+        executeOnConnection(primary, "INSERT INTO roles (name, permissions) VALUES ('admin', '[\"all\"]') ON CONFLICT (name) DO NOTHING");
+        executeOnConnection(primary, "INSERT INTO roles (name, permissions) VALUES ('operator', '[\"camera.view\", \"events.view\", \"events.manage\"]') ON CONFLICT (name) DO NOTHING");
+        executeOnConnection(primary, "INSERT INTO roles (name, permissions) VALUES ('viewer', '[\"camera.view\"]') ON CONFLICT (name) DO NOTHING");
+    } else {
+        executeOnConnection(primary, "INSERT OR IGNORE INTO roles (name, permissions) VALUES ('admin', '[\"all\"]')");
+        executeOnConnection(primary, "INSERT OR IGNORE INTO roles (name, permissions) VALUES ('operator', '[\"camera.view\", \"events.view\", \"events.manage\"]')");
+        executeOnConnection(primary, "INSERT OR IGNORE INTO roles (name, permissions) VALUES ('viewer', '[\"camera.view\"]')");
+    }
+
+    // =========================================================
+    // 7. USERS
+    // =========================================================
+    const std::string sql_users = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role_id INTEGER,
+            full_name TEXT,
+            email TEXT,
+            is_active INTEGER DEFAULT 1,
+            last_login BIGINT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            CONSTRAINT fk_role FOREIGN KEY(role_id) REFERENCES roles(id)
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role_id INTEGER,
+            full_name TEXT,
+            email TEXT,
+            is_active INTEGER DEFAULT 1,
+            last_login INTEGER,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(role_id) REFERENCES roles(id)
+        );
+    )";
+    if (!executeOnConnection(primary, sql_users)) LOG_ERROR("Failed to create users table");
+
+    if (config_.driver == "postgresql") {
+        executeOnConnection(primary,
+            "INSERT INTO users (username, password_hash, role_id, full_name, is_active) "
+            "VALUES ('admin', '8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918', 1, 'System Administrator', 1) "
+            "ON CONFLICT (username) DO NOTHING");
+    } else {
+        executeOnConnection(primary,
+            "INSERT OR IGNORE INTO users (username, password_hash, role_id, full_name, is_active) "
+            "VALUES ('admin', '8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918', 1, 'System Administrator', 1)");
+    }
+
+    // SEC-001: Detect default admin password and flag it.
+    // If the admin account still uses SHA256("admin"), set the global
+    // default_password_active flag so the login endpoint can enforce a
+    // mandatory password change.
+    {
+        QSqlQuery check_query(primary);
+        check_query.prepare("SELECT password_hash FROM users WHERE username='admin'");
+        if (check_query.exec() && check_query.next()) {
+            QString hash = check_query.value(0).toString();
+            if (hash == "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918") {
+                vms::database::default_password_active.store(true, std::memory_order_release);
+                LOG_CRITICAL("==================================================");
+                LOG_CRITICAL("SEC-001 CRITICAL: Default admin password detected!");
+                LOG_CRITICAL("The admin account is using the factory-default password.");
+                LOG_CRITICAL("Login will require an immediate password change.");
+                LOG_CRITICAL("==================================================");
+            } else {
+                vms::database::default_password_active.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    // User Migrations
+    safeAlterTable(primary, "ALTER TABLE users ADD COLUMN salt TEXT DEFAULT ''", "users.salt");
+    safeAlterTable(primary, "ALTER TABLE users ADD COLUMN two_factor_enabled INTEGER DEFAULT 0", "users.two_factor_enabled");
+    safeAlterTable(primary, "ALTER TABLE users ADD COLUMN two_factor_secret TEXT DEFAULT ''", "users.two_factor_secret");
+    // H2: token_version enables instant JWT invalidation without waiting for expiry.
+    // Increment this column to invalidate all existing tokens for a user (deactivation, role change, forced logout).
+    safeAlterTable(primary, "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0", "users.token_version");
+
+    // =========================================================
+    // 8. INDEXES
+    // =========================================================
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_events_camera_time ON events(camera_id, timestamp)");
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_events_unread ON events(is_read)");
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)");
+
+    // =========================================================
+    // 8.5. ZONES & RULES (Advanced Event Engine)
+    // =========================================================
+    const std::string sql_zones = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS zones (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            type TEXT DEFAULT 'public',
+            description TEXT,
+            polygon_json TEXT NOT NULL,
+            camera_ids_json TEXT NOT NULL,
+            max_occupancy INTEGER DEFAULT -1,
+            allow_loitering INTEGER DEFAULT 1,
+            loitering_threshold_sec INTEGER DEFAULT 30,
+            enable_alerts INTEGER DEFAULT 1,
+            max_alerts_per_minute INTEGER DEFAULT 5,
+            metadata_json TEXT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS zones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            type TEXT DEFAULT 'public',
+            description TEXT,
+            polygon_json TEXT NOT NULL,
+            camera_ids_json TEXT NOT NULL,
+            max_occupancy INTEGER DEFAULT -1,
+            allow_loitering INTEGER DEFAULT 1,
+            loitering_threshold_sec INTEGER DEFAULT 30,
+            enable_alerts INTEGER DEFAULT 1,
+            max_alerts_per_minute INTEGER DEFAULT 5,
+            metadata_json TEXT,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_zones)) LOG_ERROR("Failed to create zones table");
+
+    const std::string sql_rules = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS rules (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            enabled INTEGER DEFAULT 1,
+            logic TEXT DEFAULT 'AND',
+            conditions_json TEXT NOT NULL,
+            actions_json TEXT NOT NULL,
+            anti_noise_json TEXT NOT NULL,
+            camera_ids_json TEXT NOT NULL,
+            metadata_json TEXT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            enabled INTEGER DEFAULT 1,
+            logic TEXT DEFAULT 'AND',
+            conditions_json TEXT NOT NULL,
+            actions_json TEXT NOT NULL,
+            anti_noise_json TEXT NOT NULL,
+            camera_ids_json TEXT NOT NULL,
+            metadata_json TEXT,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_rules)) LOG_ERROR("Failed to create rules table");
+
+    // =========================================================
+    // 9. SETTINGS
+    // =========================================================
+    const std::string sql_settings = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_settings)) LOG_ERROR("Failed to create settings table");
+
+    // =========================================================
+    // 10. RECORDING SEGMENTS (Continuous 24/7 recording)
+    // =========================================================
+    const std::string sql_recording_segments = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS recording_segments (
+            id SERIAL PRIMARY KEY,
+            camera_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            start_time BIGINT NOT NULL,
+            end_time BIGINT NOT NULL,
+            file_size BIGINT DEFAULT 0,
+            status TEXT DEFAULT 'completed',
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            CONSTRAINT fk_camera FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS recording_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            camera_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            start_time INTEGER NOT NULL,
+            end_time INTEGER NOT NULL,
+            file_size INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'completed',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    )";
+    if (!executeOnConnection(primary, sql_recording_segments)) LOG_ERROR("Failed to create recording_segments table");
+
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_segments_camera_time ON recording_segments(camera_id, start_time)");
+
+    // =========================================================
+    // 11. DEVICES (NVR/DVR/Encoder management)
+    // =========================================================
+    const std::string sql_devices = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS devices (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'NVR',
+            ip_address TEXT NOT NULL,
+            port INTEGER DEFAULT 80,
+            brand TEXT,
+            model TEXT,
+            firmware TEXT,
+            username TEXT,
+            password TEXT,
+            channel_count INTEGER DEFAULT 0,
+            is_online INTEGER DEFAULT 0,
+            last_seen BIGINT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'NVR',
+            ip_address TEXT NOT NULL,
+            port INTEGER DEFAULT 80,
+            brand TEXT,
+            model TEXT,
+            firmware TEXT,
+            username TEXT,
+            password TEXT,
+            channel_count INTEGER DEFAULT 0,
+            is_online INTEGER DEFAULT 0,
+            last_seen INTEGER,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_devices)) LOG_ERROR("Failed to create devices table");
+
+    // Camera Migrations — Motion Detection
+    safeAlterTable(primary, "ALTER TABLE cameras ADD COLUMN motion_detection_enabled INTEGER DEFAULT 0", "motion_detection_enabled");
+    safeAlterTable(primary, "ALTER TABLE cameras ADD COLUMN motion_sensitivity REAL DEFAULT 0.02", "motion_sensitivity");
+
+    // =========================================================
+    // 12. MULTI-SITE SUPPORT
+    // =========================================================
+    const std::string sql_sites = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS sites (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            address TEXT,
+            parent_site_id INTEGER DEFAULT -1,
+            description TEXT,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            address TEXT,
+            parent_site_id INTEGER DEFAULT -1,
+            description TEXT,
+            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_sites)) LOG_ERROR("Failed to create sites table");
+
+    // Camera Migration for Site ID
+    safeAlterTable(primary, "ALTER TABLE cameras ADD COLUMN site_id INTEGER DEFAULT -1", "cameras.site_id");
+
+    // =========================================================
+    // 13. USER PERMISSIONS (Multi-site RBAC)
+    // =========================================================
+    const std::string sql_permissions = R"(
+        CREATE TABLE IF NOT EXISTS permissions (
+            user_id INTEGER PRIMARY KEY,
+            allowed_cameras TEXT DEFAULT '[]',
+            allowed_sites TEXT DEFAULT '[]',
+            can_view_live INTEGER DEFAULT 1,
+            can_view_playback INTEGER DEFAULT 1,
+            can_manage_settings INTEGER DEFAULT 0,
+            can_ptz INTEGER DEFAULT 1,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+    )";
+    if (!executeOnConnection(primary, sql_permissions)) LOG_ERROR("Failed to create permissions table");
+
+    // =========================================================
+    // 14. VIDEO WALL LAYOUTS
+    // =========================================================
+    const std::string sql_videowall_layouts = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS videowall_layouts (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            grid_cols INTEGER DEFAULT 4,
+            grid_rows INTEGER DEFAULT 4,
+            cells_json TEXT DEFAULT '[]',
+            created_by TEXT DEFAULT 'admin',
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW())),
+            updated_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS videowall_layouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            grid_cols INTEGER DEFAULT 4,
+            grid_rows INTEGER DEFAULT 4,
+            cells_json TEXT DEFAULT '[]',
+            created_by TEXT DEFAULT 'admin',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_videowall_layouts)) LOG_ERROR("Failed to create videowall_layouts table");
+
+    // =========================================================
+    // 15. ALERT RULES (Cấu hình cảnh báo)
+    // =========================================================
+    const std::string sql_alert_rules = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            id SERIAL PRIMARY KEY,
+            camera_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'high',
+            action_type TEXT NOT NULL, -- email, webhook, sms
+            recipient TEXT,
+            is_enabled INTEGER DEFAULT 1,
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            camera_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'high',
+            action_type TEXT NOT NULL, -- email, webhook, sms
+            recipient TEXT,
+            is_enabled INTEGER DEFAULT 1,
+            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_alert_rules)) LOG_ERROR("Failed to create alert_rules table");
+
+    LOG_INFO("All database tables initialized successfully");
+}
+
+void DbManager::close() {
+    stopBatchWriter();
+
+    initialized_.store(false, std::memory_order_release);
+    db_ready.store(false, std::memory_order_release);
+
+    // Close and remove all registered connections
+    {
+        std::lock_guard<std::mutex> conn_lock(g_db_conn_mutex);
+        std::lock_guard<std::mutex> lock(connection_registry_mutex_);
+        for (const auto& conn_name : registered_connections_) {
+            {
+                QSqlDatabase db = QSqlDatabase::database(conn_name, false);
+                if (db.isOpen()) {
+                    db.close();
+                }
+            }
+            QSqlDatabase::removeDatabase(conn_name);
+        }
+        registered_connections_.clear();
+
+        // Also remove the primary connection if not already removed
+        if (QSqlDatabase::contains(kPrimaryConnectionName)) {
+            {
+                QSqlDatabase db = QSqlDatabase::database(kPrimaryConnectionName, false);
+                if (db.isOpen()) {
+                    db.close();
+                }
+            }
+            QSqlDatabase::removeDatabase(kPrimaryConnectionName);
+        }
+    }
+
+    LOG_INFO("Database closed");
+}
+
+QSqlDatabase DbManager::getThreadConnection() {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return QSqlDatabase();
+    }
+
+    QString conn_name = threadConnectionName();
+
+    {
+        std::lock_guard<std::mutex> conn_lock(g_db_conn_mutex);
+        if (QSqlDatabase::contains(conn_name)) {
+            QSqlDatabase db = QSqlDatabase::database(conn_name, false);
+            if (db.isOpen()) {
+                return db;
+            }
+            // Connection exists but is closed — remove and recreate
+            QSqlDatabase::removeDatabase(conn_name);
+        }
+
+        // Create a new connection for this thread
+        QSqlDatabase db;
+        if (config_.driver == "postgresql") {
+            db = QSqlDatabase::addDatabase("QPSQL", conn_name);
+            db.setHostName(QString::fromStdString(config_.postgres.host));
+            db.setPort(config_.postgres.port);
+            db.setDatabaseName(QString::fromStdString(config_.postgres.database));
+            db.setUserName(QString::fromStdString(config_.postgres.username));
+            db.setPassword(QString::fromStdString(config_.postgres.password));
+        } else {
+            db = QSqlDatabase::addDatabase("QSQLITE", conn_name);
+            db.setDatabaseName(QString::fromStdString(config_.sqlite.path));
+        }
+
+        if (!db.open()) {
+            LOG_THROTTLED_ERROR(5000, "Failed to open thread-local database connection: {}",
+                      db.lastError().text().toStdString());
+            QSqlDatabase::removeDatabase(conn_name);
+            return QSqlDatabase();
+        }
+
+        // SQLite-specific configuration
+        if (config_.driver == "sqlite") {
+            QSqlQuery wal_query(db);
+            wal_query.exec("PRAGMA journal_mode=WAL");
+            QSqlQuery timeout_query(db);
+            timeout_query.exec(QString("PRAGMA busy_timeout=%1").arg(config_.sqlite.busy_timeout_ms));
+        }
+
+        // Register for cleanup
+        {
+            std::lock_guard<std::mutex> lock(connection_registry_mutex_);
+            registered_connections_.push_back(conn_name);
+        }
+
+        return db;
+    }
+}
+
+bool DbManager::execute(const std::string& sql) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG_THROTTLED_WARN(5000, "Database not initialized — query dropped");
+        return false;
+    }
+
+    QSqlDatabase db = getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) {
+        LOG_THROTTLED_ERROR(5000, "Failed to get thread connection for execute");
+        return false;
+    }
+
+    return executeOnConnection(db, sql);
+}
+
+bool DbManager::executeOnConnection(QSqlDatabase& db, const std::string& sql) {
+    QSqlQuery query(db);
+    if (!query.exec(QString::fromStdString(sql))) {
+        LOG_ERROR("SQL error: {}", query.lastError().text().toStdString());
+        return false;
+    }
+    return true;
+}
+
+void DbManager::safeAlterTable(QSqlDatabase& db, const std::string& sql, const std::string& column_name) {
+    QSqlQuery query(db);
+    if (!query.exec(QString::fromStdString(sql))) {
+        std::string err = query.lastError().text().toStdString();
+        if (err.find("duplicate column") == std::string::npos &&
+            err.find("duplicate column name") == std::string::npos) {
+            LOG_WARN("Migration failed ({}): {}", column_name, err);
+        }
+    }
+}
+
+bool DbManager::executeParameterized(const std::string& sql, const std::vector<std::string>& params) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG_THROTTLED_WARN(5000, "Database not initialized — parameterized query dropped");
+        return false;
+    }
+
+    QSqlDatabase db = getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) {
+        LOG_THROTTLED_ERROR(5000, "Failed to get thread connection for executeParameterized");
+        return false;
+    }
+
+    QSqlQuery query(db);
+    if (!query.prepare(QString::fromStdString(sql))) {
+        LOG_ERROR("Failed to prepare statement: {}", query.lastError().text().toStdString());
+        return false;
+    }
+
+    for (size_t i = 0; i < params.size(); ++i) {
+        query.bindValue(static_cast<int>(i), QString::fromStdString(params[i]));
+    }
+
+    if (!query.exec()) {
+        LOG_ERROR("Failed to execute parameterized query: {}", query.lastError().text().toStdString());
+        return false;
+    }
+
+    return true;
+}
+
+void DbManager::beginTransaction() {
+    // DB-004 FIX: Acquire cross-call transaction mutex to prevent interleaving
+    transaction_mutex_.lock();
+
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG_THROTTLED_WARN(5000, "beginTransaction: Database not initialized");
+        transaction_mutex_.unlock();
+        return;
+    }
+
+    QSqlDatabase db = getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) {
+        LOG_THROTTLED_ERROR(5000, "Failed to get thread connection for beginTransaction");
+        transaction_mutex_.unlock();
+        return;
+    }
+
+    if (!db.transaction()) {
+        LOG_ERROR("Failed to begin transaction: {}", db.lastError().text().toStdString());
+        transaction_mutex_.unlock();
+    }
+}
+
+void DbManager::commit() {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG_THROTTLED_WARN(5000, "commit: Database not initialized");
+        transaction_mutex_.unlock();
+        return;
+    }
+
+    QSqlDatabase db = getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) {
+        LOG_THROTTLED_ERROR(5000, "Failed to get thread connection for commit");
+        transaction_mutex_.unlock();
+        return;
+    }
+
+    if (!db.commit()) {
+        LOG_ERROR("Failed to commit transaction: {}", db.lastError().text().toStdString());
+    }
+
+    // DB-004 FIX: Release cross-call transaction mutex
+    transaction_mutex_.unlock();
+}
+
+void DbManager::rollback() {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG_THROTTLED_WARN(5000, "rollback: Database not initialized");
+        transaction_mutex_.unlock();
+        return;
+    }
+
+    QSqlDatabase db = getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) {
+        LOG_THROTTLED_ERROR(5000, "Failed to get thread connection for rollback");
+        transaction_mutex_.unlock();
+        return;
+    }
+
+    if (!db.rollback()) {
+        LOG_ERROR("Failed to rollback transaction: {}", db.lastError().text().toStdString());
+    }
+
+    // DB-004 FIX: Release cross-call transaction mutex
+    transaction_mutex_.unlock();
+}
+
+std::string DbManager::getSetting(const std::string& key, const std::string& default_val) {
+    if (!initialized_.load(std::memory_order_acquire)) return default_val;
+
+    QSqlDatabase db = getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) return default_val;
+
+    QSqlQuery query(db);
+    query.prepare("SELECT value FROM settings WHERE key = ?");
+    query.bindValue(0, QString::fromStdString(key));
+
+    if (query.exec() && query.next()) {
+        QVariant val = query.value(0);
+        if (!val.isNull()) {
+            return val.toString().toStdString();
+        }
+    }
+
+    return default_val;
+}
+
+bool DbManager::setSetting(const std::string& key, const std::string& value) {
+    if (!initialized_.load(std::memory_order_acquire)) return false;
+
+    QSqlDatabase db = getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) return false;
+
+    QSqlQuery query(db);
+    if (config_.driver == "postgresql") {
+        query.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, (EXTRACT(EPOCH FROM NOW()))) "
+                      "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at");
+    } else {
+        query.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, (strftime('%s', 'now')))");
+    }
+    query.bindValue(0, QString::fromStdString(key));
+    query.bindValue(1, QString::fromStdString(value));
+
+    if (!query.exec()) {
+        LOG_ERROR("Failed to insert/update setting '{}'", key);
+        return false;
+    }
+
+    return true;
+}
+
+std::map<std::string, std::string> DbManager::getAllSettings() {
+    std::map<std::string, std::string> result;
+    if (!initialized_.load(std::memory_order_acquire)) return result;
+
+    QSqlDatabase db = getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) return result;
+
+    QSqlQuery query(db);
+    if (query.exec("SELECT key, value FROM settings")) {
+        while (query.next()) {
+            std::string k = query.value(0).toString().toStdString();
+            std::string v = query.value(1).toString().toStdString();
+            result[k] = v;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Event Batch Writer (QW-5)
+// ============================================================================
+
+bool DbManager::enqueueEvent(const Event& event) {
+    // B-3 FIX: Reject events when not accepting (shutdown or not initialized)
+    if (!accepting_events_.load(std::memory_order_acquire)) {
+        LOG_WARN("EventBatchWriter: not accepting events, rejecting event {}", event.id);
+        return false;
+    }
+
+    bool should_notify = false;
+    {
+        std::lock_guard<std::mutex> lock(batch_queue_mutex_);
+        // B-6 FIX: Cap queue at kMaxQueueSize, drop oldest with warning
+        if (event_queue_.size() >= kMaxQueueSize) {
+            LOG_THROTTLED_WARN(5000, "EventBatchWriter: queue full ({} events), dropping oldest event",
+                     kMaxQueueSize);
+            event_queue_.pop_front();
+        }
+        event_queue_.push_back(event);
+        should_notify = (event_queue_.size() >= kBatchFlushSize);
+    }
+    if (should_notify) {
+        batch_cv_.notify_one();
+    }
+    return true;
+}
+
+void DbManager::startBatchWriter() {
+    if (batch_writer_running_.exchange(true)) return;  // Already running
+    accepting_events_.store(true, std::memory_order_release);
+    batch_writer_thread_ = std::thread(&DbManager::batchWriterLoop, this);
+    LOG_INFO("EventBatchWriter: started (batch={}, interval={}ms, max_queue={})",
+             kBatchFlushSize, kBatchFlushIntervalMs, kMaxQueueSize);
+}
+
+void DbManager::stopBatchWriter() {
+    // B-3 FIX: Stop accepting events FIRST, before signalling thread to exit
+    accepting_events_.store(false, std::memory_order_release);
+
+    if (!batch_writer_running_.exchange(false)) return;  // Not running
+    batch_cv_.notify_one();
+    if (batch_writer_thread_.joinable()) {
+        batch_writer_thread_.join();
+    }
+    // Final drain — flush any events still in the queue
+    std::deque<Event> remaining;
+    {
+        std::lock_guard<std::mutex> lock(batch_queue_mutex_);
+        remaining.swap(event_queue_);
+    }
+    if (!remaining.empty()) {
+        LOG_INFO("EventBatchWriter: flushing {} remaining events on shutdown",
+                 remaining.size());
+        flushEventBatch(remaining);
+    }
+    LOG_INFO("EventBatchWriter: stopped");
+}
+
+void DbManager::batchWriterLoop() {
+    LOG_INFO("EventBatchWriter: thread started");
+
+    // Create a dedicated connection for the batch writer thread
+    const QString batch_conn_name = "vms_batch_writer";
+    QSqlDatabase batch_db;
+    {
+        std::lock_guard<std::mutex> conn_lock(g_db_conn_mutex);
+        if (config_.driver == "postgresql") {
+            batch_db = QSqlDatabase::addDatabase("QPSQL", batch_conn_name);
+            batch_db.setHostName(QString::fromStdString(config_.postgres.host));
+            batch_db.setPort(config_.postgres.port);
+            batch_db.setDatabaseName(QString::fromStdString(config_.postgres.database));
+            batch_db.setUserName(QString::fromStdString(config_.postgres.username));
+            batch_db.setPassword(QString::fromStdString(config_.postgres.password));
+        } else {
+            batch_db = QSqlDatabase::addDatabase("QSQLITE", batch_conn_name);
+            batch_db.setDatabaseName(QString::fromStdString(config_.sqlite.path));
+        }
+    }
+
+    if (!batch_db.open()) {
+        LOG_ERROR("EventBatchWriter: failed to open dedicated DB connection: {}",
+                  batch_db.lastError().text().toStdString());
+        std::lock_guard<std::mutex> conn_lock(g_db_conn_mutex);
+        QSqlDatabase::removeDatabase(batch_conn_name);
+        return;
+    }
+        // SQLite-specific optimizations for batch writer
+        if (config_.driver == "sqlite") {
+            QSqlQuery wal_query(batch_db);
+            wal_query.exec("PRAGMA journal_mode=WAL");
+            QSqlQuery timeout_query(batch_db);
+            timeout_query.exec(QString("PRAGMA busy_timeout=%1").arg(config_.sqlite.busy_timeout_ms));
+        }
+
+    // Register batch writer connection for cleanup
+    {
+        std::lock_guard<std::mutex> lock(connection_registry_mutex_);
+        registered_connections_.push_back(batch_conn_name);
+    }
+
+    // B-2 FIX (C-3): Outermost try/catch — prevents std::terminate on unhandled exception
+    while (batch_writer_running_.load()) {
+        try {
+            std::deque<Event> batch;
+            {
+                std::unique_lock<std::mutex> lock(batch_queue_mutex_);
+                batch_cv_.wait_for(lock,
+                    std::chrono::milliseconds(kBatchFlushIntervalMs),
+                    [this] {
+                        return !batch_writer_running_.load()
+                            || event_queue_.size() >= kBatchFlushSize;
+                    });
+                if (event_queue_.empty()) continue;
+                batch.swap(event_queue_);
+            }
+            // C-2: batch_queue_mutex_ is NOT held here
+            if (!flushEventBatch(batch)) {
+                // B-7/C-4: flush failed — re-enqueue the batch for retry
+                std::lock_guard<std::mutex> lock(batch_queue_mutex_);
+                for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+                    event_queue_.push_front(std::move(*it));
+                }
+                LOG_WARN("EventBatchWriter: re-enqueued {} events after flush failure",
+                         batch.size());
+                // Back off to avoid tight retry loop
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("EventBatchWriter: exception in batch loop: {}", e.what());
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        } catch (...) {
+            LOG_ERROR("EventBatchWriter: unknown exception in batch loop");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    // Close the batch writer connection
+    {
+        std::lock_guard<std::mutex> conn_lock(g_db_conn_mutex);
+        QSqlDatabase batch_db = QSqlDatabase::database(batch_conn_name, false);
+        if (batch_db.isOpen()) {
+            batch_db.close();
+        }
+        QSqlDatabase::removeDatabase(batch_conn_name);
+    }
+
+    LOG_INFO("EventBatchWriter: thread exiting");
+}
+
+bool DbManager::flushEventBatch(std::deque<Event>& batch) {
+    if (batch.empty()) return true;
+
+    const QString batch_conn_name = "vms_batch_writer";
+    QSqlDatabase db;
+    {
+        std::lock_guard<std::mutex> conn_lock(g_db_conn_mutex);
+        db = QSqlDatabase::database(batch_conn_name, false);
+    }
+
+    if (!db.isValid() || !db.isOpen()) {
+        LOG_ERROR("EventBatchWriter: database connection not available, dropping {} events",
+                  batch.size());
+        return false;
+    }
+
+    if (!db.transaction()) {
+        LOG_ERROR("EventBatchWriter: BEGIN TRANSACTION failed: {}",
+                  db.lastError().text().toStdString());
+        return false;
+    }
+
+    QSqlQuery query(db);
+    QString insert_sql;
+    if (config_.driver == "postgresql") {
+        insert_sql = "INSERT INTO events "
+                     "(id, camera_id, event_type, description, snapshot_path, "
+                     "metadata_json, timestamp, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                     "ON CONFLICT (id) DO NOTHING";
+    } else {
+        insert_sql = "INSERT OR IGNORE INTO events "
+                     "(id, camera_id, event_type, description, snapshot_path, "
+                     "metadata_json, timestamp, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+    }
+
+    if (!query.prepare(insert_sql)) {
+        LOG_ERROR("EventBatchWriter: prepare failed: {}", query.lastError().text().toStdString());
+        db.rollback();
+        return false;
+    }
+
+    int inserted = 0;
+    for (const auto& event : batch) {
+        query.bindValue(0, QString::fromStdString(event.id));
+        query.bindValue(1, event.camera_id);
+        query.bindValue(2, QString::fromStdString(event.event_type));
+        query.bindValue(3, QString::fromStdString(event.description));
+        query.bindValue(4, QString::fromStdString(event.snapshot_path));
+        query.bindValue(5, QString::fromStdString(event.metadata_json));
+        query.bindValue(6, static_cast<qint64>(event.timestamp));
+        query.bindValue(7, QString::fromStdString(event.severity));
+
+        if (query.exec()) {
+            ++inserted;
+        } else {
+            LOG_WARN("EventBatchWriter: insert failed for event {}: {}",
+                     event.id, query.lastError().text().toStdString());
+        }
+    }
+
+    // B-7 FIX: On COMMIT failure, ROLLBACK and return false so caller re-enqueues
+    if (!db.commit()) {
+        LOG_ERROR("EventBatchWriter: COMMIT failed: {} — rolling back",
+                  db.lastError().text().toStdString());
+        db.rollback();
+        return false;
+    }
+
+    if (inserted > 0) {
+        LOG_DEBUG("EventBatchWriter: flushed {}/{} events",
+                  inserted, static_cast<int>(batch.size()));
+    }
+    return true;
+}
+
+} // namespace database
+} // namespace vms

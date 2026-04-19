@@ -1,0 +1,108 @@
+# VMS Backend Configuration (example)
+#
+# - Safe to commit (no real secrets).
+# - Provide secrets via environment variables:
+#     VMS_JWT_SECRET
+#     VMS_MEDIA_SIGNING_SECRET
+#     VMS_PG_PASSWORD
+#     VMS_MINIO_ACCESS_KEY
+#     VMS_MINIO_SECRET_KEY
+# - Optional:
+#     VMS_ENV=dev|prod (default: dev)
+#     VMS_ALLOW_DEFAULT_SECRET=1 (temporary bypass; NOT recommended)
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  threads: 4
+  log_level: "info"
+
+database:
+  driver: "postgresql"  # "postgresql" or "sqlite"
+  postgresql:
+    host: "localhost"
+    port: 5432
+    database: "vms_ai"
+    username: "postgres"
+    password: "" # prefer VMS_PG_PASSWORD
+    pool_size: 10
+  sqlite:
+    path: "data/events.db"
+    busy_timeout_ms: 5000
+
+storage:
+  driver: "minio"       # "minio" or "local"
+  minio:
+    endpoint: "http://localhost:9000"
+    access_key: "" # prefer VMS_MINIO_ACCESS_KEY
+    secret_key: "" # prefer VMS_MINIO_SECRET_KEY
+    bucket_recordings: "vms-recordings"
+    bucket_snapshots: "vms-snapshots"
+
+auth:
+  enabled: true
+  secret_key: "vms-ai-secret-key-change-me-in-production" # prefer VMS_JWT_SECRET
+  # media URLs are signed independently (preferred): VMS_MEDIA_SIGNING_SECRET
+  algorithm: "HS256"
+  token_expire_minutes: 10080
+
+# Presigned media URL policy.
+# - strict_scope_required=true will reject old links without signed scope params.
+# - Keep false during migration, then switch to true once all clients are updated.
+media_signing:
+  strict_scope_required: false
+  default_ttl_seconds: 120
+  snapshot_ttl_seconds: 180
+  event_video_ttl_seconds: 300
+  recording_video_ttl_seconds: 300
+  segment_video_ttl_seconds: 300
+  camera_frame_ttl_seconds: 60
+  storage_ttl_seconds: 180
+
+cors:
+  enabled: true
+  origins: ["http://localhost:3009", "http://localhost:3000"]
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+  headers: ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"]
+  credentials: true
+
+websocket:
+  port: 8083
+  heartbeat_interval_sec: 30
+  ping_interval_sec: 20
+  ping_timeout_sec: 10
+  max_message_size_mb: 10
+  update_interval_ms: 100
+
+ai_server:
+  enabled: true
+  base_zmq_port: 5555
+  zmq_timeout_ms: 1000
+  reconnect_interval_sec: 5
+
+batch_inference:
+  enabled: true
+  engine_path: "models\\yolo11m.engine"
+  max_batch_size: 1
+  max_wait_ms: 10
+
+recording:
+  enabled: true
+  continuous: true
+
+snapshots:
+  enabled: true
+  storage_path: "data/snapshots"
+  max_storage_gb: 10
+  jpeg_quality: 85
+  auto_cleanup: true
+  retention_days: 7
+
+logging:
+  level: "info"
+  file_path: "logs/cpp_backend.log"
+  console_output: true
+  file_output: true
+  max_file_size_mb: 100
+  max_files: 5
+  pattern: "[%Y-%m-%d %H:%M:%S.%e] [%n] [%l] %v"

@@ -1,0 +1,9 @@
+add_library(rtsp_camera STATIC
+    rtsp_camera.cpp
+)
+
+target_include_directories(rtsp_camera PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(rtsp_camera PUBLIC ${OpenCV_LIBS})

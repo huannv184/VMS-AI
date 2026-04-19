@@ -1,0 +1,66 @@
+# ================================================================
+# Prometheus Configuration for VMS Monitoring
+# ================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'vms-production'
+    environment: 'production'
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Load rules
+rule_files:
+  - "alerts/*.yml"
+
+# Scrape configurations
+scrape_configs:
+  # ================================================================
+  # VMS Backend Metrics
+  # ================================================================
+  - job_name: 'vms-backend'
+    static_configs:
+      - targets: ['backend:8080']
+    metrics_path: '/api/v1/metrics'
+    scrape_interval: 10s
+
+  # ================================================================
+  # System Metrics (Node Exporter)
+  # ================================================================
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # ================================================================
+  # PostgreSQL Metrics
+  # ================================================================
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # ================================================================
+  # Redis Metrics
+  # ================================================================
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # ================================================================
+  # NVIDIA GPU Metrics
+  # ================================================================
+  - job_name: 'nvidia-gpu'
+    static_configs:
+      - targets: ['dcgm-exporter:9400']
+
+  # ================================================================
+  # Docker Container Metrics
+  # ================================================================
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']

@@ -1,0 +1,32 @@
+{
+    "name": "vms-backend",
+    "version": "1.0.0",
+    "description": "VMS AI Backend - C++ HTTP/WebSocket server for camera management",
+    "dependencies": [
+        "crow",
+        "sqlite3",
+        "nlohmann-json",
+        "spdlog",
+        "yaml-cpp",
+        "cppzmq",
+        "jwt-cpp",
+        "openssl",
+        "boost-system",
+        "boost-filesystem",
+        "boost-geometry",
+        "boost-asio",
+        "opencv4",
+        "ffmpeg",
+        "gtest",
+        "curl",
+        "pugixml",
+        "libpq",
+        {
+            "name": "qtbase",
+            "default-features": false,
+            "features": ["sql-sqlite", "sql-psql", "network"]
+        },
+        "qtwebsockets"
+    ],
+    "builtin-baseline": "9855f9f4f886499dc1bc7a1d077dd39cec05e7d0"
+}

@@ -1,0 +1,39 @@
+# Dependencies
+**/node_modules/
+**/vcpkg_installed/
+
+# Build outputs
+**/build/
+**/cmake-build-*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/*.vcxproj*
+**/*.sln
+**/*.obj
+**/*.pdb
+**/*.ilk
+**/*.lib
+**/*.exp
+**/*.dll
+**/*.exe
+
+# Frontend build
+vms-frontend/dist/
+
+# Logs and runtime data
+**/logs/
+**/*.log
+**/recordings/
+**/data/events.db
+**/data/*.db
+**/data/*.db-*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+
+# Local tooling caches
+.claude/settings.local.json
+cpp-backend/.cache/

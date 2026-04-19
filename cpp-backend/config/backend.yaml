@@ -1,0 +1,149 @@
+# VMS Backend Configuration
+# This file contains all configuration for the VMS AI Backend server
+
+# ============================================================================
+# SERVER CONFIGURATION
+# ============================================================================
+server:
+  host: "0.0.0.0"
+  port: 8000
+  threads: 8
+  log_level: "info"  # debug, info, warning, error, critical
+
+# ============================================================================
+# DATABASE CONFIGURATION
+# ============================================================================
+database:
+  path: "data/events.db"
+  connection_pool_size: 10
+  busy_timeout_ms: 5000
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+auth:
+  enabled: true
+  # SEC-C1: Set VMS_JWT_SECRET env var (min 32 chars) before deploying.
+  # This default will cause startup failure unless VMS_ALLOW_DEFAULT_SECRET=1 is set.
+  secret_key: "vms-ai-secret-key-for-local-development-testing-only-12345"
+  algorithm: "HS256"
+  token_expire_minutes: 480   # 8 hours — reduced from 7 days; revocation via token_version
+  
+  # LDAP Configuration (Optional)
+  ldap:
+    enabled: false
+    host: "192.168.1.10"
+    port: 389
+    domain: "CORP"
+  
+# ============================================================================
+# CORS CONFIGURATION
+# ============================================================================
+cors:
+  enabled: true
+  origins: ["*"]
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+  headers: ["*"]
+  credentials: true
+
+# ============================================================================
+# WEBSOCKET CONFIGURATION
+# ============================================================================
+websocket:
+  port: 8083
+  heartbeat_interval_sec: 30
+  ping_interval_sec: 20
+  ping_timeout_sec: 10
+  max_message_size_mb: 10
+  update_interval_ms: 100  # Metadata update interval
+
+# ============================================================================
+# AI SERVER INTEGRATION (C++ ai-server via ZMQ)
+# ============================================================================
+ai_server:
+  enabled: true
+  base_zmq_port: 5555  # Port = base_port + camera_id
+  zmq_timeout_ms: 1000
+  reconnect_interval_sec: 5
+  
+# ============================================================================
+# MEDIA SIGNING (presigned URLs for snapshots, recordings, etc.)
+# ============================================================================
+media_signing:
+  strict_scope_required: true
+  max_ttl_seconds: 900           # C6: 15-minute hard ceiling on presigned URL lifetime
+  allow_legacy_unsigned: false   # M8: disable unscoped legacy presign format
+  default_ttl_seconds: 120
+  snapshot_ttl_seconds: 180
+  event_video_ttl_seconds: 300
+  recording_video_ttl_seconds: 300
+  segment_video_ttl_seconds: 300
+  camera_frame_ttl_seconds: 60
+  storage_ttl_seconds: 180
+
+# ============================================================================
+# CAMERA CONFIGURATION
+# ============================================================================
+cameras:
+  max_cameras: 10
+  timeout_sec: 30
+  auto_start_on_boot: false
+  
+# ============================================================================
+# ROI CONFIGURATION
+# ============================================================================
+roi:
+  enabled: true
+  config_file: "data/config/roi_config.yml"
+  auto_save: true
+  
+# ============================================================================
+# EVENT SYSTEM
+# ============================================================================
+events:
+  enabled: true
+  retention_days: 30
+  cleanup_interval_hours: 24
+  max_events_per_query: 1000
+  
+  # Event detectors
+  detectors:
+    intrusion: true
+    line_crossing: true
+    loitering: true
+    people_counting: true
+    
+  # Loitering settings
+  loitering_threshold_sec: 30
+  
+# ============================================================================
+# SNAPSHOT SYSTEM
+# ============================================================================
+snapshots:
+  enabled: true
+  storage_path: "data/snapshots"
+  max_storage_gb: 10
+  jpeg_quality: 85
+  auto_cleanup: true
+  retention_days: 7
+  
+# ============================================================================
+# LOGGING
+# ============================================================================
+logging:
+  level: "info"
+  file_path: "logs/cpp_backend.log"
+  console_output: true
+  file_output: true
+  max_file_size_mb: 100
+  max_files: 5
+  pattern: "[%Y-%m-%d %H:%M:%S.%e] [%n] [%l] %v"
+  
+# ============================================================================
+# PERFORMANCE
+# ============================================================================
+performance:
+  max_queue_size: 100
+  worker_threads: 4
+  io_threads: 2
+  max_memory_mb: 2048

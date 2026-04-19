@@ -1,0 +1,51 @@
+server:
+  host: "127.0.0.1"
+  port: 18200
+  threads: 4
+  log_level: "info"
+database:
+  driver: "postgresql"
+  postgresql:
+    host: "127.0.0.1"
+    port: 65432
+    database: "vms_ai"
+    username: "postgres"
+    password: "postgres"
+    pool_size: 2
+auth:
+  enabled: false
+  secret_key: "vms-ai-secret-key-change-me-in-production"
+  algorithm: "HS256"
+  token_expire_minutes: 10080
+  ldap:
+    enabled: false
+cors:
+  enabled: true
+  origins: ["*"]
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+  headers: ["*"]
+  credentials: true
+websocket:
+  port: 18283
+  heartbeat_interval_sec: 30
+  ping_interval_sec: 20
+  ping_timeout_sec: 10
+  max_message_size_mb: 10
+  update_interval_ms: 100
+ai_server:
+  enabled: false
+storage:
+  driver: "minio"
+  minio:
+    endpoint: "http://127.0.0.1:65530"
+    access_key: "minioadmin"
+    secret_key: "minioadmin"
+    bucket_recordings: "vms-recordings"
+    bucket_snapshots: "vms-snapshots"
+logging:
+  level: "info"
+  file_path: "logs/audit_pg_off.log"
+  console_output: true
+  file_output: true
+  max_file_size_mb: 100
+  max_files: 5
