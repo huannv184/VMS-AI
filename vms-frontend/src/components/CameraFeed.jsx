@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import useVmsStore from '../store/useVmsStore';
 import { resolveWsUrl } from '../utils/streamingConfig';
 import apiClient from '../api/apiClient';
+import cameraMetaBus from '../utils/cameraMetaBus';
 
 // ─── Constants ──────────────────────────────────────────
 const PROTOCOL_MAGIC = 0x564D5331;
@@ -122,6 +123,9 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
   const reconnectingTimerRef = useRef(null);      // Delay before showing "Reconnecting" indicator
   const hasFrameRef = useRef(false);              // Mirror of hasFrame state (ref for stable callbacks)
   const connectWsRef = useRef(null);              // Always points to latest connectWS
+  const startHttpPollingRef = useRef(null);       // Start fallback immediately on decoder failure
+  const wsPreferredTransportRef = useRef(null);   // null | h264 | jpeg | fmp4
+  const httpFallbackStartedRef = useRef(false);   // Prevent duplicate HTTP pollers
 
   const [hasFrame, setHasFrame] = useState(false);
   const [streamMode, setStreamMode] = useState('connecting');  // connecting | ws | http | reconnecting | error
@@ -144,6 +148,44 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
 
   // Keep hasFrameRef in sync with state so callbacks can read it without deps
   useEffect(() => { hasFrameRef.current = hasFrame; }, [hasFrame]);
+
+  const markWsFrameReceived = useCallback(() => {
+    if (!wsPreferredTransportRef.current) return;
+    if (wsFrameReceived.current) return;
+    wsFrameReceived.current = true;
+    httpFallbackStartedRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    clearTimeout(reconnectingTimerRef.current);
+    setStreamMode(s => s === 'ws' ? s : 'ws');
+  }, []);
+
+  const closeCurrentWs = useCallback((suppressReconnect = false) => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    if (suppressReconnect) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+    }
+    if (ws.pingInterval) clearInterval(ws.pingInterval);
+    try { ws.close(); } catch {}
+    wsRef.current = null;
+  }, []);
+
+  const startHttpFallbackNow = useCallback(() => {
+    if (httpFallbackStartedRef.current || wsFrameReceived.current || !mountedRef.current) return;
+    httpFallbackStartedRef.current = true;
+    wsFrameReceived.current = false;
+    wsPreferredTransportRef.current = null;
+    waitingForKeyframeRef.current = true;
+    clearTimeout(fallbackTimerRef.current);
+    clearTimeout(reconnectTimerRef.current);
+    clearTimeout(reconnectingTimerRef.current);
+    clearTimeout(httpTimerRef.current);
+    closeCurrentWs(true);
+    startHttpPollingRef.current?.();
+  }, [closeCurrentWs]);
 
   const renderLoop = useCallback(() => {
     if (!mountedRef.current) return;
@@ -175,8 +217,11 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
     videoModeRef.current = false;
 
     // Persistence Logic for pushFrame
+    // Hold last detections for ~30 frames (~2s @ 15fps idle, ~1.2s @ 25fps active).
+    // Backend AI worker may run slower than display rate; keeping bbox visible
+    // between AI updates prevents distracting flicker.
     if (!detections || detections.length === 0) {
-      if (detectionsDecayRef.current < 15) {
+      if (detectionsDecayRef.current < 30) {
         detectionsDecayRef.current++;
         detections = currentDetectionsRef.current;
       } else {
@@ -192,7 +237,8 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
     buf.detections = detections || [];
     buf.dirty = true;
     setHasFrame(h => h ? h : true);
-  }, []);
+    markWsFrameReceived();
+  }, [markWsFrameReceived]);
 
   const scheduleFrameDecode = useCallback(async (blob, detections) => {
     pendingFrameRef.current = { blob, detections };
@@ -222,15 +268,27 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
           decodeMetaRef.current.delete(frame.timestamp);
           pushFrame(frame, detections);
         },
-        error: () => { /* decoder error — will recover on next keyframe */ }
+        error: () => {
+          try { decoderRef.current?.close(); } catch {}
+          decoderRef.current = null;
+          decoderConfigRef.current = null;
+          waitingForKeyframeRef.current = true;
+          wsPreferredTransportRef.current = null;
+          startHttpFallbackNow();
+        }
       });
-      decoder.configure({ codec, optimizeForLatency: true });
+      try {
+        decoder.configure({ codec, optimizeForLatency: true });
+      } catch {
+        try { decoder.close(); } catch {}
+        return null;
+      }
       decoderRef.current = decoder;
       decoderConfigRef.current = configKey;
       waitingForKeyframeRef.current = true;
     }
     return decoderRef.current;
-  }, [canUseWebCodecs, pushFrame]);
+  }, [canUseWebCodecs, pushFrame, startHttpFallbackNow]);
 
   const resetH264Decoder = useCallback(() => {
     if (decoderRef.current) try { decoderRef.current.close(); } catch {}
@@ -265,12 +323,12 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
     const next = segmentQueueRef.current.shift();
     if (!next) return;
 
-    // Persistence Logic for FMP4 stream
+    // Persistence Logic for FMP4 stream — hold for 30 ticks to match JPEG decay
     if (next.objects && next.objects.length > 0) {
         currentDetectionsRef.current = next.objects;
         detectionsDecayRef.current = 0;
     } else {
-        if (detectionsDecayRef.current < 15) {
+        if (detectionsDecayRef.current < 30) {
             detectionsDecayRef.current++;
         } else {
             currentDetectionsRef.current = [];
@@ -281,10 +339,11 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
       sb.appendBuffer(next.payload);
       videoModeRef.current = true;
       setHasFrame(h => h ? h : true);
+      markWsFrameReceived();
     } catch {
       cleanupMediaSource();
     }
-  }, [cleanupMediaSource]);
+  }, [cleanupMediaSource, markWsFrameReceived]);
 
   const setupMediaSource = useCallback((mime) => {
     if (!canUseMse || !videoRef.current) return false;
@@ -300,18 +359,15 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
             if (v && v.buffered.length > 0) {
                 const end = v.buffered.end(v.buffered.length - 1);
                 const delay = end - v.currentTime;
-                // Use smoother playbackRate adjustments instead of sudden jumps (which cause visual lag/stuttering)
-                if (delay > 2.0) {
-                    // Only jump if we are severely behind (e.g. > 2 seconds)
+                // Keep playbackRate at 1.0 to avoid visible jitter from rate jumps
+                // (1.0 → 1.1 → 1.25 → 1.0 oscillation around the threshold causes
+                // perceived stutter even when frames arrive smoothly).
+                // Only do a hard seek when the buffer is severely behind (>1.5s)
+                // to recover from a network stall.
+                if (delay > 1.5) {
                     v.currentTime = end - 0.1;
-                    v.playbackRate = 1.0;
-                } else if (delay > 0.8) {
-                    v.playbackRate = 1.25; // Smooth catch-up
-                } else if (delay > 0.4) {
-                    v.playbackRate = 1.1; // Slight catch-up
-                } else {
-                    v.playbackRate = 1.0; // Normal
                 }
+                v.playbackRate = 1.0;
             }
             if (v?.paused) v.play().catch(()=>{});
 
@@ -344,6 +400,10 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
     // Cancel any pending reconnect to prevent overlapping timers
     clearTimeout(reconnectTimerRef.current);
     reconnectTimerRef.current = null;
+    clearTimeout(httpTimerRef.current);
+    httpFallbackStartedRef.current = false;
+    wsPreferredTransportRef.current = null;
+    waitingForKeyframeRef.current = true;
 
     // Guard: if current WS is still alive, don't create a new one
     const existing = wsRef.current;
@@ -427,25 +487,41 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
           if (frame.metadata.width) sourceResolutionRef.current.w = frame.metadata.width;
           if (frame.metadata.height) sourceResolutionRef.current.h = frame.metadata.height;
       }
-      if (!wsFrameReceived.current) {
-        wsFrameReceived.current = true;
-        reconnectAttemptsRef.current = 0; // Reset backoff only after first real frame
-        clearTimeout(reconnectingTimerRef.current);
-        setStreamMode(s => s === 'ws' ? s : 'ws');
-      }
-
       if (frame.frameType === FRAME_TYPE_H264) {
-          const decoder = ensureH264Decoder(frame.metadata);
-          if (decoder) {
-            const ts = Number(frame.metadata?.ts_us || Date.now()*1000);
-            decodeMetaRef.current.set(ts, frame.metadata?.objects || []);
-            if (decodeMetaRef.current.size > 200) {
-              const cutoff = ts - 5000000;
-              for (const [k] of decodeMetaRef.current) { if (k < cutoff) decodeMetaRef.current.delete(k); else break; }
+          if (!canUseWebCodecs) {
+            wsPreferredTransportRef.current = null;
+            startHttpFallbackNow();
+            return;
+          }
+          const isKeyframe = Boolean(frame.metadata?.keyframe);
+          if (waitingForKeyframeRef.current) {
+            if (!isKeyframe) {
+              return;
             }
-            decoder.decode(new EncodedVideoChunk({ type: frame.metadata?.keyframe ? 'key' : 'delta', timestamp: ts, data: frame.payload }));
+            waitingForKeyframeRef.current = false;
+          }
+          wsPreferredTransportRef.current = 'h264';
+          const decoder = ensureH264Decoder(frame.metadata);
+          if (!decoder) {
+            wsPreferredTransportRef.current = null;
+            startHttpFallbackNow();
+            return;
+          }
+          const ts = Number(frame.metadata?.ts_us || Date.now()*1000);
+          decodeMetaRef.current.set(ts, frame.metadata?.objects || []);
+          if (decodeMetaRef.current.size > 200) {
+            const cutoff = ts - 5000000;
+            for (const [k] of decodeMetaRef.current) { if (k < cutoff) decodeMetaRef.current.delete(k); else break; }
+          }
+          try {
+            decoder.decode(new EncodedVideoChunk({ type: isKeyframe ? 'key' : 'delta', timestamp: ts, data: frame.payload }));
+          } catch {
+            waitingForKeyframeRef.current = true;
+            wsPreferredTransportRef.current = null;
+            startHttpFallbackNow();
           }
       } else if (frame.frameType === FRAME_TYPE_FMP4) {
+          wsPreferredTransportRef.current = 'fmp4';
           const metadata = frame.metadata || {};
           const isInit = metadata.segment_type === 'init' || (frame.flags & 0x01);
           if (isInit) {
@@ -460,6 +536,10 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
           segmentQueueRef.current.push({ payload: frame.payload, objects: metadata.objects || [] });
           drainSegmentQueue();
       } else if (frame.frameType === FRAME_TYPE_JPEG) {
+          if (wsPreferredTransportRef.current === 'h264' || wsPreferredTransportRef.current === 'fmp4') {
+            return;
+          }
+          wsPreferredTransportRef.current = 'jpeg';
           scheduleFrameDecode(new Blob([frame.payload], { type: 'image/jpeg' }), frame.metadata?.objects || []);
       }
     };
@@ -477,6 +557,8 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
       if (!mountedRef.current || wsRef.current !== ws) return;
       wsRef.current = null;
       wsFrameReceived.current = false;
+      wsPreferredTransportRef.current = null;
+      waitingForKeyframeRef.current = true;
       const attempt = reconnectAttemptsRef.current++;
       // Server-initiated close (1001=going away, 1006=abnormal): use longer base delay
       const base = (ev.code === 1001 || ev.code === 1006) ? WS_RECONNECT_MAX_MS / 2 : WS_RECONNECT_BASE_MS;
@@ -498,6 +580,8 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
   useEffect(() => { connectWsRef.current = connectWS; }, [connectWS]);
 
   const startHttpPolling = useCallback(() => {
+    if (httpFallbackStartedRef.current && httpTimerRef.current) return;
+    httpFallbackStartedRef.current = true;
     let consecutiveErrors = 0;
     const poll = async () => {
       if (!mountedRef.current || wsFrameReceived.current) return;
@@ -537,9 +621,33 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
     poll();
   }, [cameraId, scheduleFrameDecode]);
 
+  useEffect(() => { startHttpPollingRef.current = startHttpPolling; }, [startHttpPolling]);
+
+  // ─── Subscribe to METADATA messages emitted via cameraMetaBus ───
+  // Backend can broadcast bbox detections separately from per-frame binary protocol
+  // (e.g. when AI runs at lower FPS than display). This keeps overlays responsive
+  // even if the per-frame metadata.objects array is empty.
+  useEffect(() => {
+    const unsubscribe = cameraMetaBus.on(cameraId, (detections) => {
+      if (!mountedRef.current) return;
+      if (!Array.isArray(detections)) return;
+      // Refresh the persistence buffer; renderLoop will pick this up next tick.
+      currentDetectionsRef.current = detections;
+      detectionsDecayRef.current = 0;
+      // Mark frame buffer dirty so JPEG mode redraws even without a new image
+      const buf = frameBufferRef.current;
+      if (buf.image) {
+        buf.detections = detections;
+        buf.dirty = true;
+      }
+    });
+    return unsubscribe;
+  }, [cameraId]);
+
   // ─── Main lifecycle: connect once, cleanup fully ───
   useEffect(() => {
     mountedRef.current = true;
+    httpFallbackStartedRef.current = false;
     rafRef.current = requestAnimationFrame(renderLoop);
     connectWS();
     fallbackTimerRef.current = setTimeout(() => { if (!wsFrameReceived.current && mountedRef.current) startHttpPolling(); }, WS_FALLBACK_TIMEOUT);
@@ -566,6 +674,8 @@ const CameraFeed = React.memo(({ cameraId, showControls = true }) => {
         wsRef.current = null;
       }
 
+      httpFallbackStartedRef.current = false;
+      wsPreferredTransportRef.current = null;
       resetH264Decoder();
       cleanupMediaSource();
     };

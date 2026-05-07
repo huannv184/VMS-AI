@@ -72,6 +72,15 @@ bool MediaMtxPublisher::start() {
         return false;
     }
 
+    // Ensure this runs on the owner thread to avoid QObject parent thread warnings
+    if (QThread::currentThread() != this->thread()) {
+        bool success = false;
+        QMetaObject::invokeMethod(this, [this, &success]() {
+            success = this->start();
+        }, Qt::BlockingQueuedConnection);
+        return success;
+    }
+
     if (m_process && m_process->state() != QProcess::NotRunning) return true;
 
     m_process = std::make_unique<QProcess>(this);
@@ -80,12 +89,13 @@ bool MediaMtxPublisher::start() {
     m_waitingForKeyframe = true;
 
     // R5: Extract Argument List (Exact flags and order)
-    // -analyzeduration 0 -probesize 32: don't wait for extra data — SPS/PPS in the
-    // first keyframe is sufficient because we gate on IDR before writing to the pipe.
+    // -analyzeduration and -probesize increased to allow FFmpeg to detect framerate correctly from raw stream
+    // -use_wallclock_as_timestamps 1 ensures DTS/PTS are monotonic based on arrival time from pipe
     QStringList args;
     args << "-loglevel" << "warning"
-         << "-analyzeduration" << "0"
-         << "-probesize" << "32"
+         << "-use_wallclock_as_timestamps" << "1"
+         << "-analyzeduration" << "1000000"
+         << "-probesize" << "1000000"
          << "-f" << "h264"
          << "-i" << "pipe:0"
          << "-c" << "copy"

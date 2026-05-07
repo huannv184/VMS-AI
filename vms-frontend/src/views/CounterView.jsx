@@ -1,45 +1,130 @@
 import React, { useState, useEffect } from 'react';
-import { Footprints, Car, TrendingUp, Users, AlertCircle, RefreshCw, BarChart, Download, Flame } from 'lucide-react';
+import { Footprints, Car, TrendingUp, Users, AlertCircle, RefreshCw, BarChart, Download, Flame, Plus, Edit2, Trash2, Move } from 'lucide-react';
 import useVmsStore from '../store/useVmsStore';
 import apiClient from '../api/apiClient';
+import CountingLineEditor from '../components/CountingLineEditor';
 
 const CounterView = () => {
   const counts = useVmsStore((state) => state.counts);
   const lineCrossingData = useVmsStore((state) => state.lineCrossingData);
   const cameras = useVmsStore((state) => state.cameras);
   const [trafficSummaries, setTrafficSummaries] = useState([]);
+  const [trafficHistory, setTrafficHistory] = useState([]);
   const [loading, setLoading] = useState(true);
   const [retentionDays, setRetentionDays] = useState(30);
+  const [capacityThreshold, setCapacityThreshold] = useState(80);
+  const [audibleAlert, setAudibleAlert] = useState(true);
   const [savingSettings, setSavingSettings] = useState(false);
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [heatmapData, setHeatmapData] = useState([]);
   const [exporting, setExporting] = useState(false);
 
-  useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      try {
-        // 1. Fetch traffic summaries
-        if (cameras.length > 0) {
-          const summaries = await Promise.all(
-            cameras.map(cam => apiClient.getTrafficSummary(cam.id))
-          );
-          const validSummaries = summaries.filter((s) => s.success).map((s) => s.data);
-          setTrafficSummaries(validSummaries);
-        }
+  // Counting lines management
+  const [lines, setLines]               = useState([]);
+  const [linesLoading, setLinesLoading] = useState(false);
+  const [editorState, setEditorState]   = useState(null); // { cameraId, line }
 
-        const settings = await apiClient.getSettings();
-        if (settings.success && settings.data?.analytics_retention_days) {
+  // Memoize the camera id list so a fresh array reference from the store
+  // doesn't retrigger the heavy fetch loop unnecessarily.
+  const cameraIds = React.useMemo(() => cameras.map((c) => c.id).join(','), [cameras]);
+
+  const fetchData = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      if (cameras.length > 0) {
+        const summaries = await Promise.all(cameras.map((cam) => apiClient.getTrafficSummary(cam.id)));
+        const validSummaries = summaries.filter((s) => s.success).map((s) => s.data);
+        setTrafficSummaries(validSummaries);
+
+        const history = await apiClient.getTrafficHistory(cameras[0].id);
+        if (history.success) {
+          setTrafficHistory(history.data?.history || history.data?.points || []);
+        }
+      }
+
+      const settings = await apiClient.getSettings();
+      if (settings.success && settings.data) {
+        if (settings.data.analytics_retention_days) {
           setRetentionDays(parseInt(settings.data.analytics_retention_days, 10));
         }
-      } catch (err) {
-        console.error('CounterView: fetch error', err);
-      } finally {
-        setLoading(false);
+        if (settings.data.counter_capacity_threshold) {
+          setCapacityThreshold(parseInt(settings.data.counter_capacity_threshold, 10));
+        }
+        if (settings.data.counter_audible_alert !== undefined) {
+          setAudibleAlert(Boolean(settings.data.counter_audible_alert));
+        }
       }
-    };
+    } catch (err) {
+      console.error('CounterView: fetch error', err);
+    } finally {
+      setLoading(false);
+    }
+    // cameras dep stays via cameraIds memo to avoid identity loop
+  }, [cameraIds]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
     fetchData();
-  }, [cameras]);
+  }, [fetchData]);
+
+  const refreshLines = React.useCallback(async () => {
+    setLinesLoading(true);
+    try {
+      const res = await apiClient.getCountingLines();
+      if (res.success) setLines(res.data?.lines || []);
+    } catch (err) {
+      console.error('CounterView: refreshLines error', err);
+    } finally {
+      setLinesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { refreshLines(); }, [refreshLines]);
+
+  const handleDeleteLine = async (id) => {
+    if (!window.confirm('Xóa vạch đếm này? Không thể hoàn tác.')) return;
+    try {
+      const res = await apiClient.deleteCountingLine(id);
+      if (res.success) {
+        await refreshLines();
+      } else {
+        alert(res.error || 'Xóa thất bại');
+      }
+    } catch (e) {
+      alert(e.message || 'Lỗi mạng');
+    }
+  };
+
+  const handleThresholdChange = async (val) => {
+    setCapacityThreshold(val);
+    try {
+      await apiClient.updateSettings({ counter_capacity_threshold: val });
+    } catch (err) {
+      console.warn('Failed to persist capacity threshold', err);
+    }
+  };
+
+  const handleAudibleToggle = async () => {
+    const next = !audibleAlert;
+    setAudibleAlert(next);
+    try {
+      await apiClient.updateSettings({ counter_audible_alert: next });
+    } catch (err) {
+      console.warn('Failed to persist audible alert', err);
+    }
+  };
+
+  // Build hourly buckets (07h..22h, 16 cells) from server history if available
+  const hourlyTraffic = React.useMemo(() => {
+    const buckets = new Array(16).fill(0);
+    (trafficHistory || []).forEach((h) => {
+      const hour = h.hour ?? new Date((h.timestamp || 0) * 1000).getHours();
+      const value = h.count ?? h.total ?? ((h.in || 0) + (h.out || 0));
+      const idx = hour - 7;
+      if (idx >= 0 && idx < buckets.length) buckets[idx] += value;
+    });
+    return buckets;
+  }, [trafficHistory]);
+  const maxHourly = Math.max(1, ...hourlyTraffic);
 
   const handleUpdateRetention = async () => {
     setSavingSettings(true);
@@ -141,8 +226,8 @@ const CounterView = () => {
           <div className="analytics-card span2 glass">
             <div className="analytics-card-title">
               Thống kê đường đếm (Line Crossing)
-              <button className="config-btn" style={{ fontSize: 9 }}>
-                <RefreshCw size={10} /> Làm mới
+              <button className="config-btn" style={{ fontSize: 9 }} onClick={fetchData} disabled={loading}>
+                <RefreshCw size={10} /> {loading ? 'Đang tải...' : 'Làm mới'}
               </button>
             </div>
             <table className="lpr-table">
@@ -201,21 +286,28 @@ const CounterView = () => {
             <div className="analytics-card-title">Cấu hình Cảnh báo</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div className="ai-row">
-                <div className="ai-row-label">Ngưỡng tối đa (%)</div>
-                <input className="config-input" defaultValue="80" style={{ width: 40 }} />
+                <div className="ai-row-label">Ngưỡng tối đa (người)</div>
+                <input
+                  className="config-input"
+                  type="number"
+                  min={1}
+                  value={capacityThreshold}
+                  onChange={(e) => handleThresholdChange(parseInt(e.target.value, 10) || 0)}
+                  style={{ width: 60 }}
+                />
               </div>
               <div className="ai-row">
                 <div className="ai-row-label">Ngày lưu trữ (Retention)</div>
                 <div style={{ display: 'flex', gap: 5 }}>
-                  <input 
-                    className="config-input" 
+                  <input
+                    className="config-input"
                     type="number"
-                    value={retentionDays} 
+                    value={retentionDays}
                     onChange={(e) => setRetentionDays(e.target.value)}
-                    style={{ width: 50 }} 
+                    style={{ width: 50 }}
                   />
-                  <button 
-                    className="config-btn" 
+                  <button
+                    className="config-btn"
                     onClick={handleUpdateRetention}
                     disabled={savingSettings}
                     style={{ padding: '0 8px', height: 24 }}
@@ -226,20 +318,26 @@ const CounterView = () => {
               </div>
               <div className="ai-row">
                 <div className="ai-row-label">Âm báo khu vực</div>
-                <div className="toggle on" style={{ width: 30, height: 15 }}><div className="toggle-dot" /></div>
+                <div
+                  className={`toggle ${audibleAlert ? 'on' : ''}`}
+                  style={{ width: 30, height: 15, cursor: 'pointer' }}
+                  onClick={handleAudibleToggle}
+                >
+                  <div className="toggle-dot" />
+                </div>
               </div>
               <div className="ai-row">
                 <div className="ai-row-label">Reset hằng ngày</div>
                 <div className="config-select">00:00</div>
               </div>
-              
-              {counts.people > 80 && (
+
+              {counts.people > capacityThreshold && (
                 <div style={{ marginTop: 10, padding: 10, background: 'rgba(255,48,96,0.05)', borderRadius: 4, border: '1px solid rgba(255,48,96,0.1)' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--danger)', fontSize: 11, fontWeight: 700 }}>
                     <AlertCircle size={14} /> CẢNH BÁO CAPACITY
                   </div>
                   <div style={{ fontSize: 9, color: 'var(--text-secondary)', marginTop: 4 }}>
-                    Số người phát hiện đang ở mức cao. Cần điều phối luồng người.
+                    Đã phát hiện {counts.people} người (ngưỡng {capacityThreshold}). Cần điều phối luồng người.
                   </div>
                 </div>
               )}
@@ -247,20 +345,113 @@ const CounterView = () => {
           </div>
         </div>
 
+        {/* Counting Lines management */}
+        <div className="analytics-card span3 glass" style={{ marginTop: 10 }}>
+          <div className="analytics-card-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span><Move size={12} style={{ marginRight: 6 }} /> Quản lý vạch đếm (Counting Lines)</span>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="config-btn" onClick={refreshLines} disabled={linesLoading} style={{ fontSize: 10 }}>
+                <RefreshCw size={10} /> {linesLoading ? '...' : 'Làm mới'}
+              </button>
+            </div>
+          </div>
+
+          {cameras.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: 24, color: 'var(--text-dim)' }}>
+              Chưa có camera nào trong hệ thống.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10 }}>
+              {cameras.map((cam) => {
+                const camLines = lines.filter((ln) => ln.camera_id === cam.id);
+                return (
+                  <div key={cam.id} style={{
+                    border: '1px solid var(--border)', borderRadius: 6,
+                    padding: 10, background: 'rgba(0,0,0,0.25)',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700 }}>
+                        {cam.name || `CAM-${cam.id}`} <span style={{ color: 'var(--text-dim)', fontWeight: 400 }}>· {camLines.length} vạch</span>
+                      </div>
+                      <button className="config-btn"
+                              onClick={() => setEditorState({ cameraId: cam.id, line: null })}
+                              style={{ padding: '3px 8px', fontSize: 10 }}>
+                        <Plus size={11} /> Thêm vạch
+                      </button>
+                    </div>
+                    {camLines.length === 0 ? (
+                      <div style={{ fontSize: 10, color: 'var(--text-dim)', padding: '4px 0' }}>
+                        Chưa có vạch đếm — bấm "Thêm vạch" để vẽ trên snapshot.
+                      </div>
+                    ) : (
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                        <thead>
+                          <tr style={{ borderBottom: '1px solid var(--border)', color: 'var(--text-dim)' }}>
+                            <th style={{ textAlign: 'left',  padding: 4 }}>Tên</th>
+                            <th style={{ textAlign: 'left',  padding: 4 }}>A→B / B→A</th>
+                            <th style={{ textAlign: 'left',  padding: 4 }}>Class</th>
+                            <th style={{ textAlign: 'center', padding: 4 }}>Bật</th>
+                            <th style={{ textAlign: 'right',  padding: 4 }}>Hành động</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {camLines.map((ln) => (
+                            <tr key={ln.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                              <td style={{ padding: 4 }}>{ln.name || `Line #${ln.id}`}</td>
+                              <td style={{ padding: 4, fontFamily: "'Share Tech Mono'", color: 'var(--accent3)' }}>
+                                {ln.direction_a_label || 'in'} / {ln.direction_b_label || 'out'}
+                              </td>
+                              <td style={{ padding: 4, color: 'var(--text-dim)' }}>
+                                {(() => { try { return (JSON.parse(ln.object_classes_json || '["person"]') || []).join(', '); } catch { return 'person'; } })()}
+                              </td>
+                              <td style={{ padding: 4, textAlign: 'center' }}>
+                                {ln.enabled ? '✓' : <span style={{ color: 'var(--text-dim)' }}>—</span>}
+                              </td>
+                              <td style={{ padding: 4, textAlign: 'right' }}>
+                                <button className="config-btn"
+                                        onClick={() => setEditorState({ cameraId: cam.id, line: ln })}
+                                        style={{ padding: '2px 6px', marginRight: 4 }}>
+                                  <Edit2 size={10} />
+                                </button>
+                                <button className="config-btn danger"
+                                        onClick={() => handleDeleteLine(ln.id)}
+                                        style={{ padding: '2px 6px' }}>
+                                  <Trash2 size={10} />
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {editorState && (
+          <CountingLineEditor
+            cameraId={editorState.cameraId}
+            cameraName={cameras.find((c) => c.id === editorState.cameraId)?.name}
+            initialLine={editorState.line}
+            onSave={async () => { await refreshLines(); setEditorState(null); }}
+            onClose={() => setEditorState(null)}
+          />
+        )}
+
         {/* Capacity Tracking Chart */}
         <div className="analytics-card span3 glass" style={{ marginTop: 10 }}>
-          <div className="analytics-card-title">Biểu đồ lưu lượng trong ngày (In/Out)</div>
+          <div className="analytics-card-title">Biểu đồ lưu lượng trong ngày (07h–22h)</div>
           <div className="bar-chart" style={{ height: 120 }}>
-            {Array.from({ length: 16 }).map((_, i) => {
+            {hourlyTraffic.map((value, i) => {
+              const heightPct = (value / maxHourly) * 100;
+              const ratio = value / Math.max(1, capacityThreshold);
+              const color = ratio > 1 ? 'var(--danger)' : ratio > 0.7 ? 'var(--warn)' : 'var(--accent3)';
               return (
-                <div key={i} className="bar-col">
-                  <div 
-                    className="bar-bar" 
-                    style={{ 
-                      height: '2px', 
-                      background: 'var(--accent3)'
-                    }} 
-                  />
+                <div key={i} className="bar-col" title={`${i + 7}h: ${value}`}>
+                  <div className="bar-bar" style={{ height: `${Math.max(2, heightPct)}%`, background: color }} />
                   <div className="bar-x">{i + 7}h</div>
                 </div>
               );

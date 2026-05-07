@@ -1,39 +1,55 @@
-# Dependencies
-**/node_modules/
-**/vcpkg_installed/
+# build & runtime
+build/
+.audit_runtime/
+logs/
+*.log
 
-# Build outputs
-**/build/
-**/cmake-build-*/
-**/CMakeFiles/
-**/CMakeCache.txt
-**/*.vcxproj*
-**/*.sln
-**/*.obj
-**/*.pdb
-**/*.ilk
-**/*.lib
-**/*.exp
-**/*.dll
-**/*.exe
+# data
+data/
+/database/
 
-# Frontend build
-vms-frontend/dist/
+# dependencies
+node_modules/
 
-# Logs and runtime data
-**/logs/
-**/*.log
-**/recordings/
-**/data/events.db
-**/data/*.db
-**/data/*.db-*
+# env
+.env
 
-# OS / IDE
-.DS_Store
-Thumbs.db
-*.swp
+# IDE
 .vscode/
+.vs/
+*.user
+*.suo
 
-# Local tooling caches
+# AI / media files
+*.mp4
+*.avi
+*.pt
+*.onnx
+*.h5
+
+# archive
+*.zip
+*.tar
+
+# CMake / MSBuild generated artifacts (never commit these)
+*.vcxproj
+*.vcxproj.filters
+*.sln
+cmake_install.cmake
+CMakeCache.txt
+CMakeFiles/
+_deps/
+CTestTestfile.cmake
+RUN_TESTS.cmake
+install_manifest.txt
+vcpkg_installed/
+
+# External service binaries (large, downloaded at setup time)
+external_services/postgresql/bin/
+external_services/postgresql/lib/
+external_services/postgresql/pgAdmin 4/
+external_services/minio.exe
+external_services/mediamtx/mediamtx.exe
+
+# Claude Code settings (local only)
 .claude/settings.local.json
-cpp-backend/.cache/

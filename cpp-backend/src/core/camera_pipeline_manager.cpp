@@ -7,24 +7,33 @@
 // ==============================================================
 
 #include <QThread>
-#include <QTimer>
 #include <QMetaObject>
 #include <QObject>
 #include <QCoreApplication>
 #include "core/native_reader_worker.h"
 #include <QByteArray>
 #include "streaming/camera_stream_manager_qt.h"
-#include "streaming/mediamtx_publisher.h"
 #include "core/camera_pipeline_manager.h"
 #include "core/ffmpeg_process.h"
-#include "recording/buffer_pipeline.h"
-#include "recording/continuous_recorder.h"
+#include "core/frame_bus.h"
+#include "core/frame_bus_diagnostics.h"
+#include "core/health_monitor.h"
+#include "core/media_pipeline.h"
+#include "core/pipeline_state_store.h"
 #include "core/camera_manager.h"
 #include "database/models.h"
 #include "utils/logger.h"
 #include "utils/config.h" // Added for config access
 #include "database/camera_repository.h" // Added for camera name lookup
 #include <cstdint> // Added for uint64_t
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <fstream>
+#include <sstream>
+#include <unistd.h>
+#endif
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include "utils/api_utils.h"
@@ -40,6 +49,7 @@
 #include <cstring>
 #include <atomic>
 #include <cmath>  // For std::pow in exponential backoff
+#include <cstdio>
 #include <thread>
 #include <mutex>
 #include "inference/tracking.h"
@@ -74,6 +84,39 @@ namespace {
     constexpr int WATCHDOG_CHECK_INTERVAL_SEC = 5;
     constexpr int FRAME_TIMEOUT_MS = 15000;
     constexpr size_t MAX_FRAME_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB safety limit
+
+    std::string selectLiveRtspUrl(const std::string& main_url, const std::string& sub_url) {
+        if (!sub_url.empty()) {
+            return sub_url;
+        }
+        return main_url;
+    }
+
+    std::string detectAvcCodecString(const QByteArray& packet, const std::string& fallback) {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(packet.constData());
+        const int size = packet.size();
+        for (int i = 0; i + 8 < size; ++i) {
+            int start_code_len = 0;
+            if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1) {
+                start_code_len = 3;
+            } else if (i + 4 < size && bytes[i] == 0 && bytes[i + 1] == 0 &&
+                       bytes[i + 2] == 0 && bytes[i + 3] == 1) {
+                start_code_len = 4;
+            }
+            if (start_code_len == 0) {
+                continue;
+            }
+            const int nal_index = i + start_code_len;
+            if ((bytes[nal_index] & 0x1F) != 7 || nal_index + 3 >= size) {
+                continue;
+            }
+            char codec[16];
+            std::snprintf(codec, sizeof(codec), "avc1.%02X%02X%02X",
+                          bytes[nal_index + 1], bytes[nal_index + 2], bytes[nal_index + 3]);
+            return codec;
+        }
+        return fallback;
+    }
 }
 
 // Definition of PipelineContext (Moved from header to hide implementation details)
@@ -92,24 +135,19 @@ struct PipelineContext {
     
     // AI Integration
     std::unique_ptr<FFmpegProcess> ai_process;
-    
-    // MediaMTX WebRTC Publisher (forwards raw H264 → MediaMTX RTSP → WebRTC WHEP)
-    std::unique_ptr<vms::streaming::MediaMtxPublisher> mediamtx_publisher;
-    
+
     // Shared Memory Manager
     std::unique_ptr<::ipc::SharedMemoryManager> shm_manager;
-    
-    // Buffer Pipeline (RAM Circular Buffer)
-    std::unique_ptr<vms::recording::BufferPipeline> buffer_pipeline;
-    
-    // Continuous 24/7 Recorder (segment-based)
-    std::unique_ptr<vms::recording::ContinuousRecorder> continuous_recorder;
-    std::mutex objects_mutex;
-    std::vector<inference::TrackedObject> latest_objects;
-    
-    std::mutex frame_mutex;
-    std::vector<char> latest_frame;
-    
+
+    // Phase B (2026-05-07): the BufferPipeline + MediaMtxPublisher + ContinuousRecorder
+    // trio used to live as 3 raw unique_ptrs here. They are now grouped behind
+    // MediaPipeline so PipelineContext stays focused on the inference/IO path
+    // and lifecycle ordering for the media subsystems is owned in one place.
+    std::unique_ptr<vms::core::MediaPipeline> media;
+
+    // Phase B: ctx-local caches for latest_objects/latest_frame/last_metadata_json_
+    // were removed in favor of PipelineStateStore as the single source of truth.
+
     std::atomic<int64_t> last_frame_ts{0};
     std::atomic<double> current_fps{0.0};
     std::atomic<int> restart_count{0};
@@ -119,20 +157,39 @@ struct PipelineContext {
     std::chrono::steady_clock::time_point last_log_time;
     std::chrono::steady_clock::time_point last_ai_log_time;          // PERF: throttle AI detection logging
     std::chrono::steady_clock::time_point last_event_process_time;   // PERF: throttle AiEventProcessor
+    std::chrono::steady_clock::time_point fps_window_start;
+    uint32_t fps_window_frames{0};
     uint64_t frame_count_{0};                                         // PERF: per-camera frame counter
 
     std::string rtsp_url;
     std::string sub_stream_url;
+    std::string live_rtsp_url;
+    bool use_h264_live_ws{false};
+    std::string h264_codec{"avc1.42E01E"};
     std::string camera_name;
     bool using_backup_stream = false;
     std::chrono::steady_clock::time_point start_time;
-    nlohmann::json last_metadata_json_;
+
+    // ZmqEventBridge metadata subscription. The connection's receiver context is
+    // qApp (lives forever), so without an explicit disconnect each camera restart
+    // would add another lambda — after N restarts the ZMQ event would be processed
+    // N times, inflating CPU and double-writing PipelineStateStore. Tracking the
+    // handle here lets ~PipelineContext() detach exactly its own subscription.
+    QMetaObject::Connection metadata_subscription;
 
     // Explicit destructor: enforce safe shutdown order (no per-camera QTimer anymore;
     // global watchdog in CameraPipelineManager handles all cameras).
     ~PipelineContext() {
         should_stop = true;
         running = false;
+
+        // 0. Drop the ZMQ metadata subscription before anything else so the lambda
+        //    cannot fire mid-teardown and observe half-destroyed state. Safe to call
+        //    even if the connection was never established (default-constructed handle
+        //    yields a no-op disconnect).
+        if (metadata_subscription) {
+            QObject::disconnect(metadata_subscription);
+        }
 
         // 1. Join the NativeReaderWorker thread FIRST.
         //    The worker emits signals into the Qt event loop; joining it guarantees
@@ -147,14 +204,15 @@ struct PipelineContext {
             }
         }
 
-        // 3. Stop recording subsystems.
-        if (buffer_pipeline)     buffer_pipeline->stop();
-        if (continuous_recorder) continuous_recorder->stop();
+        // 3. Tear down media subsystems (BufferPipeline + ContinuousRecorder +
+        //    MediaMtxPublisher). MediaPipeline::stop() preserves the legacy
+        //    ordering buffer → continuous_recorder → mediamtx; this reset()
+        //    triggers stop() then destruction.
+        media.reset();
 
-        // 4. Stop media relay and AI subprocess.
-        if (mediamtx_publisher) mediamtx_publisher->stop();
-        if (ai_process)         ai_process->stop();
-        if (process)            process->stop();
+        // 4. Stop AI subprocess + reader's FFmpeg process.
+        if (ai_process) ai_process->stop();
+        if (process)    process->stop();
 
         // Remaining members (shm_manager, native_reader, frames, etc.)
         // are cleaned up by their own destructors in reverse declaration order.
@@ -174,6 +232,7 @@ CameraPipelineManager::CameraPipelineManager() {
     // If "Address in use" happens after a crash, we should handle it by
     // retrying binds / using per-instance ports and by shutting down child
     // processes cleanly during normal stop().
+    HealthMonitor::getInstance().start([this]() { globalWatchdogTick(); });
 }
 
 void CameraPipelineManager::startAllPipelines() {
@@ -182,7 +241,7 @@ void CameraPipelineManager::startAllPipelines() {
     auto cameras = camera_manager.getAllCameras();
     
     for (const auto& cam : cameras) {
-        if (cam.is_active || !cam.rtsp_url.empty()) {
+        if (cam.is_active && !cam.rtsp_url.empty()) {
             LOG_INFO("Auto-starting camera {}: {}", cam.id, cam.name);
             startPipeline(cam.id, cam.rtsp_url);
         }
@@ -190,19 +249,7 @@ void CameraPipelineManager::startAllPipelines() {
 }
 
 CameraPipelineManager::~CameraPipelineManager() {
-    // Stop global watchdog before destroying pipelines so the tick never fires
-    // on a partially-destroyed pipeline map.
-    if (global_watchdog_timer_) {
-        QTimer* t = global_watchdog_timer_;
-        global_watchdog_timer_ = nullptr;
-        if (QThread::currentThread() == t->thread()) {
-            t->stop();
-            delete t;
-        } else {
-            QMetaObject::invokeMethod(t, [t]() { t->stop(); t->deleteLater(); },
-                                      Qt::BlockingQueuedConnection);
-        }
-    }
+    HealthMonitor::getInstance().stop();
     stopAllPipelines();
 }
 
@@ -254,19 +301,45 @@ bool CameraPipelineManager::startPipeline(int camera_id, const std::string& rtsp
     catch (...) { return false; }
 
     if (!camera_opt) return false;
+
+    PipelineStateStore::getInstance().registerCamera(camera_id);
+    HealthMonitor::getInstance().registerCamera(camera_id);
+    HealthMonitor::getInstance().clearFailure(camera_id);
+    // Subscribe diagnostics so the FrameBus contract is exercised end-to-end on every
+    // camera. Cheap onFrame (one relaxed atomic + throttled log) — does not affect
+    // the producer hot path measurably.
+    FrameBusDiagnostics::getInstance().attach(camera_id);
     std::string sub_url = camera_opt->sub_stream_url;
+    std::string live_url = selectLiveRtspUrl(rtsp_url, sub_url);
     std::string camera_name_cached = camera_opt->name.empty() ? "Camera " + std::to_string(camera_id) : camera_opt->name;
 
     auto ctx = std::make_unique<PipelineContext>();
     ctx->camera_name = camera_name_cached;
     ctx->rtsp_url = rtsp_url;
     ctx->sub_stream_url = sub_url;
+    ctx->live_rtsp_url = live_url;
+    // Raw H264-over-WS is too fragile across heterogeneous RTSP cameras
+    // (packetization/profile/timestamp variance). Keep RTSP on the stable
+    // JPEG live path for now; sub-stream selection still removes most of the
+    // previous decode cost.
+    ctx->use_h264_live_ws = false;
     
     // BUG 3 FIX: Initialize last_frame_ts to current system time to avoid immediate watchdog timeout.
     auto now_init = std::chrono::system_clock::now();
     ctx->last_frame_ts = std::chrono::duration_cast<std::chrono::milliseconds>(now_init.time_since_epoch()).count();
     // Record pipeline start time for watchdog grace period
     ctx->start_time = std::chrono::steady_clock::now();
+    ctx->fps_window_start = ctx->start_time;
+    PipelineStateStore::getInstance().updateStats(camera_id, 0.0, 0, ctx->last_frame_ts.load(),
+                                                  CameraState::CONNECTING, true);
+    HealthMonitor::getInstance().updateFrameHeartbeat(camera_id, static_cast<uint64_t>(ctx->last_frame_ts.load()));
+    HealthMonitor::getInstance().setState(camera_id, CameraState::CONNECTING);
+
+    if (live_url != rtsp_url) {
+        LOG_INFO("[Manager] Camera {} live pipeline using sub stream: {}", camera_id, live_url);
+    } else {
+        LOG_INFO("[Manager] Camera {} live pipeline using primary stream", camera_id);
+    }
     
     // Detect model path relative to executable or CWD
     std::string model_path = "models/yolo11m.engine";
@@ -289,8 +362,25 @@ bool CameraPipelineManager::startPipeline(int camera_id, const std::string& rtsp
         ctx->ai_process->moveProcessToThread(QCoreApplication::instance()->thread());
         std::string db_path = vms::Config::getInstance().getDatabaseConfig().path;
         std::string ai_config_json = camera_opt->ai_config.empty() ? "{}" : camera_opt->ai_config;
+
+        // Windows CommandLineToArgvW: inside a "..."-quoted argument, an embedded
+        // double-quote must be written as \". A backslash followed by a quote is
+        // an escaped quote; a backslash NOT followed by a quote is a literal \.
+        // The previous version wrote `"\""` (== "), which left every JSON quote
+        // unescaped → cmd-line tokenization broke on the first `:` and ai_worker
+        // received "{":<...>" as separate tokens, fell through to the catch-all
+        // and ran with default config → user-set face_match_threshold ignored.
         std::string escaped_json;
-        for (char c : ai_config_json) escaped_json += (c == '"' ? "\"" : std::string(1, c));
+        escaped_json.reserve(ai_config_json.size() + 8);
+        for (char c : ai_config_json) {
+            if (c == '\\') {
+                escaped_json += "\\\\";
+            } else if (c == '"') {
+                escaped_json += "\\\"";
+            } else {
+                escaped_json += c;
+            }
+        }
 
         // Detect AI worker executable path robustly
         std::string ai_worker_exe = "ai_worker_v2.exe";
@@ -339,14 +429,26 @@ bool CameraPipelineManager::startPipeline(int camera_id, const std::string& rtsp
     
     ctx->shm_manager = std::make_unique<::ipc::SharedMemoryManager>(camera_id);
     ctx->shm_manager->initialize();
-    
-    vms::streaming::StreamProfile rec_profile; rec_profile.rtsp_url = rtsp_url;
-    ctx->buffer_pipeline = std::make_unique<vms::recording::BufferPipeline>(camera_id, rec_profile);
-    ctx->buffer_pipeline->start();
-    
+
+    // ── MediaPipeline construction + Phase 1 (BufferPipeline) ─────────────
+    // Phases 2 and 3 (MediaMTX publisher / ContinuousRecorder) come later in
+    // this function to preserve the original lifecycle ordering.
+    {
+        vms::core::MediaPipeline::Config mcfg;
+        mcfg.camera_id        = camera_id;
+        mcfg.live_url         = live_url;
+        mcfg.recording_url    = sub_url.empty() ? rtsp_url : sub_url;
+        mcfg.segment_seconds  = 60;
+        mcfg.retention_days   = 7;
+        mcfg.mediamtx_enabled = (qEnvironmentVariable("VMS_ENABLE_MEDIAMTX", "0") == QStringLiteral("1"));
+        mcfg.mediamtx_url     = qEnvironmentVariable("VMS_MEDIAMTX_URL", "").toStdString();
+        ctx->media = std::make_unique<vms::core::MediaPipeline>(std::move(mcfg));
+    }
+    ctx->media->startBuffer();
+
     // The stream will be opened by NativeReaderWorker::run() in its own thread.
     
-    auto* worker = new NativeReaderWorker(camera_id, rtsp_url);
+    auto* worker = new NativeReaderWorker(camera_id, live_url);
     ctx->native_reader_thread.reset(worker);
     ctx->worker_ptr = worker; // non-owning; valid for lifetime of ctx
     
@@ -360,80 +462,81 @@ bool CameraPipelineManager::startPipeline(int camera_id, const std::string& rtsp
                          auto it = pipelines_.find(camera_id);
                          if (it != pipelines_.end()) {
                              auto raw_ctx = it->second.get();
-                             if (raw_ctx->buffer_pipeline) {
-                                 raw_ctx->buffer_pipeline->writeRawData(reinterpret_cast<const uint8_t*>(data.constData()), data.size());
+                             if (raw_ctx->media) {
+                                 raw_ctx->media->writeRawData(
+                                     reinterpret_cast<const uint8_t*>(data.constData()),
+                                     static_cast<std::size_t>(data.size()));
+                             }
+                             if (raw_ctx->use_h264_live_ws &&
+                                 vms::streaming::CameraStreamManager::getInstance().getClientCount(camera_id) > 0) {
+                                 if (isKeyframe) {
+                                     raw_ctx->h264_codec = detectAvcCodecString(data, raw_ctx->h264_codec);
+                                 }
+                                 // Phase B: read latest objects from PipelineStateStore (single
+                                 // source of truth). Previously dual-read from ctx->latest_objects.
+                                 // The store's shared_mutex grants concurrent reads under load.
+                                 auto objects = PipelineStateStore::getInstance().latestObjects(camera_id);
+                                 const uint64_t now_us = static_cast<uint64_t>(
+                                     std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::system_clock::now().time_since_epoch()).count());
+                                 vms::streaming::CameraStreamManager::getInstance().broadcastH264Frame(
+                                     camera_id,
+                                     data,
+                                     objects,
+                                     now_us,
+                                     isKeyframe,
+                                     raw_ctx->h264_codec,
+                                     "",
+                                     static_cast<int>(FRAME_WIDTH),
+                                     static_cast<int>(FRAME_HEIGHT));
                              }
                          }
                      }, Qt::QueuedConnection);
                      
-    // FaceID Phase 2: Metadata update from ZmqEventBridge
-    QObject::connect(&vms::ipc::ZmqEventBridge::getInstance(), &vms::ipc::ZmqEventBridge::eventReceived, qApp,
-                     [this, camera_id](const QString& type, const QString& raw_json) {
-                         if (type == "metadata" || type == "METADATA") {
-                             std::shared_lock<std::shared_mutex> lock(mutex_);
-                             auto it = pipelines_.find(camera_id);
-                             if (it != pipelines_.end()) {
-                                 try {
-                                     auto j = nlohmann::json::parse(raw_json.toStdString());
-                                     if (j.value("camera_id", -1) == camera_id) {
-                                         it->second->last_metadata_json_ = j;
-                                     }
-                                 } catch (...) {}
-                             }
-                         }
-                     });
+    // FaceID Phase 2: Metadata update from ZmqEventBridge.
+    // BUG-CPL-01 FIX: stash the connection handle so ~PipelineContext() can
+    // disconnect it on stopPipeline()/restart. Receiver context stays qApp so
+    // the lambda runs on the Qt main thread (consistent with the rest of the
+    // pipeline's signal model); without the explicit disconnect the lambda
+    // outlived the PipelineContext and accumulated one extra duplicate handler
+    // per restart.
+    ctx->metadata_subscription = QObject::connect(
+        &vms::ipc::ZmqEventBridge::getInstance(), &vms::ipc::ZmqEventBridge::eventReceived, qApp,
+        [this, camera_id](const QString& type, const QString& raw_json) {
+            if (type == "metadata" || type == "METADATA") {
+                // Phase B: pipelines_ membership check still uses the manager's
+                // shared mutex; the actual write goes only to PipelineStateStore.
+                {
+                    std::shared_lock<std::shared_mutex> lock(mutex_);
+                    if (pipelines_.find(camera_id) == pipelines_.end()) return;
+                }
+                try {
+                    auto j = nlohmann::json::parse(raw_json.toStdString());
+                    if (j.value("camera_id", -1) == camera_id) {
+                        PipelineStateStore::getInstance().updateMetadata(camera_id, j);
+                    }
+                } catch (...) {}
+            }
+        });
                      
-    // [R10] MediaMTX WebRTC Publisher ─────────────────────────────────────
-    // Forward raw H264 packets to MediaMTX for WebRTC WHEP delivery.
-    // This runs a separate FFmpeg process: pipe:0 -> rtsp://localhost:8554/cam_<id>
-    {
-        // [R6] Prepare config for publisher. 
-        // Note: In a full implementation, these would be loaded from the database into the Camera model.
-        // For now, we use defaults as per R5/R6 requirements.
-        CameraConfig cfg;
-        cfg.mediamtx_url = ""; // Will fallback to rtsp://localhost:8554 in publisher
-        cfg.ffmpeg_path = "";  // Will fallback to "ffmpeg" in publisher
-
-        // [R10] Fetch stream profile for the SUB stream
-        vms::streaming::StreamProfile profile = vms::streaming::StreamProfile::createSub(rtsp_url);
-
-        ctx->mediamtx_publisher = std::make_unique<vms::streaming::MediaMtxPublisher>(camera_id, profile, cfg);
-        // Move to Qt main thread so QTimer children and QProcess (created in start()) live there.
-        ctx->mediamtx_publisher->moveToThread(QCoreApplication::instance()->thread());
-
-        // start() creates QProcess and starts QTimers — must run on owner thread.
-        bool pub_started = false;
-        auto* pub = ctx->mediamtx_publisher.get();
-        if (QThread::currentThread() == QCoreApplication::instance()->thread()) {
-            pub_started = pub->start();
-        } else {
-            QMetaObject::invokeMethod(pub, [pub, &pub_started]() {
-                pub_started = pub->start();
-            }, Qt::BlockingQueuedConnection);
-        }
-        if (pub_started) {
-            LOG_INFO("[Manager] MediaMTX publisher started for camera {} -> {}",
-                     camera_id, ctx->mediamtx_publisher->getPublishUrl().toStdString());
-        } else {
-            LOG_WARN("[Manager] MediaMTX publisher failed for camera {} (WebRTC fallback to WS only)", camera_id);
-        }
-    }
-
-    // [R10] Connect rawPacketReady -> MediaMTX publisher
-    if (ctx->mediamtx_publisher) {
-        // [R2] Qt::QueuedConnection is mandatory for thread-safe cross-thread signaling
-        QObject::connect(worker, &vms::core::NativeReaderWorker::rawPacketReady,
-                         ctx->mediamtx_publisher.get(), &vms::streaming::MediaMtxPublisher::onPacketReady,
-                         Qt::QueuedConnection);
-    }
+    // ── MediaPipeline Phase 2 (MediaMTX publisher) ────────────────────────
+    // Opt-in via `VMS_ENABLE_MEDIAMTX=1` (config bridged into MediaPipeline::Config
+    // above). Skipped by default because without a MediaMTX server on
+    // localhost:8554 FFmpeg's RTSP output blocks → stdin backs up → 100s of
+    // dropped frames → kill+restart loop. MediaPipeline owns the moveToThread +
+    // start-on-Qt-thread dance and logs success/disabled/failure internally.
+    // connectToWorker() is a no-op when the publisher isn't running.
+    ctx->media->startMediaMtx();
+    ctx->media->connectToWorker(worker);
 
     // [OPTIMIZATION] Set SHM manager and connect processed signal
     worker->setShmManager(ctx->shm_manager.get());
     QObject::connect(worker, &vms::core::NativeReaderWorker::frameProcessed, qApp,
-                     [this](int camera_id, const std::vector<uchar>& jpeg_data,
+                     [this](int camera_id, const cv::Mat& frame,
+                            const std::vector<uchar>& jpeg_data,
                             const std::vector<inference::TrackedObject>& objects,
                             const nlohmann::json& meta, uint64_t timestamp) {
-                         handleFrameProcessed(camera_id, jpeg_data, objects, meta, timestamp);
+                         handleFrameProcessed(camera_id, frame, jpeg_data, objects, meta, timestamp);
                      }, Qt::QueuedConnection);
 
     // Permanent failure signal — stops watchdog from restarting a dead camera
@@ -442,34 +545,24 @@ bool CameraPipelineManager::startPipeline(int camera_id, const std::string& rtsp
                      Qt::QueuedConnection);
 
     worker->start();
-    
-    // [OPTIMIZATION] Staggered startup to avoid connection flood to Dahua/Hikvision cameras
-    QThread::msleep(500); 
 
-    // Start Continuous Recorder for 24/7 segment-based
-    // Uses sub_stream_url to avoid Dahua TCP drop on main stream due to multiple connections
-    std::string rec_url = sub_url.empty() ? rtsp_url : sub_url;
-    ctx->continuous_recorder = std::make_unique<vms::recording::ContinuousRecorder>(
-        camera_id, rec_url, "recordings", 300, 7); // 5-min segments, 7-day retention
-    ctx->continuous_recorder->start();
-    LOG_INFO("[Manager] ContinuousRecorder started for camera {} on url {}", camera_id, rec_url);
+    // [OPTIMIZATION] Staggered startup to avoid connection flood to Dahua/Hikvision cameras.
+    // The ContinuousRecorder spins its own RTSP-pulling FFmpeg, so opening it
+    // immediately after worker->start() risks two simultaneous connections to
+    // the same NVR. The 500ms sleep keeps the legacy ordering even when the
+    // recording URL is the main stream (sub_url empty).
+    QThread::msleep(500);
+
+    // ── MediaPipeline Phase 3 (ContinuousRecorder, 24/7 segment-based) ────
+    // Uses sub_stream_url when present (avoids Dahua TCP drop from concurrent
+    // main-stream connections); falls back to main RTSP. Config wired in the
+    // MediaPipeline construction site at the top of this function.
+    ctx->media->startContinuousRecorder();
     
     // BUG 3 FIX: Mark pipeline as running immediately to prevent supervisor restarts.
     ctx->running = true;
     LOG_INFO("[Manager] Pipeline {} marked as running with last_frame_ts = {}", camera_id, ctx->last_frame_ts.load());
     
-    // Lazy-init the single global watchdog timer (protected by restart_mutex_).
-    // All cameras share one QTimer that ticks every 1 s — replaces N per-camera timers.
-    if (!global_watchdog_timer_) {
-        global_watchdog_timer_ = new QTimer();
-        global_watchdog_timer_->moveToThread(QCoreApplication::instance()->thread());
-        QObject::connect(global_watchdog_timer_, &QTimer::timeout,
-                         [this]() { globalWatchdogTick(); });
-        QTimer* gw = global_watchdog_timer_;
-        QMetaObject::invokeMethod(gw, [gw]() { gw->start(1000); }, Qt::QueuedConnection);
-        LOG_INFO("[Manager] Global watchdog timer started (1 s interval)");
-    }
-
     std::lock_guard<std::shared_mutex> lock(mutex_);
     pipelines_[camera_id] = std::move(ctx);
     LOG_INFO("Pipeline started successfully for camera {}", camera_id);
@@ -510,22 +603,38 @@ void CameraPipelineManager::stopPipeline(int camera_id) {
         ctx_to_stop.reset(); // Explicit destruction — triggers ~PipelineContext()
         LOG_INFO("Pipeline stopped and destroyed for camera {}", camera_id);
     }
+
+    FrameBusDiagnostics::getInstance().detach(camera_id);
+    FrameBus::getInstance().unsubscribeAll(camera_id);
+    PipelineStateStore::getInstance().removeCamera(camera_id);
+    HealthMonitor::getInstance().unregisterCamera(camera_id);
 }
 
 
 void CameraPipelineManager::stopAllPipelines() {
     std::vector<std::unique_ptr<PipelineContext>> stopped_pipes;
+    std::vector<int> camera_ids;
     {
         std::lock_guard<std::shared_mutex> lock(mutex_);
         LOG_INFO("Stopping all pipelines...");
         
         for (auto& [id, ctx] : pipelines_) {
-            if (ctx) stopped_pipes.push_back(std::move(ctx));
+            if (ctx) {
+                camera_ids.push_back(id);
+                stopped_pipes.push_back(std::move(ctx));
+            }
         }
         pipelines_.clear();
     }
     // Destroy all contexts outside lock
     stopped_pipes.clear();
+
+    for (int camera_id : camera_ids) {
+        FrameBusDiagnostics::getInstance().detach(camera_id);
+        FrameBus::getInstance().unsubscribeAll(camera_id);
+        PipelineStateStore::getInstance().removeCamera(camera_id);
+        HealthMonitor::getInstance().unregisterCamera(camera_id);
+    }
 }
 
 
@@ -536,14 +645,7 @@ bool CameraPipelineManager::isRunning(int camera_id) {
 }
 
 std::optional<std::vector<char>> CameraPipelineManager::getLatestFrame(int camera_id) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (pipelines_.find(camera_id) == pipelines_.end()) return std::nullopt;
-    
-    auto& ctx = pipelines_[camera_id];
-    std::lock_guard<std::mutex> frame_lock(ctx->frame_mutex);
-    if (ctx->latest_frame.empty()) return std::nullopt;
-    
-    return ctx->latest_frame;
+    return PipelineStateStore::getInstance().latestFrameJpeg(camera_id);
 }
 
 // ============================================================================
@@ -554,31 +656,19 @@ std::optional<std::vector<char>> CameraPipelineManager::getLatestFrame(int camer
 
 
 CameraStats CameraPipelineManager::getCameraStats(int camera_id) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
     CameraStats stats;
-
-    if (failed_cameras_.count(camera_id)) {
+    auto snapshot = PipelineStateStore::getInstance().snapshot(camera_id);
+    if (!snapshot) {
         stats.state = CameraState::FAILED;
         return stats;
     }
 
-    if (pipelines_.find(camera_id) != pipelines_.end()) {
-        auto& ctx = pipelines_[camera_id];
-        stats.fps = ctx->current_fps.load();
-        stats.restart_count = ctx->restart_count.load();
-        stats.last_frame_ts = ctx->last_frame_ts.load();
-        stats.state = static_cast<CameraState>(ctx->camera_state.load());
-
-        bool thread_running = ctx->running.load();
-        if (thread_running && stats.last_frame_ts > 0) {
-            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            stats.is_running = (now - stats.last_frame_ts) < 10000;
-        } else {
-            stats.is_running = false;
-        }
-    }
-
+    stats.is_running = snapshot->is_running;
+    stats.fps = snapshot->fps;
+    stats.restart_count = snapshot->restart_count;
+    stats.last_frame_ts = snapshot->last_frame_ts;
+    stats.state = snapshot->state;
+    stats.cpu_usage_percent = snapshot->cpu_usage_percent;
     return stats;
 }
 
@@ -599,11 +689,55 @@ void CameraPipelineManager::handleAiLogData(int camera_id, const QByteArray& dat
         std::shared_lock<std::shared_mutex> lock(mutex_);
         if (pipelines_.find(camera_id) == pipelines_.end()) return;
     }
-    // String parsing outside the lock — harmless; camera_id may have stopped
-    // by the time we get here, but the data itself is owned by QByteArray (safe).
     std::string text(data.constData(), data.length());
-    if (text.find("BBOX:") != std::string::npos) {
-        // Reserved for future bounding-box parsing
+    if (text.empty()) return;
+
+    // Forward AI worker stdout/stderr to the main logger so model-load failures,
+    // exceptions, and FPS reports are actually visible. The worker emits one JSON
+    // line per inferred frame on stdout (very high volume) — drop those by default
+    // since they contain only `frame_id`/`objects` and the [AI-DIAG] log already
+    // surfaces detection counts on the SHM consumer side.
+    //
+    // Heuristics:
+    //   - Lines beginning with `{"frame_id"` are per-frame inference dumps → drop
+    //   - Lines containing "Loading", "Error", "Warning", "Loaded", "FPS:", "Engine"
+    //     etc. are diagnostic → forward at INFO/WARN
+    std::stringstream ss(text);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (line.empty()) continue;
+        // Strip trailing CR (Windows pipes)
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty()) continue;
+
+        // Drop high-volume per-frame JSON
+        if (line.size() > 1 && line.front() == '{' && line.find("\"frame_id\"") != std::string::npos) continue;
+
+        // Drop per-inference diagnostic spam — these fire 5-25× per second per camera
+        // and were causing ~1000 LOG_INFO calls/s under 3 cameras, contributing to
+        // visible live-stream stutter. Keep ai_worker's own [AI-DIAG] every 10s for
+        // health, plus result.objects= every 30 frames for pipeline tracing.
+        if (line.find("[AdvancedInfer] YOLO output size") != std::string::npos ||
+            line.find("[AdvancedInfer] YOLO layout") != std::string::npos ||
+            line.find("[SCRFD] Input:") != std::string::npos ||
+            line.find("[SCRFD]   output[") != std::string::npos ||
+            line.find("[SCRFD] stride=") != std::string::npos ||
+            line.find("[SCRFD] max_score=") != std::string::npos ||
+            line.find("[SHM] ") != std::string::npos) {
+            continue;
+        }
+
+        // Anything else → forward. Worker logs to stderr by convention, so include
+        // both streams uniformly here. This is throttled by line frequency rather
+        // than time so model-load output is preserved.
+        if (line.find("Error") != std::string::npos ||
+            line.find("ERROR") != std::string::npos ||
+            line.find("Failed") != std::string::npos ||
+            line.find("Exception") != std::string::npos) {
+            LOG_WARN("[AI-Worker-{}] {}", camera_id, line);
+        } else {
+            LOG_INFO("[AI-Worker-{}] {}", camera_id, line);
+        }
     }
 }
 void CameraPipelineManager::handleFrameReady(int camera_id, const cv::Mat& raw_frame) {
@@ -612,12 +746,14 @@ void CameraPipelineManager::handleFrameReady(int camera_id, const cv::Mat& raw_f
 }
 
 void CameraPipelineManager::handleFrameProcessed(int camera_id,
+                                                 const cv::Mat& frame,
                                                  const std::vector<uchar>& jpeg_data,
                                                  const std::vector<inference::TrackedObject>& objects,
                                                  const nlohmann::json& meta,
                                                  uint64_t timestamp) {
     // ══════════════════════════════════════════════════════════════════
-    // LEAN HOT PATH — All heavy lifting (Resize/JPEG/SHM) done by worker!
+    // LEAN HOT PATH — Worker already resized frame + updated SHM.
+    // JPEG is now encoded only for webcam WS or on-demand HTTP/snapshot calls.
     //
     // THREAD SAFETY: mutex_ is held for the ENTIRE function body.
     //
@@ -630,7 +766,8 @@ void CameraPipelineManager::handleFrameProcessed(int camera_id,
     // mutex_, so no deadlock is possible.
     // ══════════════════════════════════════════════════════════════════
     // shared_lock: we only read the map to get the ctx pointer.
-    // ctx mutations use ctx-level atomics and sub-mutexes (objects_mutex, frame_mutex).
+    // ctx mutations use ctx-level atomics; latest frame/objects/metadata are
+    // routed to PipelineStateStore (single source of truth, see Phase B).
     // stopPipeline (unique_lock) cannot proceed while this shared_lock is held,
     // so ctx remains valid for the entire duration of this function.
     std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -638,51 +775,137 @@ void CameraPipelineManager::handleFrameProcessed(int camera_id,
     auto it = pipelines_.find(camera_id);
     if (it == pipelines_.end()) return;
     PipelineContext* ctx = it->second.get();
+    const uint64_t frame_index = ++ctx->frame_count_;
 
     // 1. Update status — transition to RUNNING on first frame if not already
     ctx->last_frame_ts = timestamp;
     ctx->running = true;
+    ctx->fps_window_frames++;
+    auto fps_now = std::chrono::steady_clock::now();
+    auto fps_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        fps_now - ctx->fps_window_start).count();
+    if (fps_elapsed_ms >= 1000) {
+        ctx->current_fps = (ctx->fps_window_frames * 1000.0) / static_cast<double>(fps_elapsed_ms);
+        ctx->fps_window_frames = 0;
+        ctx->fps_window_start = fps_now;
+    }
     int prev_state = ctx->camera_state.exchange(static_cast<int>(CameraState::RUNNING));
     if (prev_state != static_cast<int>(CameraState::RUNNING)) {
         LOG_INFO("[STATE] Camera {} → RUNNING (first decoded frame received)", camera_id);
     }
+    HealthMonitor::getInstance().updateFrameHeartbeat(camera_id, timestamp);
+    HealthMonitor::getInstance().setState(camera_id, CameraState::RUNNING);
+    // Phase B: PipelineStateStore is the single source of truth for the latest
+    // frame, objects, and metadata. The dual-write to ctx->latest_objects /
+    // ctx->latest_frame / ctx->last_metadata_json_ has been removed (all readers
+    // now go through the store).
+    PipelineStateStore::getInstance().updateFrame(camera_id, jpeg_data, objects, meta, timestamp);
+    PipelineStateStore::getInstance().updateStats(camera_id,
+                                                  ctx->current_fps.load(),
+                                                  ctx->restart_count.load(),
+                                                  ctx->last_frame_ts.load(),
+                                                  CameraState::RUNNING,
+                                                  true);
 
-    // 2. Cache objects and metadata for API queries
-    {
-        std::lock_guard<std::mutex> obj_lock(ctx->objects_mutex);
-        ctx->latest_objects = objects;
-        ctx->last_metadata_json_ = meta;
+    // 2. WebSocket broadcast is now handled directly in NativeReaderWorker::processAndEmit
+    // (called from worker thread before emitting this signal) to eliminate the Qt event
+    // loop hop latency (~15ms on Windows). Nothing to do here for JPEG streams.
+
+    // 3. Throttled AI event processing (every 500 ms to avoid DB pressure).
+    // Skip when frame is empty (worker only sends a real Mat once per ~500ms; on
+    // the lightweight emits we still updated counters/objects above but have no
+    // image to crop snapshots from).
+    if (!frame.empty()) {
+        auto steady_now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                steady_now - ctx->last_event_process_time).count() >= 500) {
+            AiEventProcessor::getInstance().processMetadata(camera_id, meta, frame);
+            ctx->last_event_process_time = steady_now;
+        }
     }
 
-    // 3. Cache latest frame for snapshot endpoint
-    {
-        std::lock_guard<std::mutex> frame_lock(ctx->frame_mutex);
-        ctx->latest_frame.assign(jpeg_data.begin(), jpeg_data.end());
-    }
-
-    // 4. Broadcast to live-view WebSocket clients (does not acquire mutex_)
-    vms::streaming::CameraStreamManager::getInstance().broadcastRawFrame(
-        camera_id,
-        *reinterpret_cast<const std::vector<uint8_t>*>(&jpeg_data),
-        objects, 640, 360
-    );
-
-    // 5. Throttled AI event processing (every 500 ms to avoid DB pressure)
-    auto steady_now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(
-            steady_now - ctx->last_event_process_time).count() >= 500) {
-        AiEventProcessor::getInstance().processMetadata(camera_id, meta, jpeg_data);
-        ctx->last_event_process_time = steady_now;
+    if (FrameBus::getInstance().subscriberCount(camera_id) > 0) {
+        FrameEnvelope envelope;
+        envelope.camera_id = camera_id;
+        envelope.timestamp_ms = timestamp;
+        envelope.frame_index = frame_index;
+        if (!frame.empty()) {
+            // Zero-copy fanout: cv::Mat header copy here is cheap (refcount++ on the
+            // underlying pixel buffer). The shared_ptr keeps the cv::Mat alive across
+            // any number of consumers without an extra pixel deep-copy per consumer.
+            envelope.raw_frame = std::make_shared<const cv::Mat>(frame);
+        }
+        envelope.jpeg_preview = jpeg_data;
+        envelope.objects = objects;
+        envelope.metadata = meta;
+        envelope.source_stream = ctx->live_rtsp_url;
+        envelope.is_backup_stream = ctx->using_backup_stream;
+        FrameBus::getInstance().publish(camera_id, envelope);
     }
 }
 // Single global watchdog tick — checks ALL active cameras in one pass.
 // Runs on main Qt thread via QTimer (1 s interval). Replaces N per-camera timers.
 // Also drives adaptive FPS: cameras with no live WebSocket viewers run at kFpsIdle
 // to save CPU; cameras with viewers run at kFpsActive.
+// Read cumulative CPU time (kernel + user) for a child process in nanoseconds.
+// Returns false if the PID is invalid or the OS rejected the query.
+namespace {
+bool sampleProcessCpuNs(long long pid, uint64_t& out_ns) {
+    if (pid <= 0) return false;
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!h) return false;
+    FILETIME ft_create, ft_exit, ft_kernel, ft_user;
+    BOOL ok = GetProcessTimes(h, &ft_create, &ft_exit, &ft_kernel, &ft_user);
+    CloseHandle(h);
+    if (!ok) return false;
+    auto to_uint64 = [](const FILETIME& ft) {
+        return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    };
+    // FILETIME is in 100-ns units → multiply by 100 for ns.
+    out_ns = (to_uint64(ft_kernel) + to_uint64(ft_user)) * 100ull;
+    return true;
+#else
+    std::ifstream fs("/proc/" + std::to_string(pid) + "/stat");
+    if (!fs) return false;
+    std::string content;
+    std::getline(fs, content);
+    // Skip past comm field which is parenthesized and may contain spaces.
+    auto rparen = content.rfind(')');
+    if (rparen == std::string::npos) return false;
+    std::istringstream rest(content.substr(rparen + 1));
+    std::string state_field;
+    rest >> state_field;
+    // Skip fields 4..13 (1-indexed in proc(5); we already consumed 1=pid, 2=comm, 3=state).
+    for (int i = 0; i < 10; ++i) { unsigned long long tmp; if (!(rest >> tmp)) return false; }
+    unsigned long long utime = 0, stime = 0;
+    if (!(rest >> utime >> stime)) return false;
+    static const long ticks_per_sec = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
+    out_ns = static_cast<uint64_t>((utime + stime) * (1'000'000'000ull / static_cast<uint64_t>(ticks_per_sec)));
+    return true;
+#endif
+}
+
+int hostCpuCount() {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return std::max<int>(1, static_cast<int>(si.dwNumberOfProcessors));
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return static_cast<int>(n > 0 ? n : 1);
+#endif
+}
+} // namespace
+
 void CameraPipelineManager::globalWatchdogTick() {
     // Processing FPS targets. Recording uses raw-packet callback and is unaffected.
+    // 2026-04-26: hạ kFpsActive 25→15. 3 cam × 25fps × encode JPEG + WS broadcast +
+    // SHM read/write + AI inference @ 5-25fps là quá tải CPU dù GPU rảnh, gây
+    // visible stutter. 15fps đủ smooth cho live monitoring và giảm 40% CPU load.
+    // User có thể tăng lại nếu thấy mượt và GPU/CPU dư.
     static constexpr int kFpsIdle   = 5;   // no live viewers — AI still runs for event detection
-    static constexpr int kFpsActive = 15;  // live viewers — smooth playback
+    static constexpr int kFpsActive = 15;  // live viewers — balance smooth vs CPU
 
     auto now_sys    = std::chrono::system_clock::now();
     auto now_steady = std::chrono::steady_clock::now();
@@ -690,9 +913,54 @@ void CameraPipelineManager::globalWatchdogTick() {
         std::chrono::duration_cast<std::chrono::milliseconds>(now_sys.time_since_epoch()).count());
 
     std::shared_lock<std::shared_mutex> lock(mutex_);
+
+    // Track which PIDs we touched this tick so stale cache entries can be pruned.
+    std::unordered_set<long long> live_pids;
+    const int n_cores = hostCpuCount();
+
     for (auto& [camera_id, ctx] : pipelines_) {
         if (!ctx) continue;
         if (failed_cameras_.count(camera_id)) continue;
+
+        // ── Per-pipeline CPU% (FFmpeg + ai_worker child processes) ────────────
+        // Computed at 1 Hz here, published into PipelineStateStore so HTTP
+        // /api/cameras can read it cheaply.
+        {
+            std::vector<long long> child_pids;
+            if (ctx->process)    child_pids.push_back(ctx->process->processId());
+            if (ctx->ai_process) child_pids.push_back(ctx->ai_process->processId());
+
+            double pipeline_cpu_pct = 0.0;
+            bool   have_sample      = false;
+            for (long long pid : child_pids) {
+                if (pid <= 0) continue;
+                live_pids.insert(pid);
+                uint64_t cpu_ns_now = 0;
+                if (!sampleProcessCpuNs(pid, cpu_ns_now)) continue;
+                auto& s = cpu_sample_cache_[pid];
+                if (s.initialized) {
+                    auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       now_steady - s.sampled_at).count();
+                    if (wall_ns > 0 && cpu_ns_now >= s.cpu_time_ns) {
+                        const double cpu_diff_ns = static_cast<double>(cpu_ns_now - s.cpu_time_ns);
+                        // % of one core, then divide by core count to express as
+                        // fraction of total host CPU (matches Windows Task Manager
+                        // and Linux `top -1 i` per-process display normalised).
+                        const double pct_of_one_core = cpu_diff_ns / static_cast<double>(wall_ns) * 100.0;
+                        pipeline_cpu_pct += pct_of_one_core / static_cast<double>(n_cores);
+                        have_sample = true;
+                    }
+                }
+                s.cpu_time_ns  = cpu_ns_now;
+                s.sampled_at   = now_steady;
+                s.initialized  = true;
+            }
+
+            if (have_sample) {
+                pipeline_cpu_pct = std::max(0.0, std::min(100.0, pipeline_cpu_pct));
+                PipelineStateStore::getInstance().updateCpuUsage(camera_id, pipeline_cpu_pct);
+            }
+        }
 
         // ── Adaptive FPS ──────────────────────────────────────────────────────
         if (ctx->worker_ptr) {
@@ -721,10 +989,18 @@ void CameraPipelineManager::globalWatchdogTick() {
             int prev = ctx->camera_state.exchange(static_cast<int>(CameraState::DEGRADED));
             if (prev != static_cast<int>(CameraState::DEGRADED)) {
                 LOG_WARN("[WATCHDOG] [STATE] Camera {} → DEGRADED (no frames for {}ms)", camera_id, age);
+                FrameBus::getInstance().publishStateChange(camera_id, CameraState::DEGRADED);
             } else {
                 LOG_THROTTLED_WARN(30000,
                     "[WATCHDOG] Camera {} still DEGRADED (no frames for {}ms)", camera_id, age);
             }
+            HealthMonitor::getInstance().setState(camera_id, CameraState::DEGRADED);
+            PipelineStateStore::getInstance().updateStats(camera_id,
+                                                          ctx->current_fps.load(),
+                                                          ctx->restart_count.load(),
+                                                          ctx->last_frame_ts.load(),
+                                                          CameraState::DEGRADED,
+                                                          ctx->running.load());
         }
     }
 }
@@ -743,27 +1019,25 @@ void CameraPipelineManager::handleStreamFailed(int camera_id) {
         ctx->camera_state = static_cast<int>(CameraState::FAILED);
         // Global watchdog skips failed_cameras_ entries — no per-camera timer to stop.
     }
+
+    HealthMonitor::getInstance().markPermanentFailure(
+        camera_id, "All reconnect attempts exhausted");
+    PipelineStateStore::getInstance().setState(
+        camera_id, CameraState::FAILED, "All reconnect attempts exhausted");
+    FrameBus::getInstance().publishStateChange(camera_id, CameraState::FAILED);
 }
 
 CameraState CameraPipelineManager::getCameraState(int camera_id) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (failed_cameras_.count(camera_id)) return CameraState::FAILED;
-    auto it = pipelines_.find(camera_id);
-    if (it == pipelines_.end()) return CameraState::FAILED;
-    return static_cast<CameraState>(it->second->camera_state.load());
+    auto snapshot = PipelineStateStore::getInstance().snapshot(camera_id);
+    if (!snapshot) return CameraState::FAILED;
+    return snapshot->state;
 }
 
 
 std::string CameraPipelineManager::getLatestObjectsJson(int camera_id) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    auto it = pipelines_.find(camera_id);
-    if (it == pipelines_.end()) return "[]";
-    
-    auto ctx = it->second.get();
-    std::lock_guard<std::mutex> obj_lock(ctx->objects_mutex);
-    
+    auto objects = PipelineStateStore::getInstance().latestObjects(camera_id);
     nlohmann::json j = nlohmann::json::array();
-    for (const auto& obj : ctx->latest_objects) {
+    for (const auto& obj : objects) {
         nlohmann::json o;
         o["track_id"] = obj.track_id;
         o["class_id"] = obj.class_id;
@@ -776,13 +1050,7 @@ std::string CameraPipelineManager::getLatestObjectsJson(int camera_id) {
 }
 
 nlohmann::json CameraPipelineManager::getLatestMetadata(int camera_id) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    auto it = pipelines_.find(camera_id);
-    if (it == pipelines_.end()) return nlohmann::json::object();
-    
-    auto ctx = it->second.get();
-    std::lock_guard<std::mutex> obj_lock(ctx->objects_mutex);
-    return ctx->last_metadata_json_;
+    return PipelineStateStore::getInstance().latestMetadata(camera_id);
 }
 
 std::string CameraPipelineManager::triggerEventRecording(int camera_id, const std::string& event_id, int duration_sec, int pre_record_sec) {
@@ -791,8 +1059,8 @@ std::string CameraPipelineManager::triggerEventRecording(int camera_id, const st
     if (it == pipelines_.end()) return "";
     
     auto ctx = it->second.get();
-    if (ctx->buffer_pipeline) {
-        return ctx->buffer_pipeline->triggerEvent(event_id, duration_sec, pre_record_sec);
+    if (ctx->media) {
+        return ctx->media->triggerEvent(event_id, duration_sec, pre_record_sec);
     }
     return "";
 }

@@ -11,12 +11,15 @@ const PtzPatrolModal = ({ cameraId, onClose }) => {
   const [activePatrolId, setActivePatrolId] = useState(null);
   const patrolIntervalRef = useRef(null);
   const patrolIndexRef = useRef(0);
+  const patrolStopRef = useRef(null);
 
   useEffect(() => {
     fetchData();
     }, [cameraId]);
 
   useEffect(() => () => {
+    if (patrolStopRef.current) patrolStopRef.current.stopped = true;
+    clearTimeout(patrolIntervalRef.current);
     clearInterval(patrolIntervalRef.current);
   }, []);
 
@@ -36,25 +39,38 @@ const PtzPatrolModal = ({ cameraId, onClose }) => {
   const handleStart = async () => {
     if (patrolPoints.length === 0) return;
 
+    // Clear any existing timer (interval OR setTimeout) before starting fresh
+    clearTimeout(patrolIntervalRef.current);
     clearInterval(patrolIntervalRef.current);
     patrolIndexRef.current = 0;
     setActivePatrolId(1);
 
-    const goToCurrentPreset = async () => {
+    // Use a recursive setTimeout chain (NOT setInterval) so each preset's
+    // dwell time is honored individually and timers never stack on slow goto calls.
+    const stepRef = { stopped: false };
+
+    const stepOnce = async () => {
+      if (stepRef.stopped) return;
       const point = patrolPoints[patrolIndexRef.current % patrolPoints.length];
       if (!point) return;
-      await apiClient.ptzGoToPreset(cameraId, point.preset_token);
-      clearInterval(patrolIntervalRef.current);
-      patrolIntervalRef.current = setInterval(() => {
-        patrolIndexRef.current = (patrolIndexRef.current + 1) % patrolPoints.length;
-        goToCurrentPreset();
-      }, Math.max(1, point.dwell_time_sec) * 1000);
+      try {
+        await apiClient.ptzGoToPreset(cameraId, point.preset_token);
+      } catch (err) {
+        console.warn('[PTZ patrol] goto-preset failed:', err);
+      }
+      if (stepRef.stopped) return;
+      patrolIndexRef.current = (patrolIndexRef.current + 1) % patrolPoints.length;
+      patrolIntervalRef.current = setTimeout(stepOnce, Math.max(1, point.dwell_time_sec) * 1000);
     };
 
-    await goToCurrentPreset();
+    // Track stop signal via the ref so handleStop can clear it
+    patrolStopRef.current = stepRef;
+    await stepOnce();
   };
 
   const handleStop = async () => {
+    if (patrolStopRef.current) patrolStopRef.current.stopped = true;
+    clearTimeout(patrolIntervalRef.current);
     clearInterval(patrolIntervalRef.current);
     setActivePatrolId(null);
   };

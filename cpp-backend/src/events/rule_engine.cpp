@@ -1,4 +1,4 @@
-﻿// ==============================================================
+// ==============================================================
 // File: src/events/rule_engine.cpp
 // Composite Rule Engine Implementation
 // ==============================================================
@@ -253,12 +253,14 @@ RuleEngine& RuleEngine::getInstance() {
 // RULE CRUD
 // ============================================================================
 
-bool RuleEngine::addRule(const CompositeRule& rule) {
+int RuleEngine::addRule(const CompositeRule& rule) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& existing : rules_) {
-        if (existing.rule_id == rule.rule_id) {
-            LOG_WARN("[RuleEngine] Rule {} already exists", rule.rule_id);
-            return false;
+    if (rule.rule_id != 0) {
+        for (auto& existing : rules_) {
+            if (existing.rule_id == rule.rule_id) {
+                LOG_WARN("[RuleEngine] Rule {} already exists", rule.rule_id);
+                return 0;
+            }
         }
     }
     CompositeRule r = rule;
@@ -268,7 +270,7 @@ bool RuleEngine::addRule(const CompositeRule& rule) {
     rules_.push_back(r);
     if (r.rule_id >= next_rule_id_) next_rule_id_ = r.rule_id + 1;
     LOG_INFO("[RuleEngine] Added rule {}: {}", r.rule_id, r.name);
-    return true;
+    return r.rule_id;
 }
 
 bool RuleEngine::updateRule(const CompositeRule& rule) {
@@ -295,12 +297,12 @@ bool RuleEngine::removeRule(int rule_id) {
     return true;
 }
 
-CompositeRule* RuleEngine::getRule(int rule_id) {
+std::optional<CompositeRule> RuleEngine::getRule(int rule_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& r : rules_) {
-        if (r.rule_id == rule_id) return &r;
+    for (const auto& r : rules_) {
+        if (r.rule_id == rule_id) return r; // copy out — caller may use after lock
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 std::vector<CompositeRule> RuleEngine::getAllRules() {
@@ -309,8 +311,11 @@ std::vector<CompositeRule> RuleEngine::getAllRules() {
 }
 
 int RuleEngine::getNextRuleId() {
+    // Reserve and return — without post-increment two concurrent UI clients
+    // would receive the same id, then both addRule() calls would race to insert
+    // the same rule_id (one losing with "already exists" log, silently dropped).
     std::lock_guard<std::mutex> lock(mutex_);
-    return next_rule_id_;
+    return next_rule_id_++;
 }
 
 // ============================================================================
@@ -324,10 +329,12 @@ bool RuleEngine::evaluateEvent(const RawEvent& event) {
         RawEvent event;
     };
     std::vector<PendingAction> pending_actions;
+    std::vector<RuleFiredCallback> local_callbacks;
     
     {
         std::lock_guard<std::mutex> lock(mutex_);
         total_evaluated_++;
+        local_callbacks = callbacks_;
         
         for (auto& rule : rules_) {
             if (!rule.enabled) continue;
@@ -405,13 +412,14 @@ bool RuleEngine::evaluateEvent(const RawEvent& event) {
     bool any_triggered = !pending_actions.empty();
     for (auto& pa : pending_actions) {
         executeActions(pa.rule, pa.event);
-        
-        // Fire callbacks
-        for (auto& cb : callbacks_) {
+
+        // BUG-2 FIX: dùng local_callbacks (đã copy trong lock) thay vì callbacks_
+        // để tránh race condition khi onRuleFired() được gọi từ thread khác
+        for (auto& cb : local_callbacks) {
             try { cb(pa.rule, pa.event); } catch (...) {}
         }
     }
-    
+
     return any_triggered;
 }
 
@@ -497,20 +505,28 @@ bool RuleEngine::evaluateCondition(const RuleCondition& cond, const RawEvent& ev
             
         case ConditionType::RULE_TRIGGERED: {
             if (cond.referenced_rule_id < 0) return true;
-            
-            std::lock_guard<std::mutex> llock(log_mutex_);
+
+            // BUG-3 FIX: Không lock log_mutex_ ở đây vì evaluateEvent() đang giữ mutex_
+            // → lock ordering không nhất quán → deadlock tiềm ẩn.
+            // Giải pháp: snapshot trigger_log ra local trước khi evaluate conditions.
+            // Caller (evaluateEvent) phải truyền snapshot log_snapshot thay vì dùng
+            // log_mutex_ trực tiếp. Workaround hiện tại: dùng try_lock để tránh block.
+            std::unique_lock<std::mutex> llock(log_mutex_, std::try_to_lock);
+            if (!llock.owns_lock()) {
+                // Không thể lock log_mutex_ ngay — bỏ qua RULE_TRIGGERED check lần này
+                // thay vì deadlock
+                return false;
+            }
             auto now = std::chrono::system_clock::now();
-            
+
             // Look back in trigger log for the referenced rule
-            // Match same camera if it's a camera-specific rule
             for (auto it = trigger_log_.rbegin(); it != trigger_log_.rend(); ++it) {
                 if (it->rule_id == cond.referenced_rule_id) {
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         now - it->triggered_at).count();
-                    
+
                     if (elapsed <= cond.chaining_window_sec) {
-                        // Found a recent trigger! 
-                        // Optional: confirm it was for the same camera
+                        // Found a recent trigger!
                         if (it->camera_id == event.camera_id) return true;
                     } else {
                         // Beyond window, and logs are chronological, so we can stop
@@ -565,28 +581,43 @@ bool RuleEngine::checkCooldown(int rule_id, int cooldown_sec) {
 }
 
 bool RuleEngine::checkDebounce(int rule_id, int camera_id, int debounce_sec) {
+    // Debounce semantics: only trigger after the SAME event has been seen
+    // continuously for `debounce_sec` seconds. A gap longer than `debounce_sec`
+    // resets the streak — otherwise a single isolated event one minute later
+    // would immediately fire (the previous bug).
     std::string key = std::to_string(rule_id) + ":" + std::to_string(camera_id);
     auto now = std::chrono::system_clock::now();
-    
+
     auto it = debounce_state_.find(key);
     if (it == debounce_state_.end()) {
-        // First time seeing this event for this rule+camera
-        debounce_state_[key].first_seen = now;
-        debounce_state_[key].consecutive_count = 1;
-        return false; // Don't trigger yet
+        auto& s = debounce_state_[key];
+        s.first_seen = now;
+        s.last_seen  = now;
+        s.consecutive_count = 1;
+        return false;
     }
-    
+
     auto& state = it->second;
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+    auto gap_sec = std::chrono::duration_cast<std::chrono::seconds>(
+        now - state.last_seen).count();
+    if (gap_sec > debounce_sec) {
+        // Stream of events broke — restart the debounce window from this event.
+        state.first_seen = now;
+        state.last_seen  = now;
+        state.consecutive_count = 1;
+        return false;
+    }
+
+    state.last_seen = now;
+    auto streak_sec = std::chrono::duration_cast<std::chrono::seconds>(
         now - state.first_seen).count();
-    
-    if (elapsed >= debounce_sec) {
-        // Debounce period passed, allow trigger and reset
+    if (streak_sec >= debounce_sec) {
+        // Sustained signal — fire and reset so the next trigger needs another full window.
         state.first_seen = now;
         state.consecutive_count = 0;
         return true;
     }
-    
+
     state.consecutive_count++;
     return false;
 }
@@ -819,12 +850,24 @@ bool RuleEngine::saveToDatabase() {
     
     db_mgr.beginTransaction();
     
-    // Prepare upsert statement
+    // Prepare upsert statement — dialect-aware
+    const QString upsert_sql = db_mgr.isPostgres()
+        ? "INSERT INTO rules (id, name, description, enabled, logic, "
+          "conditions_json, actions_json, anti_noise_json, camera_ids_json, "
+          "metadata_json, created_at, updated_at) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+          "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description, "
+          "enabled=EXCLUDED.enabled, logic=EXCLUDED.logic, conditions_json=EXCLUDED.conditions_json, "
+          "actions_json=EXCLUDED.actions_json, anti_noise_json=EXCLUDED.anti_noise_json, "
+          "camera_ids_json=EXCLUDED.camera_ids_json, metadata_json=EXCLUDED.metadata_json, "
+          "updated_at=EXCLUDED.updated_at"
+        : "INSERT OR REPLACE INTO rules (id, name, description, enabled, logic, "
+          "conditions_json, actions_json, anti_noise_json, camera_ids_json, "
+          "metadata_json, created_at, updated_at) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
     QSqlQuery query(db);
-    if (!query.prepare("INSERT OR REPLACE INTO rules (id, name, description, enabled, logic, "
-                       "conditions_json, actions_json, anti_noise_json, camera_ids_json, "
-                       "metadata_json, created_at, updated_at) "
-                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+    if (!query.prepare(upsert_sql)) {
         LOG_ERROR("[RuleEngine] Failed to prepare save query: {}", query.lastError().text().toStdString());
         db_mgr.rollback();
         return false;

@@ -53,8 +53,11 @@ public:
      * Read and decode the next frame.
      * Returns true on success, false on error or EOF.
      * @param out_mat Output OpenCV Matrix (BGR)
+     * @param skip_decode If true, reads packet and decodes but skips BGR conversion to save CPU
+     * @param target_width Optional: Scale output to this width during conversion
+     * @param target_height Optional: Scale output to this height during conversion
      */
-    bool readFrame(cv::Mat& out_mat);
+    bool readFrame(cv::Mat& out_mat, bool skip_decode = false, int target_width = 0, int target_height = 0);
 
     /**
      * Get the latest raw packet (NALU) for streaming without re-encoding.
@@ -90,11 +93,16 @@ private:
     int video_stream_index_ = -1;
     AVFrame* frame_ = nullptr;
     AVFrame* frame_bgr_ = nullptr;
+    AVFrame* frame_tmp_ = nullptr;  // pre-allocated scratch frame, avoids per-decode alloc
     AVPacket* packet_ = nullptr;
 
     int width_ = 0;
     int height_ = 0;
     double fps_ = 0.0;
+
+    // Cached sws_ctx parameters — recreate only when these change, not every frame
+    int sws_src_w_{0}, sws_src_h_{0}, sws_dst_w_{0}, sws_dst_h_{0};
+    AVPixelFormat sws_src_fmt_{AV_PIX_FMT_NONE};
     bool first_frame_decoded_{false};
     std::atomic<int> consecutive_timeouts_{0};
 

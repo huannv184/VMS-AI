@@ -23,6 +23,7 @@ PTZManager& PTZManager::getInstance() {
 
 PTZManager::CameraConnectionInfo PTZManager::getCameraInfo(int camera_id) {
     CameraConnectionInfo info;
+    info.camera_id = camera_id;
     try {
         database::CameraRepository repo;
         auto cam_opt = repo.getCameraById(camera_id);
@@ -70,6 +71,26 @@ PTZManager::CameraConnectionInfo PTZManager::getCameraInfo(int camera_id) {
         LOG_ERROR("[PTZ] Error getting camera info for {}: {}", camera_id, e.what());
     }
     return info;
+}
+
+// XML-escape user-supplied strings before splicing into SOAP/ISAPI envelopes.
+// Operator-controlled names (preset name, etc.) flow through this — without
+// the escape a name like `Lobby & Door 'A'` produces malformed XML and a
+// hostile name could forge sibling elements (SOAP injection).
+static std::string xmlEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            case '&':  out += "&amp;";  break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default:   out += c;
+        }
+    }
+    return out;
 }
 
 PTZProtocol PTZManager::detectProtocol(int camera_id) {
@@ -201,22 +222,61 @@ std::vector<PTZPatrol> PTZManager::getPatrols(int camera_id) {
 
 bool PTZManager::savePreset(int camera_id, int preset_id, const std::string& name) {
     LOG_INFO("[PTZ] SavePreset cam={} preset={} name={}", camera_id, preset_id, name);
-    // Hikvision ISAPI: PUT /ISAPI/PTZCtrl/channels/1/presets/<id>
     auto info = getCameraInfo(camera_id);
-    if (info.protocol == PTZProtocol::HIKVISION_ISAPI) {
-        std::string url = "http://" + info.ip + ":" + std::to_string(info.port) +
-                          "/ISAPI/PTZCtrl/channels/1/presets/" + std::to_string(preset_id);
-        std::string body = "<PTZPreset><id>" + std::to_string(preset_id) + "</id>"
-                           "<presetName>" + name + "</presetName></PTZPreset>";
-        auto resp = httpPut(url, body, info.username, info.password);
-        return !resp.empty();
+    switch (info.protocol) {
+        case PTZProtocol::HIKVISION_ISAPI: {
+            // ISAPI: PUT /ISAPI/PTZCtrl/channels/1/presets/<id>
+            std::string url = "http://" + info.ip + ":" + std::to_string(info.port) +
+                              "/ISAPI/PTZCtrl/channels/1/presets/" + std::to_string(preset_id);
+            // ISAPI accepts the same XML-special set; reuse xmlEscape so an
+            // operator can name a preset "Lobby & Door 'A'" without producing
+            // malformed XML.
+            std::string body = "<PTZPreset><id>" + std::to_string(preset_id) + "</id>"
+                               "<presetName>" + xmlEscape(name) + "</presetName></PTZPreset>";
+            auto resp = httpPut(url, body, info.username, info.password);
+            return !resp.empty();
+        }
+        case PTZProtocol::DAHUA_CGI: {
+            // Dahua: setPreset stores current view at preset slot N.
+            // /cgi-bin/ptz.cgi?action=start&channel=0&code=SetPreset&arg1=0&arg2=<id>&arg3=0
+            // The protocol does NOT carry a name — the name is GUI-side metadata
+            // and Dahua stores it locally only. We still log it so future GET
+            // can match what the operator typed against the camera's slot.
+            std::string url = "http://" + info.ip + ":" + std::to_string(info.port) +
+                              "/cgi-bin/ptz.cgi?action=start&channel=0&code=SetPreset&arg1=0&arg2=" +
+                              std::to_string(preset_id) + "&arg3=0";
+            return !httpGet(url, info.username, info.password).empty();
+        }
+        case PTZProtocol::ONVIF:
+            return onvifSetPreset(info, preset_id, name);
+        default:
+            return false;
     }
-    return false;
 }
 
 bool PTZManager::deletePreset(int camera_id, int preset_id) {
     LOG_INFO("[PTZ] DeletePreset cam={} preset={}", camera_id, preset_id);
-    return false; // TODO: Implement per-protocol
+    auto info = getCameraInfo(camera_id);
+    switch (info.protocol) {
+        case PTZProtocol::HIKVISION_ISAPI: {
+            // ISAPI: DELETE /ISAPI/PTZCtrl/channels/1/presets/<id>
+            std::string url = "http://" + info.ip + ":" + std::to_string(info.port) +
+                              "/ISAPI/PTZCtrl/channels/1/presets/" + std::to_string(preset_id);
+            return httpDelete(url, info.username, info.password);
+        }
+        case PTZProtocol::DAHUA_CGI: {
+            // Dahua CGI uses GET-with-action verbs even for delete:
+            // /cgi-bin/ptz.cgi?action=clearPreset&channel=0&arg1=<id>
+            std::string url = "http://" + info.ip + ":" + std::to_string(info.port) +
+                              "/cgi-bin/ptz.cgi?action=clearPreset&channel=0&arg1=" +
+                              std::to_string(preset_id);
+            return !httpGet(url, info.username, info.password).empty();
+        }
+        case PTZProtocol::ONVIF:
+            return onvifRemovePreset(info, preset_id);
+        default:
+            return false;
+    }
 }
 
 PTZCapabilities PTZManager::getCapabilities(int camera_id) {
@@ -342,7 +402,63 @@ std::vector<PTZPreset> PTZManager::dahuaGetPresets(const CameraConnectionInfo& i
 // ONVIF PTZ Implementation (SOAP)
 // ============================================================================
 
+std::string PTZManager::resolveProfileToken(const CameraConnectionInfo& info) {
+    // Cache hit path. Empty cached value = "discovery already failed once" —
+    // we do not retry on every SOAP call (would cost 1 round-trip per move).
+    if (info.camera_id >= 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = profile_token_cache_.find(info.camera_id);
+        if (it != profile_token_cache_.end()) {
+            return it->second.empty() ? std::string("Profile_1") : it->second;
+        }
+    }
+
+    const std::string get_profiles_soap =
+        R"(<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:trt="http://www.onvif.org/ver10/media/wsdl">
+  <s:Body>
+    <trt:GetProfiles/>
+  </s:Body>
+</s:Envelope>)";
+
+    const std::string url = "http://" + info.ip + ":" + std::to_string(info.port) + "/onvif/Media";
+    const std::string resp = httpPut(url, get_profiles_soap, info.username, info.password,
+                                     "application/soap+xml");
+
+    std::string token;
+    if (!resp.empty() && resp.find("Fault") == std::string::npos) {
+        // Parse the FIRST `token="..."` attribute on a `<...:Profiles ...>` element.
+        // We accept any namespace prefix (`trt:`, `tt:`, `wstoken:`...) by anchoring
+        // on the local name `Profiles`. Regex is intentionally permissive — full
+        // SOAP/XML parsing isn't justified for this single field.
+        static const std::regex profile_re(
+            R"REGEX(<[^>]*?:?Profiles\b[^>]*?\btoken\s*=\s*"([^"]+)")REGEX",
+            std::regex::icase);
+        std::smatch m;
+        if (std::regex_search(resp, m, profile_re) && m.size() >= 2) {
+            token = m[1].str();
+        }
+    }
+
+    if (info.camera_id >= 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Store empty string if discovery failed so we don't retry. The
+        // accessor above maps empty → "Profile_1" fallback.
+        profile_token_cache_[info.camera_id] = token;
+    }
+
+    if (token.empty()) {
+        LOG_WARN("[PTZ] ONVIF GetProfiles failed for cam={} ip={} — falling back to 'Profile_1'",
+                 info.camera_id, info.ip);
+        return "Profile_1";
+    }
+    LOG_INFO("[PTZ] ONVIF profile resolved cam={} → '{}'", info.camera_id, token);
+    return token;
+}
+
 bool PTZManager::onvifMove(const CameraConnectionInfo& info, float pan, float tilt, float zoom) {
+    const std::string profile_token = xmlEscape(resolveProfileToken(info));
     // ONVIF ContinuousMove SOAP request
     std::string soap = R"(<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
@@ -350,7 +466,7 @@ bool PTZManager::onvifMove(const CameraConnectionInfo& info, float pan, float ti
             xmlns:tt="http://www.onvif.org/ver10/schema">
   <s:Body>
     <tptz:ContinuousMove>
-      <tptz:ProfileToken>Profile_1</tptz:ProfileToken>
+      <tptz:ProfileToken>)" + profile_token + R"(</tptz:ProfileToken>
       <tptz:Velocity>
         <tt:PanTilt x=")" + std::to_string(pan) + R"(" y=")" + std::to_string(tilt) + R"("/>
         <tt:Zoom x=")" + std::to_string(zoom) + R"("/>
@@ -365,12 +481,13 @@ bool PTZManager::onvifMove(const CameraConnectionInfo& info, float pan, float ti
 }
 
 bool PTZManager::onvifStop(const CameraConnectionInfo& info) {
+    const std::string profile_token = xmlEscape(resolveProfileToken(info));
     std::string soap = R"(<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
   <s:Body>
     <tptz:Stop>
-      <tptz:ProfileToken>Profile_1</tptz:ProfileToken>
+      <tptz:ProfileToken>)" + profile_token + R"(</tptz:ProfileToken>
       <tptz:PanTilt>true</tptz:PanTilt>
       <tptz:Zoom>true</tptz:Zoom>
     </tptz:Stop>
@@ -383,12 +500,13 @@ bool PTZManager::onvifStop(const CameraConnectionInfo& info) {
 }
 
 bool PTZManager::onvifGotoPreset(const CameraConnectionInfo& info, int preset_id) {
+    const std::string profile_token = xmlEscape(resolveProfileToken(info));
     std::string soap = R"(<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
   <s:Body>
     <tptz:GotoPreset>
-      <tptz:ProfileToken>Profile_1</tptz:ProfileToken>
+      <tptz:ProfileToken>)" + profile_token + R"(</tptz:ProfileToken>
       <tptz:PresetToken>)" + std::to_string(preset_id) + R"(</tptz:PresetToken>
     </tptz:GotoPreset>
   </s:Body>
@@ -409,6 +527,46 @@ std::vector<PTZPreset> PTZManager::onvifGetPresets(const CameraConnectionInfo& i
         presets.push_back(p);
     }
     return presets;
+}
+
+bool PTZManager::onvifSetPreset(const CameraConnectionInfo& info, int preset_id, const std::string& name) {
+    const std::string profile_token = xmlEscape(resolveProfileToken(info));
+    // ONVIF PTZ SetPreset — overwrites if PresetToken is supplied, otherwise
+    // creates a new one. We always supply the token so the camera-side ID
+    // matches our internal numbering.
+    std::string soap = R"(<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <s:Body>
+    <tptz:SetPreset>
+      <tptz:ProfileToken>)" + profile_token + R"(</tptz:ProfileToken>
+      <tptz:PresetName>)" + xmlEscape(name) + R"(</tptz:PresetName>
+      <tptz:PresetToken>)" + std::to_string(preset_id) + R"(</tptz:PresetToken>
+    </tptz:SetPreset>
+  </s:Body>
+</s:Envelope>)";
+
+    std::string url = "http://" + info.ip + ":" + std::to_string(info.port) + "/onvif/PTZ";
+    auto resp = httpPut(url, soap, info.username, info.password, "application/soap+xml");
+    return !resp.empty() && resp.find("Fault") == std::string::npos;
+}
+
+bool PTZManager::onvifRemovePreset(const CameraConnectionInfo& info, int preset_id) {
+    const std::string profile_token = xmlEscape(resolveProfileToken(info));
+    std::string soap = R"(<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <s:Body>
+    <tptz:RemovePreset>
+      <tptz:ProfileToken>)" + profile_token + R"(</tptz:ProfileToken>
+      <tptz:PresetToken>)" + std::to_string(preset_id) + R"(</tptz:PresetToken>
+    </tptz:RemovePreset>
+  </s:Body>
+</s:Envelope>)";
+
+    std::string url = "http://" + info.ip + ":" + std::to_string(info.port) + "/onvif/PTZ";
+    auto resp = httpPut(url, soap, info.username, info.password, "application/soap+xml");
+    return !resp.empty() && resp.find("Fault") == std::string::npos;
 }
 
 // ============================================================================
@@ -439,6 +597,30 @@ std::string PTZManager::httpGet(const std::string& url, const std::string& usern
         return "";
     }
     return response.body;
+}
+
+bool PTZManager::httpDelete(const std::string& url,
+                            const std::string& username,
+                            const std::string& password) {
+    static const std::regex url_regex(R"(^http://([^/:]+)(?::(\d+))(/.*)$)", std::regex::icase);
+    std::smatch match;
+    if (!std::regex_match(url, match, url_regex)) {
+        LOG_ERROR("[PTZ-HTTP] Invalid URL '{}'", url);
+        return false;
+    }
+    int port = 80;
+    if (match[2].matched) {
+        try { port = std::stoi(match[2].str()); }
+        catch (...) { LOG_ERROR("[PTZ-HTTP] Invalid port in '{}'", url); return false; }
+    }
+    auto response = vms::http::deleteDigest(match[1].str(), port, match[3].str(),
+                                            username, password, 3L, 5L);
+    if (response.status_code < 0) {
+        LOG_ERROR("[PTZ-HTTP] DELETE failed: {}", response.error);
+        return false;
+    }
+    // Hikvision returns 200 with an XML body on success; treat 2xx as ok.
+    return response.status_code >= 200 && response.status_code < 300;
 }
 
 std::string PTZManager::httpPut(const std::string& url, const std::string& body,

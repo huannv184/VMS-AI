@@ -13,6 +13,23 @@ const AnalyticsView = () => {
   const [analyticsItems, setAnalyticsItems] = useState([]);
   const [totalAlerts, setTotalAlerts] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
+
+  const handleExportReport = async () => {
+    setExporting(true);
+    try {
+      const res = await apiClient.exportAnalyticsCsv({ type: 'analytics', days: 7 });
+      if (res.success) {
+        apiClient.saveBlobResponse(res, `analytics_report_${Date.now()}.csv`);
+      } else {
+        window.alert('Xuất báo cáo thất bại: ' + (res.error || 'Unknown error'));
+      }
+    } catch (err) {
+      window.alert('Lỗi xuất báo cáo: ' + (err.message || err));
+    } finally {
+      setExporting(false);
+    }
+  };
 
   useEffect(() => {
     const fetchData = async () => {
@@ -147,8 +164,13 @@ const AnalyticsView = () => {
             Hệ Thống Phân Tích & Báo Cáo
           </div>
           <div style={{ display: 'flex', gap: 10 }}>
-            <button className="pb-btn" style={{ padding: '6px 12px', background:'var(--bg)', border:'1px solid var(--border)' }}>
-              <Download size={14} style={{marginRight:6}}/> Xuất Báo Cáo
+            <button
+              className="pb-btn"
+              style={{ padding: '6px 12px', background:'var(--bg)', border:'1px solid var(--border)', opacity: exporting ? 0.5 : 1, cursor: exporting ? 'wait' : 'pointer' }}
+              onClick={handleExportReport}
+              disabled={exporting}
+            >
+              <Download size={14} style={{marginRight:6}}/> {exporting ? 'Đang xuất...' : 'Xuất Báo Cáo (CSV)'}
             </button>
             <div className="pb-btn" style={{ background:'var(--accent)', color:'#000', fontWeight:'bold' }}>
               <Calendar size={14} style={{marginRight:6}}/> 7 Ngày qua

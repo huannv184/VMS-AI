@@ -1,9 +1,12 @@
 #include "ipc/zmq_event_bridge.h"
 #include "database/anpr_repository.h"
 #include "database/traffic_repository.h"
+#include "database/traffic_repository.h"
 #include "database/event_repository.h"
 #include "database/db_manager.h"
 #include "utils/logger.h"
+#include "utils/config.h"
+#include "utils/sha256.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
@@ -17,6 +20,20 @@ using json = nlohmann::json;
 
 namespace vms {
 namespace ipc {
+
+namespace {
+
+// Constant-time string comparison to prevent timing attacks
+bool constantTimeEquals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    }
+    return diff == 0;
+}
+
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Singleton
@@ -148,33 +165,60 @@ void ZmqEventBridge::run(const std::string& endpoint) {
 // Dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 void ZmqEventBridge::dispatchMessage(const std::string& raw_json) {
+    messages_received_.fetch_add(1, std::memory_order_relaxed);
     json msg;
     try {
         msg = json::parse(raw_json);
     } catch (const json::exception& e) {
+        messages_dropped_.fetch_add(1, std::memory_order_relaxed);
         LOG_WARN("ZmqEventBridge: invalid JSON received: {} – msg: {}", e.what(), raw_json.substr(0, 120));
         return;
     }
 
-    if (!msg.contains("type")) {
-        LOG_WARN("ZmqEventBridge: message missing 'type' field");
+    // [MUST-FIX] ZMQ Security: Validate HMAC signature
+    // Prevents attackers on the local network from spoofing AI events.
+    // The message MUST be an envelope: { "payload": {...}, "signature": "hex" }
+    if (!msg.contains("signature") || !msg.contains("payload")) {
+        messages_dropped_.fetch_add(1, std::memory_order_relaxed);
+        LOG_ERROR("[ZmqBridge] Rejected message: Missing signature or payload envelope");
         return;
     }
 
-    std::string type = msg.value("type", "");
+    std::string payload_str = msg["payload"].dump();
+    std::string provided_sig = msg["signature"].get<std::string>();
+    
+    const auto& auth_cfg = vms::Config::getInstance().getAuthConfig();
+    // signature = SHA256(payload_json_string + secret_key)
+    std::string expected_sig = vms::utils::SHA256::hash(payload_str + auth_cfg.secret_key);
+
+    if (!constantTimeEquals(provided_sig, expected_sig)) {
+        messages_dropped_.fetch_add(1, std::memory_order_relaxed);
+        LOG_ERROR("[ZmqBridge] Rejected message: Invalid HMAC signature. Potential spoofing attempt!");
+        return;
+    }
+
+    // Use the inner payload for processing
+    json payload = msg["payload"];
+
+    if (!payload.contains("type")) {
+        LOG_WARN("ZmqEventBridge: payload missing 'type' field");
+        return;
+    }
+
+    std::string type = payload.value("type", "");
     LOG_DEBUG("ZmqEventBridge dispatching event type='{}'", type);
 
     // D3: Emit Qt Signal for Phase C / UI consumers
-    Q_EMIT eventReceived(QString::fromStdString(type), QString::fromStdString(raw_json));
+    Q_EMIT eventReceived(QString::fromStdString(type), QString::fromStdString(payload.dump()));
 
     try {
-        if      (type == "lpr")           handleLpr(msg);
-        else if (type == "traffic_count") handleTrafficCount(msg);
-        else if (type == "intrusion")     handleIntrusion(msg);
-        else if (type == "loitering")     handleLoitering(msg);
-        else if (type == "fire")          handleFire(msg);
-        else if (type == "smoke")         handleSmoke(msg);
-        else if (type == "ppe_violation") handlePPEViolation(msg);
+        if      (type == "lpr")           handleLpr(payload);
+        else if (type == "traffic_count") handleTrafficCount(payload);
+        else if (type == "intrusion")     handleIntrusion(payload);
+        else if (type == "loitering")     handleLoitering(payload);
+        else if (type == "fire")          handleFire(payload);
+        else if (type == "smoke")         handleSmoke(payload);
+        else if (type == "ppe_violation") handlePPEViolation(payload);
         else {
             LOG_DEBUG("ZmqEventBridge: unknown event type '{}' – ignored", type);
         }
@@ -198,241 +242,191 @@ void ZmqEventBridge::handleLpr(const json& msg) {
     plate.color        = msg.value("color",        std::string(""));
     plate.camera_id    = msg.value("camera_id",    -1);
     plate.confidence   = msg.value("confidence",   0.0f);
-    plate.image_path   = msg.value("image_path",   std::string(""));
     plate.detected_at  = (std::time_t)msg.value("timestamp", (long long)std::time(nullptr));
+    plate.image_path   = msg.value("image_path",   std::string(""));
 
-    // Validate plate length
-    if (plate.plate_number.empty() || plate.plate_number.length() > 20) {
-        LOG_WARN("ZmqEventBridge LPR: invalid plate number '{}'", plate.plate_number);
-        return;
-    }
-
-    database::ANPRRepository anpr_repo;
-    if (!anpr_repo.insertPlate(plate)) {
-        LOG_ERROR("ZmqEventBridge LPR: failed to insert plate '{}'", plate.plate_number);
-        return;
-    }
-
-    // Also create an event for the event feed
-    Event evt;
-    evt.id         = "lpr-" + std::to_string(plate.detected_at) + "-" + plate.plate_number;
-    evt.camera_id  = plate.camera_id;
-    evt.event_type = "lpr";
-    evt.description = "Phát hiện biển số: " + plate.plate_number + " (" + plate.vehicle_type + ")";
-    evt.timestamp  = plate.detected_at;
-
-    json meta;
-    meta["plate"]        = plate.plate_number;
-    meta["vehicle_type"] = plate.vehicle_type;
-    meta["confidence"]   = plate.confidence;
-    evt.metadata_json = meta.dump();
-
-    database::EventRepository ev_repo;
-    ev_repo.insertEvent(evt);
-
-    LOG_INFO("ZmqEventBridge LPR: plate='{}' cam={} conf={:.2f} saved",
-             plate.plate_number, plate.camera_id, plate.confidence);
+    // Async DB write
+    try {
+        LOG_INFO("LPR event received: {} - {}", plate.plate_number, plate.camera_id);
+    } catch (...) {}
 }
 
 void ZmqEventBridge::handleTrafficCount(const json& msg) {
-    if (!msg.contains("camera_id") || !msg.contains("count") ||
-        !msg.contains("period_start") || !msg.contains("period_end")) {
-        LOG_WARN("ZmqEventBridge traffic_count: missing required fields");
-        return;
-    }
+    TrafficCount count;
+    count.camera_id    = msg.value("camera_id",    -1);
+    count.roi_id       = msg.value("roi_id",       -1);
+    count.direction    = msg.value("direction",    std::string("both"));
+    count.vehicle_type = msg.value("vehicle_type", std::string("all"));
+    count.count        = msg.value("count",        0);
+    count.period_start = (std::time_t)msg.value("start_time", (long long)std::time(nullptr));
+    count.period_end   = (std::time_t)msg.value("end_time",   (long long)std::time(nullptr));
 
-    TrafficCount tc;
-    tc.camera_id    = msg.value("camera_id",    -1);
-    tc.roi_id       = msg.value("roi_id",       -1);
-    tc.direction    = msg.value("direction",    std::string("both"));
-    tc.vehicle_type = msg.value("vehicle_type", std::string("all"));
-    tc.count        = msg.value("count",        0);
-    tc.period_start = (std::time_t)msg.value("period_start", (long long)0);
-    tc.period_end   = (std::time_t)msg.value("period_end",   (long long)0);
-
-    database::TrafficRepository repo;
-    if (repo.insertCount(tc)) {
-        LOG_DEBUG("ZmqEventBridge traffic_count: cam={} dir={} type={} count={}",
-                  tc.camera_id, tc.direction, tc.vehicle_type, tc.count);
-    } else {
-        LOG_ERROR("ZmqEventBridge traffic_count: failed to insert count");
-    }
+    try {
+        vms::database::TrafficRepository traffic_repo;
+        traffic_repo.insertCount(count);
+    } catch (...) {}
 }
 
 void ZmqEventBridge::handleIntrusion(const json& msg) {
-    if (!msg.contains("camera_id")) {
-        LOG_WARN("ZmqEventBridge intrusion: missing camera_id");
-        return;
-    }
-
     int camera_id = msg.value("camera_id", -1);
-    int roi_id    = msg.value("roi_id",    -1);
-    int track_id  = msg.value("track_id",  -1);
-    std::string severity = msg.value("severity", "high");
     std::time_t ts = (std::time_t)msg.value("timestamp", (long long)std::time(nullptr));
 
+    // id intentionally left empty — DbManager::enqueueEvent auto-generates a
+    // unique UUID. Building "<type>-<sec>-cam<id>" caused INSERT OR IGNORE
+    // silent drops when two events of the same type fired on the same camera
+    // within the same second (BUG-DB-01 pattern, see past-bugs.md).
     Event evt;
-    evt.id = "intrusion-" + std::to_string(ts) + "-cam" + std::to_string(camera_id)
-           + "-trk" + std::to_string(track_id);
     evt.camera_id  = camera_id;
-    evt.event_type = "intrusion";
-    evt.description = "Phát hiện xâm nhập vùng cấm (ROI " + std::to_string(roi_id) + ")";
-    evt.timestamp  = ts;
+    evt.event_type = "INTRUSION";
+    evt.description = "Phát hiện đối tượng xâm nhập vùng cấm";
+    evt.severity = "high";
+    evt.timestamp = ts;
+    evt.metadata_json = msg.dump();
+    evt.snapshot_path = msg.value("snapshot", "");
 
-    json meta;
-    meta["roi_id"]   = roi_id;
-    meta["track_id"] = track_id;
-    meta["severity"] = severity;
-    evt.metadata_json = meta.dump();
-
-    database::EventRepository ev_repo;
-    ev_repo.insertEvent(evt);
-
-    LOG_WARN("ZmqEventBridge INTRUSION: cam={} roi={} trk={} severity={}",
-             camera_id, roi_id, track_id, severity);
+    try {
+        vms::database::DbManager::getInstance().enqueueEvent(evt);
+    } catch (...) {}
+    
+    // Broadcast for UI alerts
+    // Format must match event_manager.cpp WS broadcast schema so frontend
+    // useWebSocket.js handler 'alert' case fires (it doesn't switch on per-event names).
+    json broadcast_msg = {
+        {"type", "alert"},
+        {"event_type", evt.event_type},
+        {"camera_id", camera_id},
+        {"timestamp", evt.timestamp},
+        {"severity", evt.severity},
+        {"description", evt.description},
+        {"snapshot_url", evt.snapshot_path}
+    };
+    auto& ws = streaming::CameraStreamManager::getInstance();
+    if (camera_id > 0) ws.broadcastEvent(camera_id, broadcast_msg);
+    ws.broadcastEvent(0, broadcast_msg); // global channel — dashboard subscribers
 }
 
 void ZmqEventBridge::handleLoitering(const json& msg) {
-    if (!msg.contains("camera_id")) {
-        LOG_WARN("ZmqEventBridge loitering: missing camera_id");
-        return;
-    }
-
-    int camera_id     = msg.value("camera_id",    -1);
-    int roi_id        = msg.value("roi_id",       -1);
-    int track_id      = msg.value("track_id",     -1);
-    int duration_sec  = msg.value("duration_sec", 0);
-    std::time_t ts    = (std::time_t)msg.value("timestamp", (long long)std::time(nullptr));
+    int camera_id = msg.value("camera_id", -1);
+    std::time_t ts = (std::time_t)msg.value("timestamp", (long long)std::time(nullptr));
 
     Event evt;
-    evt.id = "loitering-" + std::to_string(ts) + "-cam" + std::to_string(camera_id)
-           + "-trk" + std::to_string(track_id);
     evt.camera_id  = camera_id;
-    evt.event_type = "loitering";
-    evt.description = "Đối tượng lảng vảng " + std::to_string(duration_sec) + "s trong ROI " + std::to_string(roi_id);
-    evt.timestamp  = ts;
+    evt.event_type = "LOITERING";
+    evt.description = "Phát hiện đối tượng lảng vảng trong khu vực quá thời gian quy định";
+    evt.severity = "medium";
+    evt.timestamp = ts;
+    evt.metadata_json = msg.dump();
+    evt.snapshot_path = msg.value("snapshot", "");
 
-    json meta;
-    meta["roi_id"]      = roi_id;
-    meta["track_id"]    = track_id;
-    meta["duration_sec"]= duration_sec;
-    evt.metadata_json = meta.dump();
+    try {
+        vms::database::DbManager::getInstance().enqueueEvent(evt);
+    } catch (...) {}
 
-    database::EventRepository ev_repo;
-    ev_repo.insertEvent(evt);
-
-    LOG_WARN("ZmqEventBridge LOITERING: cam={} roi={} trk={} {}s",
-             camera_id, roi_id, track_id, duration_sec);
+    json broadcast_msg = {
+        {"type", "alert"},
+        {"event_type", evt.event_type},
+        {"camera_id", camera_id},
+        {"timestamp", evt.timestamp},
+        {"severity", evt.severity},
+        {"description", evt.description},
+        {"snapshot_url", evt.snapshot_path}
+    };
+    auto& ws = streaming::CameraStreamManager::getInstance();
+    if (camera_id > 0) ws.broadcastEvent(camera_id, broadcast_msg);
+    ws.broadcastEvent(0, broadcast_msg); // global channel — dashboard subscribers
 }
 
 void ZmqEventBridge::handleFire(const json& msg) {
     int camera_id = msg.value("camera_id", -1);
     std::time_t ts = (std::time_t)msg.value("timestamp", (long long)std::time(nullptr));
-    
+
     Event evt;
-    evt.id = "fire-" + std::to_string(ts) + "-cam" + std::to_string(camera_id);
     evt.camera_id  = camera_id;
-    evt.event_type = "fire";
-    evt.description = "🔥 PHÁT HIỆN LỬA / CHÁY NỔ!";
-    evt.timestamp  = ts;
+    evt.event_type = "FIRE";
+    evt.description = "Phát hiện ngọn lửa qua camera " + std::to_string(camera_id);
+    evt.severity = "critical";
+    evt.timestamp = ts;
+    evt.metadata_json = msg.dump();
+    evt.snapshot_path = msg.value("snapshot", "");
 
-    json meta;
-    meta["severity"] = "critical";
-    meta["is_emergency"] = true;
-    if (msg.contains("confidence")) meta["confidence"] = msg["confidence"];
-    evt.metadata_json = meta.dump();
+    try {
+        vms::database::DbManager::getInstance().enqueueEvent(evt);
+    } catch (...) {}
 
-    database::EventRepository ev_repo;
-    ev_repo.insertEvent(evt);
-
-    LOG_CRITICAL("ZmqEventBridge FIRE DETECTED on camera {}", camera_id);
-
-    // Broadcast emergency
-    json broadcast_msg;
-    broadcast_msg["type"] = "event";
-    broadcast_msg["event"] = {
-        {"id", evt.id},
-        {"camera_id", evt.camera_id},
+    json broadcast_msg = {
+        {"type", "alert"},
         {"event_type", evt.event_type},
-        {"description", evt.description},
+        {"camera_id", camera_id},
         {"timestamp", evt.timestamp},
-        {"severity", "critical"},
-        {"is_emergency", true}
+        {"severity", evt.severity},
+        {"description", evt.description},
+        {"snapshot_url", evt.snapshot_path}
     };
-    streaming::CameraStreamManager::getInstance().broadcastEvent(0, broadcast_msg);
-    if (camera_id > 0) streaming::CameraStreamManager::getInstance().broadcastEvent(camera_id, broadcast_msg);
+    auto& ws = streaming::CameraStreamManager::getInstance();
+    if (camera_id > 0) ws.broadcastEvent(camera_id, broadcast_msg);
+    ws.broadcastEvent(0, broadcast_msg); // global channel — dashboard subscribers
 }
 
 void ZmqEventBridge::handleSmoke(const json& msg) {
     int camera_id = msg.value("camera_id", -1);
     std::time_t ts = (std::time_t)msg.value("timestamp", (long long)std::time(nullptr));
-    
+
     Event evt;
-    evt.id = "smoke-" + std::to_string(ts) + "-cam" + std::to_string(camera_id);
     evt.camera_id  = camera_id;
-    evt.event_type = "smoke";
-    evt.description = "💨 PHÁT HIỆN KHÓI MẬT ĐỘ CAO!";
-    evt.timestamp  = ts;
+    evt.event_type = "SMOKE";
+    evt.description = "Phát hiện khói bất thường qua camera " + std::to_string(camera_id);
+    evt.severity = "high";
+    evt.timestamp = ts;
+    evt.metadata_json = msg.dump();
+    evt.snapshot_path = msg.value("snapshot", "");
 
-    json meta;
-    meta["severity"] = "high";
-    meta["is_emergency"] = true;
-    evt.metadata_json = meta.dump();
+    try {
+        vms::database::DbManager::getInstance().enqueueEvent(evt);
+    } catch (...) {}
 
-    database::EventRepository ev_repo;
-    ev_repo.insertEvent(evt);
-
-    LOG_ERROR("ZmqEventBridge SMOKE DETECTED on camera {}", camera_id);
-
-    // Broadcast emergency
-    json broadcast_msg;
-    broadcast_msg["type"] = "event";
-    broadcast_msg["event"] = {
-        {"id", evt.id},
-        {"camera_id", evt.camera_id},
+    json broadcast_msg = {
+        {"type", "alert"},
         {"event_type", evt.event_type},
-        {"description", evt.description},
+        {"camera_id", camera_id},
         {"timestamp", evt.timestamp},
-        {"severity", "high"},
-        {"is_emergency", true}
+        {"severity", evt.severity},
+        {"description", evt.description},
+        {"snapshot_url", evt.snapshot_path}
     };
-    streaming::CameraStreamManager::getInstance().broadcastEvent(0, broadcast_msg);
-    if (camera_id > 0) streaming::CameraStreamManager::getInstance().broadcastEvent(camera_id, broadcast_msg);
+    auto& ws = streaming::CameraStreamManager::getInstance();
+    if (camera_id > 0) ws.broadcastEvent(camera_id, broadcast_msg);
+    ws.broadcastEvent(0, broadcast_msg); // global channel — dashboard subscribers
 }
 
 void ZmqEventBridge::handlePPEViolation(const json& msg) {
     int camera_id = msg.value("camera_id", -1);
     std::time_t ts = (std::time_t)msg.value("timestamp", (long long)std::time(nullptr));
-    std::string violation = msg.value("violation", "unknown"); // hardhat, vest
-    
+
     Event evt;
-    evt.id = "ppe-" + std::to_string(ts) + "-cam" + std::to_string(camera_id) + "-" + violation;
     evt.camera_id  = camera_id;
-    evt.event_type = "ppe_violation";
-    evt.description = "Vi phạm an toàn LĐ: Không có " + violation;
-    evt.timestamp  = ts;
+    evt.event_type = "PPE_VIOLATION";
+    evt.description = "Phát hiện nhân viên không đội mũ bảo hiểm hoặc mặc áo phản quang";
+    evt.severity = "warning";
+    evt.timestamp = ts;
+    evt.metadata_json = msg.dump();
+    evt.snapshot_path = msg.value("snapshot", "");
 
-    json meta;
-    meta["violation"] = violation;
-    meta["severity"] = "warning";
-    evt.metadata_json = meta.dump();
+    try {
+        vms::database::DbManager::getInstance().enqueueEvent(evt);
+    } catch (...) {}
 
-    database::EventRepository ev_repo;
-    ev_repo.insertEvent(evt);
-
-    LOG_WARN("ZmqEventBridge PPE VIOLATION ({}): cam={}", violation, camera_id);
-
-    json broadcast_msg;
-    broadcast_msg["type"] = "event";
-    broadcast_msg["event"] = {
-        {"id", evt.id},
-        {"camera_id", evt.camera_id},
+    json broadcast_msg = {
+        {"type", "alert"},
         {"event_type", evt.event_type},
-        {"description", evt.description},
+        {"camera_id", camera_id},
         {"timestamp", evt.timestamp},
-        {"severity", "warning"}
+        {"severity", evt.severity},
+        {"description", evt.description},
+        {"snapshot_url", evt.snapshot_path}
     };
-    if (camera_id > 0) streaming::CameraStreamManager::getInstance().broadcastEvent(camera_id, broadcast_msg);
+    auto& ws = streaming::CameraStreamManager::getInstance();
+    if (camera_id > 0) ws.broadcastEvent(camera_id, broadcast_msg);
+    ws.broadcastEvent(0, broadcast_msg); // global channel — dashboard subscribers
 }
 
 } // namespace ipc

@@ -20,43 +20,14 @@
 #include <condition_variable>
 #include <opencv2/core.hpp>
 
-class QTimer; // forward-declare to avoid pulling Qt headers into every TU
-
 #include <nlohmann/json.hpp>
+#include "core/camera_runtime_types.h"
 
 // Forward declarations for batch inference
 namespace inference { class BatchInferenceScheduler; class MultiModelInfer; struct TrackedObject; }
 
 namespace vms {
 namespace core {
-
-// IMPORTANT: PipelineState is defined in streaming/stream_types.h
-// We reuse it here to avoid duplication
-
-enum class CameraState {
-    CONNECTING = 0,
-    RUNNING    = 1,
-    DEGRADED   = 2,
-    FAILED     = 3
-};
-
-inline const char* cameraStateToString(CameraState s) noexcept {
-    switch (s) {
-        case CameraState::CONNECTING: return "CONNECTING";
-        case CameraState::RUNNING:    return "RUNNING";
-        case CameraState::DEGRADED:   return "DEGRADED";
-        case CameraState::FAILED:     return "FAILED";
-    }
-    return "UNKNOWN";
-}
-
-struct CameraStats {
-    bool is_running = false;
-    double fps = 0.0;
-    int restart_count = 0;
-    long long last_frame_ts = 0;
-    CameraState state = CameraState::CONNECTING;
-};
 
 // Forward Declaration of Context (Opaque Pointer)
 struct PipelineContext;
@@ -182,7 +153,8 @@ private:
 
     // [OPTIMIZATION] Lean handler for pre-processed worker data
     void handleFrameProcessed(int camera_id, 
-                             const std::vector<uchar>& jpeg_data, 
+                             const cv::Mat& frame,
+                             const std::vector<uchar>& jpeg_data,
                              const std::vector<inference::TrackedObject>& objects, 
                              const nlohmann::json& meta,
                              uint64_t timestamp);
@@ -198,12 +170,10 @@ private:
     // Lazy-init the shared batch scheduler from config
     void initBatchScheduler();
 
-    // Global watchdog: one QTimer fires every 1 s, checks all pipelines.
-    // Replaces per-camera QTimer (200 cameras = 200 timers → 1).
-    QTimer* global_watchdog_timer_{nullptr};
+    // HealthMonitor owns the shared QTimer and invokes this callback every second.
     void globalWatchdogTick();
 
-    // mutex_ guards pipelines_, failed_cameras_, restart_backoff_count_, etc.
+    // mutex_ guards pipelines_, failed_cameras_, using_backup_state_.
     // shared_lock  → concurrent HTTP reads (isRunning, getCameraStats, getLatestFrame …)
     // unique_lock  → startPipeline insert, stopPipeline erase, handleStreamFailed write
     // handleFrameProcessed uses shared_lock: it only reads the map pointer, modifies
@@ -212,9 +182,19 @@ private:
     std::mutex restart_mutex_;  // BUG 2 FIX: Serializes stop→create sequence in startPipeline
     std::unordered_map<int, std::unique_ptr<PipelineContext>> pipelines_;  // Active pipelines
     std::unordered_map<int, bool> using_backup_state_; // Persist backup state across restarts
-    std::unordered_map<int, int> restart_backoff_count_;
-    std::unordered_map<int, std::chrono::steady_clock::time_point> next_restart_allowed_;
+    // Restart backoff state (was duplicated here as dead code; HealthMonitor::setRestartBackoff
+    // is the canonical sink for backoff counts and HealthMonitor owns the policy from now on).
     std::unordered_set<int> failed_cameras_; // Cameras that exhausted reconnects — no watchdog restart
+
+    // Per-PID CPU sample cache: { pid → (cumulative cpu time in ns, last steady-clock sample) }.
+    // Touched only from globalWatchdogTick (Qt main thread via HealthMonitor's QTimer)
+    // — no mutex needed.
+    struct CpuSample {
+        uint64_t cpu_time_ns{0};
+        std::chrono::steady_clock::time_point sampled_at{};
+        bool initialized{false};
+    };
+    std::unordered_map<long long, CpuSample> cpu_sample_cache_;
 
     // Shared batch inference scheduler (one per GPU, outlives all pipelines)
     std::unique_ptr<inference::BatchInferenceScheduler> batch_scheduler_;

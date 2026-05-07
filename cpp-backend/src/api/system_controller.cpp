@@ -205,9 +205,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) {
-            return ApiUtils::createErrorResponse("Admin privileges required", 403, origin);
-        }
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         if (req.method == crow::HTTPMethod::Get) {
             auto& db = vms::database::DbManager::getInstance();
@@ -225,16 +223,53 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
             try {
                 auto body = json::parse(req.body);
                 auto& db = vms::database::DbManager::getInstance();
-                
+
+                // Validate every key first so a malformed value can't leave a
+                // half-applied settings batch (rejecting key 7 of 12 after
+                // mutating 6 was the previous behaviour and very confusing
+                // operationally).
+                std::vector<std::pair<std::string, std::string>> normalised;
+                normalised.reserve(body.size());
                 for (auto& el : body.items()) {
                     std::string key = el.key();
                     auto value = normalizeSettingValue(key, el.value());
                     if (!value.has_value()) {
                         return ApiUtils::createErrorResponse("Invalid setting value for key: " + key, 400, origin);
                     }
-                    db.setSetting(key, value.value());
+                    normalised.emplace_back(std::move(key), std::move(value.value()));
                 }
-                
+
+                // Look up old values BEFORE writing so the audit row records
+                // the actual transition (was→now). Settings affecting auth /
+                // SMTP / SMS need this trail for forensic review.
+                auto current = db.getAllSettings();
+
+                // Settings that control credentials / secrets — never log the
+                // raw new value to the audit table. Logging "old=… new=…" for
+                // these would defeat the point of having them be settings.
+                static const std::unordered_set<std::string> sensitive_keys = {
+                    "smtp_pass", "twilio_auth_token", "alarm_output_token",
+                    "ldap_bind_password", "openai_api_key", "smb_password"
+                };
+
+                for (const auto& [key, value] : normalised) {
+                    db.setSetting(key, value);
+
+                    std::string detail;
+                    if (sensitive_keys.count(key)) {
+                        detail = "Updated setting '" + key + "' (value redacted)";
+                    } else {
+                        auto it = current.find(key);
+                        std::string old_v = (it != current.end()) ? it->second : "<unset>";
+                        if (old_v.size() > 80) old_v = old_v.substr(0, 80) + "...";
+                        std::string new_v = value;
+                        if (new_v.size() > 80) new_v = new_v.substr(0, 80) + "...";
+                        detail = "Setting '" + key + "': " + old_v + " → " + new_v;
+                    }
+                    database::AuditRepository audit;
+                    audit.insertLog(ctx.user->id, "UPDATE_SETTING", detail);
+                }
+
                 return ApiUtils::createResponse(json::object(), 200, origin);
             } catch (const std::exception& e) {
                 return ApiUtils::createErrorResponse(e.what(), 500, origin);
@@ -253,12 +288,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
         
         {
             auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-            if (!ctx.user.has_value()) {
-                return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
-            }
-            if (ctx.user->role_id != 1) {
-                return ApiUtils::createErrorResponse("Admin privileges required", 403, origin);
-            }
+            if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
         }
 
         try {
@@ -287,9 +317,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) {
-            return ApiUtils::createErrorResponse("Admin privileges required", 403, origin);
-        }
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         try {
             vms::core::ScanConfig cfg;
@@ -320,9 +348,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) {
-            return ApiUtils::createErrorResponse("Admin privileges required", 403, origin);
-        }
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         try {
             std::string scan_id = req.url_params.get("scan_id") ? req.url_params.get("scan_id") : "";
@@ -357,9 +383,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) {
-            return ApiUtils::createErrorResponse("Admin privileges required", 403, origin);
-        }
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);
@@ -383,9 +407,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) {
-            return ApiUtils::createErrorResponse("Admin privileges required", 403, origin);
-        }
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         auto& scanner = vms::core::NetworkScanner::getInstance();
 
@@ -398,8 +420,8 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
     });
 
     // GET /api/system/streaming-config
-    // Returns the actual WebSocket port (may differ from config if port was in use).
-    // Frontend must call this on startup and connect to the returned port.
+    // PUBLIC endpoint — không yêu cầu auth. Frontend gọi trước khi login
+    // để lấy WS port thực tế (có thể khác config nếu port bị occupied).
     CROW_ROUTE(app, "/api/system/streaming-config")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
     ([](const crow::request& req) {
@@ -408,9 +430,16 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(json::object(), 204, origin);
 
         int ws_port = vms::streaming::CameraStreamManager::getInstance().getBoundPort();
+        // api_port phải đọc từ Config (env PORT hoặc YAML), không hardcode —
+        // production deploy sau reverse-proxy hoặc container hay đổi port,
+        // hardcode 8000 sẽ làm frontend auto-detect ra URL sai và mọi request
+        // im lặng đi vào hư không.
+        int api_port = vms::Config::getInstance().getServerConfig().port;
+
         json result;
         result["websocket_port"] = ws_port;
         result["websocket_available"] = (ws_port > 0);
+        result["api_port"] = api_port;
         return ApiUtils::createResponse(result, 200, origin);
     });
 

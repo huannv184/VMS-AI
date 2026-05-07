@@ -133,7 +133,14 @@ private:
     float face_similarity_threshold_{0.5f};
     bool enable_face_detection_{false};
     bool enable_face_recognition_{false};
-    
+
+    // YOLO letterbox state — populated by preprocessYOLO, consumed by parseYOLOv8Output.
+    // Letterbox preserves aspect ratio (no squashing) which is what YOLO11 was trained
+    // with. Storing scale/pad here avoids changing the parse signature.
+    float yolo_letterbox_scale_{1.0f};
+    int   yolo_letterbox_pad_x_{0};
+    int   yolo_letterbox_pad_y_{0};
+
     mutable std::mutex mutex_;
 };
 

@@ -95,6 +95,7 @@ private:
     PTZProtocol detectProtocol(int camera_id);
     
     struct CameraConnectionInfo {
+        int camera_id{-1};
         std::string ip;
         int port{80};
         std::string username;
@@ -119,6 +120,14 @@ private:
     bool onvifStop(const CameraConnectionInfo& info);
     bool onvifGotoPreset(const CameraConnectionInfo& info, int preset_id);
     std::vector<PTZPreset> onvifGetPresets(const CameraConnectionInfo& info);
+    bool onvifSetPreset(const CameraConnectionInfo& info, int preset_id, const std::string& name);
+    bool onvifRemovePreset(const CameraConnectionInfo& info, int preset_id);
+
+    // Resolve the ONVIF MediaProfile token for this camera. Looks up a cached
+    // token first; on miss issues a Media GetProfiles SOAP call and stores the
+    // first profile's token. Falls back to "Profile_1" so existing devices
+    // (which advertise that exact token) keep working when discovery fails.
+    std::string resolveProfileToken(const CameraConnectionInfo& info);
     
     bool hikvisionStartPatrol(const CameraConnectionInfo& info, int patrol_id);
     bool dahuaStartPatrol(const CameraConnectionInfo& info, int patrol_id);
@@ -126,13 +135,17 @@ private:
 
     // HTTP helper
     std::string httpGet(const std::string& url, const std::string& username, const std::string& password);
-    std::string httpPut(const std::string& url, const std::string& body, 
+    std::string httpPut(const std::string& url, const std::string& body,
                         const std::string& username, const std::string& password,
                         const std::string& content_type = "application/xml");
+    bool httpDelete(const std::string& url, const std::string& username, const std::string& password);
 
     std::mutex mutex_;
     // Cache protocol per camera to avoid repeated detection
     std::unordered_map<int, PTZProtocol> protocol_cache_;
+    // Cache resolved ONVIF MediaProfile token per camera. Empty string means
+    // "tried discovery and failed — caller should use legacy fallback".
+    std::unordered_map<int, std::string> profile_token_cache_;
 };
 
 } // namespace core

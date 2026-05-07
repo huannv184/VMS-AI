@@ -1,25 +1,51 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { MousePointer2, Move, LassoSelect, Trash2, Save, X, Type, Settings2 } from 'lucide-react';
+import { Move, LassoSelect, Trash2, Save, X } from 'lucide-react';
+import apiClient from '../api/apiClient';
 
-const AiRuleEditor = ({ cameraId, onSave, onClose }) => {
+const AiRuleEditor = ({ cameraId, onSave, onClose, initialZone = null }) => {
   const canvasRef = useRef(null);
-  const [points, setPoints] = useState([]);
-  const [mode, setMode] = useState('polygon'); // 'line' or 'polygon'
+  // Seed from initialZone so "SỬA VÙNG" actually edits the existing polygon
+  // instead of starting blank and silently creating a duplicate on save.
+  const [points, setPoints] = useState(() =>
+    Array.isArray(initialZone?.points) ? initialZone.points : []
+  );
+  const [mode, setMode] = useState(initialZone?.type === 'line' ? 'line' : 'polygon');
   const [snapshot, setSnapshot] = useState(null);
-  const [isDrawing, setIsDrawing] = useState(false);
+  const [snapshotError, setSnapshotError] = useState(null);
 
-  // Load snapshot on mount
+  // Load snapshot on mount via apiClient (carries auth headers/cookies).
   useEffect(() => {
+    let cancelled = false;
+    let objectUrl = null;
     const fetchSnapshot = async () => {
-       try {
-         const res = await fetch(`/api/cameras/${cameraId}/snapshot`, { method: 'POST' });
-         if (res.ok) {
-           const blob = await res.blob();
-           setSnapshot(URL.createObjectURL(blob));
-         }
-       } catch (e) { console.error('Snapshot failed', e); }
+      try {
+        // POST snapshot triggers backend to capture; backend persists and returns JSON with snapshot_url.
+        const triggerRes = await apiClient.snapshotCamera(cameraId);
+        if (!triggerRes.success) {
+          if (!cancelled) setSnapshotError(triggerRes.error || 'Không lấy được snapshot');
+          return;
+        }
+        const url = triggerRes.data?.snapshot_url || triggerRes.data?.url;
+        if (url) {
+          // Fetch the image binary so we can render it as a blob URL (auth via cookie/header).
+          const imgRes = await apiClient.download(url);
+          if (imgRes.success && imgRes.data instanceof Blob) {
+            objectUrl = URL.createObjectURL(imgRes.data);
+            if (!cancelled) setSnapshot(objectUrl);
+          } else if (!cancelled) {
+            setSnapshotError(imgRes.error || 'Lỗi tải ảnh snapshot');
+          }
+        }
+      } catch (e) {
+        console.error('Snapshot failed', e);
+        if (!cancelled) setSnapshotError(e.message || 'Lỗi snapshot');
+      }
     };
     fetchSnapshot();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
   }, [cameraId]);
 
   const redraw = useCallback(() => {
@@ -69,11 +95,13 @@ const AiRuleEditor = ({ cameraId, onSave, onClose }) => {
   };
 
   const handleSave = () => {
-    if (points.length < 2) return alert('Vui lòng vẽ ít nhất 2 điểm!');
+    if (mode === 'line' && points.length < 2) return alert('Vạch ảo cần ít nhất 2 điểm!');
+    if (mode === 'polygon' && points.length < 3) return alert('Vùng đa giác cần ít nhất 3 điểm!');
     onSave({
+      zone_id: initialZone?.zone_id ?? null,
       type: mode,
       points: points,
-      camera_id: cameraId
+      camera_id: cameraId,
     });
   };
 
@@ -102,7 +130,13 @@ const AiRuleEditor = ({ cameraId, onSave, onClose }) => {
             onClick={handleCanvasClick}
             style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', cursor:'crosshair' }} 
          />
-         {!snapshot && <div className="ai-dot-spin"></div>}
+         {!snapshot && !snapshotError && <div className="ai-dot-spin"></div>}
+         {!snapshot && snapshotError && (
+           <div style={{ position: 'absolute', color: 'var(--danger)', fontSize: 12, textAlign: 'center', padding: 16 }}>
+             ⚠ {snapshotError}<br />
+             <span style={{ fontSize: 10, color: 'var(--text-dim)' }}>Bạn vẫn có thể vẽ vùng trên nền lưới phía dưới.</span>
+           </div>
+         )}
       </div>
 
       <div className="cam-footer" style={{ background: 'rgba(0,0,0,0.8)', padding: '15px 20px', display:'flex', justifyContent:'space-between' }}>

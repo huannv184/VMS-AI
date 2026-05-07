@@ -41,6 +41,26 @@ public:
     std::vector<char> getObject(const std::string& object_key);
 
     /**
+     * @brief Result of a partial GET. `total_size` is the full object length
+     * (parsed from Content-Range), -1 if unknown. `http_code` lets callers
+     * distinguish 206 (partial), 200 (server ignored Range, returned full body),
+     * 416 (range not satisfiable), other (error).
+     */
+    struct RangeResult {
+        std::vector<char> data;
+        long long         total_size{-1};
+        long              http_code{0};
+    };
+
+    /**
+     * @brief Fetch a byte range from a MinIO object.
+     * @param object_key Path in MinIO bucket
+     * @param start First byte offset (inclusive)
+     * @param length Number of bytes to fetch (>0)
+     */
+    RangeResult getObjectRange(const std::string& object_key, size_t start, size_t length);
+
+    /**
      * @brief Generate a presigned URL for GET access.
      * @param object_key Path in MinIO bucket
      * @param expires_in_sec Lifetime of the URL

@@ -1,10 +1,27 @@
 #include "core/alert_manager.h"
+#include "core/runtime_state.h"
 #include "database/db_manager.h"
+#include "utils/background_job_runner.h"
+#include "utils/email_sender.h"
 #include "utils/logger.h"
 #include <QSqlQuery>
 #include <QSqlError>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
+#include <sstream>
+#include <string>
+
+namespace {
+
+// Webhooks used to run inline on EventManager's broadcast loop — one slow
+// endpoint stalled the entire event pipeline. Move them to a bounded
+// background runner (drop-on-full) mirroring the AlertRouter pattern.
+vms::utils::BackgroundJobRunner& webhookRunner() {
+    static vms::utils::BackgroundJobRunner instance("alert-mgr-webhooks", 2, 128);
+    return instance;
+}
+
+} // namespace
 
 namespace vms {
 namespace core {
@@ -66,38 +83,67 @@ void AlertManager::dispatchNotification(const vms::Event& event, const std::stri
 }
 
 void AlertManager::sendEmail(const vms::Event& event, const std::string& recipient) {
-    // Basic implementation: Log to console as placeholder for SMTP logic
-    LOG_INFO(">>> [MOCK EMAIL] To: {}, Subject: VMS Alert - {}, Body: {}", 
-             recipient, event.event_type, event.description);
+    // Subject must be single-line (sendEmailAsync sanitizes again, but we keep
+    // the human-readable form short here so logs aren't noisy).
+    std::string subject = "VMS Alert — ";
+    subject += event.event_type;
+    if (event.camera_id > 0) {
+        subject += " (camera " + std::to_string(event.camera_id) + ")";
+    }
+
+    std::ostringstream body;
+    body << "VMS Alert\r\n\r\n"
+         << "Event type: " << event.event_type << "\r\n"
+         << "Camera:     " << event.camera_id << "\r\n"
+         << "Timestamp:  " << event.timestamp << "\r\n"
+         << "Event ID:   " << event.id << "\r\n\r\n"
+         << "Description:\r\n" << event.description << "\r\n";
+
+    vms::utils::sendEmailAsync(subject, body.str(), { recipient }, "alert_manager");
 }
 
 void AlertManager::sendWebhook(const vms::Event& event, const std::string& url) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return;
-
+    // Build the payload on the calling thread (EventManager broadcast loop)
+    // so a stale `event` reference can't outlive the queued job. Then hand
+    // the cheap value-type copy to the background runner — the actual
+    // libcurl perform must NEVER block the event loop.
     nlohmann::json payload;
     payload["event_id"] = event.id;
     payload["camera_id"] = event.camera_id;
     payload["type"] = event.event_type;
     payload["message"] = event.description;
     payload["timestamp"] = event.timestamp;
-    
     std::string json_str = payload.dump();
+    std::string url_copy = url;
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+    if (!webhookRunner().submit([url_copy, json_str]() {
+        if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        CURL* curl = curl_easy_init();
+        if (!curl) return;
 
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        LOG_ERROR("AlertManager: Webhook failed: {}", curl_easy_strerror(res));
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl, CURLOPT_URL, url_copy.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        // Without these, a dead webhook host blocks a worker for the OS
+        // default ~120s. Two workers + 60 dead hosts = full stall.
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+            LOG_ERROR("AlertManager: Webhook to {} failed: {}", url_copy, curl_easy_strerror(res));
+        }
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    })) {
+        LOG_THROTTLED_WARN(5000, "AlertManager: webhook queue full, dropping send to {}", url_copy);
     }
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
 }
 
 } // namespace core

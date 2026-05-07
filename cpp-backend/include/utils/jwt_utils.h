@@ -33,6 +33,18 @@ bool decodeAccessTokenJwtUser(const std::string& token, vms::core::User& user_ou
 bool verifyTwoFactorTempTokenJwt(const std::string& token, int& user_id_out);
 
 /**
+ * Create a short-lived JWT for users who must change their password before
+ * being granted a real access token. Carries token_use="password_change_pending"
+ * so AuthMiddleware will reject it for any normal API call.
+ */
+std::string createPasswordChangeTempTokenJwt(const vms::core::User& user);
+
+/**
+ * Verify a password-change-pending JWT and extract the user_id.
+ */
+bool verifyPasswordChangeTempTokenJwt(const std::string& token, int& user_id_out);
+
+/**
  * Create a short-lived, single-use ticket for WebSocket authentication bound to an IP.
  */
 std::string createWsTicketJwt(const vms::core::User& user, const std::string& client_ip = "");

@@ -158,8 +158,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(json::object(), 204, origin);
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value())
-            return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::FACE_READ, origin)) return std::move(*err);
 
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
@@ -209,8 +208,12 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(json::object(), 204, origin);
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value())
-            return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
+        // GET → FACE_READ; POST → FACE_WRITE. Operator role has READ-only on
+        // faces; only admin can register / mutate persons. Previously any
+        // authenticated user could spoof identities by inserting persons.
+        const Permission needed = (req.method == crow::HTTPMethod::Get)
+            ? Permission::FACE_READ : Permission::FACE_WRITE;
+        if (auto err = ApiUtils::requirePermission(ctx, needed, origin)) return std::move(*err);
 
         // --- GET: List all persons ---
         if (req.method == crow::HTTPMethod::Get) {
@@ -301,7 +304,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 int new_id = repo.insertPerson(person);
                 if (new_id > 0) {
                     LOG_INFO("Person created successfully: {} (ID: {})", person.name, new_id);
-                    
+
                     // Return full person object with ID
                     bool has_embedding = (person.embedding_json != "[]" && !person.embedding_json.empty());
                     json response = {
@@ -316,6 +319,12 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                         }}
                     };
                     return ApiUtils::createResponse(response, 201, origin);
+                }
+                // BUG-H6 FIX: image was saved BEFORE the DB insert. If insert
+                // fails we now own a file with no row pointing at it (orphan).
+                // Roll the file back so /storage/faces doesn't accumulate junk.
+                if (!person.face_image_path.empty()) {
+                    deleteImageFromDisk(person.face_image_path);
                 }
                 LOG_ERROR("Failed to insert person into DB");
                 return ApiUtils::createErrorResponse("Failed to create person", 500, origin);
@@ -340,8 +349,9 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(json::object(), 204, origin);
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value())
-            return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
+        const Permission needed = (req.method == crow::HTTPMethod::Get)
+            ? Permission::FACE_READ : Permission::FACE_WRITE;
+        if (auto err = ApiUtils::requirePermission(ctx, needed, origin)) return std::move(*err);
 
         database::PersonRepository repo;
 
@@ -390,13 +400,18 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                             return ApiUtils::createErrorResponse("Failed to decode image", 400, origin);
                         }
 
-                        // Delete old image
-                        deleteImageFromDisk(p.face_image_path);
-
-                        // Save new image
+                        // BUG-H6 FIX: save new image FIRST. Only after we know
+                        // we have a working replacement on disk do we delete
+                        // the previous one. The old order (delete-then-save)
+                        // left the person with no image at all if the new save
+                        // failed (out of disk, permission error, etc.).
+                        std::string previous_path = p.face_image_path;
                         std::string web_path = saveImageToDisk(decoded_image, p.name);
                         if (!web_path.empty()) {
                             p.face_image_path = web_path;
+                            if (!previous_path.empty() && previous_path != web_path) {
+                                deleteImageFromDisk(previous_path);
+                            }
                         }
 
                         // Re-extract embedding
@@ -465,8 +480,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(json::object(), 204, origin);
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value())
-            return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::FACE_READ, origin)) return std::move(*err);
 
         try {
             database::PersonRepository repo;
@@ -496,8 +510,8 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(json::object(), 204, origin);
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value())
-            return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
+        // Search is a read-only query against the embedding gallery.
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::FACE_READ, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);

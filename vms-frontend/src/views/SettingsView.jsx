@@ -76,6 +76,356 @@ const Toast = ({ message, type, onClose }) => {
   );
 };
 
+// ─── Rule Editor Modal ──────────────────────────────────────────────────────
+const RULE_EVENT_TYPES = [
+  { value: 'PERSON_DETECTED', label: 'Phát hiện người' },
+  { value: 'FACE_RECOGNIZED', label: 'Nhận diện khuôn mặt' },
+  { value: 'INTRUSION', label: 'Xâm nhập' },
+  { value: 'LINE_CROSSING', label: 'Vượt ranh giới' },
+  { value: 'LOITERING', label: 'Lảng vảng' },
+  { value: 'CROWD_DETECTED', label: 'Đám đông' },
+  { value: 'PPE_VIOLATION', label: 'Vi phạm PPE' },
+  { value: 'FIRE_DETECTED', label: 'Phát hiện lửa' },
+  { value: 'FIGHTING', label: 'Bạo lực' },
+  { value: 'FALL_DETECTED', label: 'Ngã' },
+];
+
+const RULE_ACTIONS = [
+  { value: 'ALERT', label: 'Gửi cảnh báo' },
+  { value: 'RECORD_CLIP', label: 'Ghi clip video' },
+  { value: 'SNAPSHOT', label: 'Chụp ảnh' },
+  { value: 'WEBHOOK', label: 'Gọi Webhook' },
+  { value: 'LOG', label: 'Ghi nhật ký' },
+];
+
+const defaultRuleForm = () => ({
+  name: 'Quy tắc mới',
+  description: '',
+  enabled: true,
+  logic: 'AND',
+  camera_ids: [],
+  conditions: [{ type: 'EVENT_TYPE', event_types: ['PERSON_DETECTED'] }],
+  actions: [{ type: 'ALERT', channels: ['UI'] }],
+  anti_noise: { cooldown_sec: 60, debounce_sec: 3, confidence_threshold: 0.5, max_alerts_per_hour: 60 },
+});
+
+const RuleEditorModal = ({ rule, cameras, onSave, onClose }) => {
+  const isNew = !rule.rule_id;
+  const [form, setForm] = useState(() => {
+    if (isNew) return defaultRuleForm();
+    return {
+      name: rule.name || '',
+      description: rule.description || '',
+      enabled: rule.enabled !== false,
+      logic: rule.logic || 'AND',
+      camera_ids: rule.camera_ids || [],
+      conditions: rule.conditions?.length
+        ? rule.conditions
+        : [{ type: 'EVENT_TYPE', event_types: ['PERSON_DETECTED'] }],
+      actions: rule.actions?.length
+        ? rule.actions
+        : [{ type: 'ALERT', channels: ['UI'] }],
+      anti_noise: rule.anti_noise || { cooldown_sec: 60, debounce_sec: 3, confidence_threshold: 0.5, max_alerts_per_hour: 60 },
+    };
+  });
+  const [saving, setSaving] = useState(false);
+
+  const toggleCamera = (camId) => {
+    setForm(f => ({
+      ...f,
+      camera_ids: f.camera_ids.includes(camId)
+        ? f.camera_ids.filter(id => id !== camId)
+        : [...f.camera_ids, camId],
+    }));
+  };
+
+  const toggleEventType = (et) => {
+    const cond = form.conditions[0] || { type: 'EVENT_TYPE', event_types: [] };
+    const cur = cond.event_types || [];
+    const updated = cur.includes(et) ? cur.filter(x => x !== et) : [...cur, et];
+    setForm(f => ({ ...f, conditions: [{ ...cond, type: 'EVENT_TYPE', event_types: updated }] }));
+  };
+
+  const toggleAction = (act) => {
+    const has = form.actions.some(a => a.type === act);
+    if (has) {
+      setForm(f => ({ ...f, actions: f.actions.filter(a => a.type !== act) }));
+    } else {
+      setForm(f => ({ ...f, actions: [...f.actions, { type: act, channels: act === 'ALERT' ? ['UI'] : [] }] }));
+    }
+  };
+
+  const webhookAction = form.actions.find(a => a.type === 'WEBHOOK');
+  const setWebhookUrl = (url) => {
+    setForm(f => ({
+      ...f,
+      actions: f.actions.map(a => a.type === 'WEBHOOK' ? { ...a, webhook_url: url } : a),
+    }));
+  };
+
+  const selectedEventTypes = form.conditions[0]?.event_types || [];
+
+  const handleSave = async () => {
+    if (!form.name.trim()) return;
+    setSaving(true);
+    await onSave({ ...rule, ...form });
+    setSaving(false);
+  };
+
+  const inputStyle = { width:'100%', background:'var(--bg)', border:'1px solid var(--border)', color:'var(--text)', padding:'6px 10px', borderRadius:'4px', fontFamily:"'Share Tech Mono',monospace", fontSize:'11px', outline:'none', boxSizing:'border-box' };
+  const labelStyle = { fontSize:'10px', color:'var(--text-dim)', letterSpacing:'1px', marginBottom:'4px', display:'block' };
+  const sectionStyle = { marginBottom:'16px' };
+  const chipActive = { padding:'4px 10px', borderRadius:'3px', fontSize:'10px', fontFamily:"'Share Tech Mono',monospace", cursor:'pointer', background:'rgba(0,200,245,0.15)', border:'1px solid var(--accent)', color:'var(--accent)', fontWeight:700 };
+  const chipInactive = { padding:'4px 10px', borderRadius:'3px', fontSize:'10px', fontFamily:"'Share Tech Mono',monospace", cursor:'pointer', background:'var(--bg)', border:'1px solid var(--border)', color:'var(--text-dim)' };
+
+  return (
+    <div style={{ position:'fixed', inset:0, zIndex:9000, background:'rgba(0,10,20,0.9)', backdropFilter:'blur(6px)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ width:'620px', maxHeight:'90vh', overflowY:'auto', background:'var(--bg-panel)', border:'1px solid var(--border)', borderRadius:'10px', boxShadow:'0 20px 60px rgba(0,0,0,0.8)' }}>
+
+        {/* Header */}
+        <div style={{ padding:'14px 18px', borderBottom:'1px solid var(--border)', display:'flex', justifyContent:'space-between', alignItems:'center', background:'var(--bg)', position:'sticky', top:0, zIndex:1 }}>
+          <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:'16px', color:'var(--accent)', letterSpacing:'1px' }}>
+            {isNew ? '+ TẠO QUY TẮC MỚI' : 'CHỈNH SỬA QUY TẮC'}
+          </div>
+          <div style={{ cursor:'pointer', opacity:0.6 }} onClick={onClose}>✕</div>
+        </div>
+
+        <div style={{ padding:'18px' }}>
+
+          {/* Name & Description */}
+          <div style={sectionStyle}>
+            <label style={labelStyle}>TÊN QUY TẮC *</label>
+            <input style={inputStyle} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Nhập tên quy tắc..." />
+          </div>
+          <div style={sectionStyle}>
+            <label style={labelStyle}>MÔ TẢ</label>
+            <input style={inputStyle} value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="Mô tả ngắn..." />
+          </div>
+
+          {/* Camera Selection */}
+          <div style={sectionStyle}>
+            <label style={labelStyle}>ÁP DỤNG CHO CAMERA (để trống = tất cả)</label>
+            <div style={{ display:'flex', flexWrap:'wrap', gap:'6px' }}>
+              {cameras.map(cam => {
+                const sel = form.camera_ids.includes(cam.id);
+                return (
+                  <div key={cam.id} onClick={() => toggleCamera(cam.id)} style={sel ? chipActive : chipInactive}>
+                    📹 {cam.name || `CAM-${cam.id}`}
+                  </div>
+                );
+              })}
+              {cameras.length === 0 && <div style={{ fontSize:'11px', color:'var(--text-dim)' }}>Không có camera nào.</div>}
+            </div>
+            {form.camera_ids.length === 0 && cameras.length > 0 && (
+              <div style={{ fontSize:'10px', color:'var(--warn)', marginTop:'4px' }}>Áp dụng cho TẤT CẢ camera.</div>
+            )}
+          </div>
+
+          {/* Event Types */}
+          <div style={sectionStyle}>
+            <label style={labelStyle}>LOẠI SỰ KIỆN KÍ HOẠT</label>
+            <div style={{ display:'flex', flexWrap:'wrap', gap:'6px' }}>
+              {RULE_EVENT_TYPES.map(et => {
+                const sel = selectedEventTypes.includes(et.value);
+                return (
+                  <div key={et.value} onClick={() => toggleEventType(et.value)} style={sel ? chipActive : chipInactive}>
+                    {et.label}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Logic */}
+          <div style={{ ...sectionStyle, display:'flex', gap:'12px', alignItems:'center' }}>
+            <label style={{ ...labelStyle, marginBottom:0 }}>LOGIC ĐIỀU KIỆN:</label>
+            {['AND', 'OR'].map(l => (
+              <div key={l} onClick={() => setForm(f => ({ ...f, logic: l }))} style={form.logic === l ? chipActive : chipInactive}>{l}</div>
+            ))}
+          </div>
+
+          {/* Actions */}
+          <div style={sectionStyle}>
+            <label style={labelStyle}>HÀNH ĐỘNG KHI KÍCH HOẠT</label>
+            <div style={{ display:'flex', flexWrap:'wrap', gap:'6px', marginBottom:'8px' }}>
+              {RULE_ACTIONS.map(act => {
+                const sel = form.actions.some(a => a.type === act.value);
+                return (
+                  <div key={act.value} onClick={() => toggleAction(act.value)} style={sel ? chipActive : chipInactive}>
+                    {act.label}
+                  </div>
+                );
+              })}
+            </div>
+            {webhookAction && (
+              <input style={{ ...inputStyle, marginTop:'6px' }} placeholder="Webhook URL: https://..." value={webhookAction.webhook_url || ''} onChange={e => setWebhookUrl(e.target.value)} />
+            )}
+          </div>
+
+          {/* Anti-Noise */}
+          <div style={{ ...sectionStyle, background:'var(--bg)', border:'1px solid var(--border)', borderRadius:'6px', padding:'12px' }}>
+            <label style={{ ...labelStyle, marginBottom:'10px' }}>CHỐNG NHIỄU (ANTI-NOISE)</label>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'10px' }}>
+              <div>
+                <label style={labelStyle}>Cooldown (giây)</label>
+                <input type="number" style={inputStyle} value={form.anti_noise.cooldown_sec} min={0} onChange={e => setForm(f => ({ ...f, anti_noise: { ...f.anti_noise, cooldown_sec: +e.target.value } }))} />
+              </div>
+              <div>
+                <label style={labelStyle}>Debounce (giây)</label>
+                <input type="number" style={inputStyle} value={form.anti_noise.debounce_sec} min={0} onChange={e => setForm(f => ({ ...f, anti_noise: { ...f.anti_noise, debounce_sec: +e.target.value } }))} />
+              </div>
+              <div>
+                <label style={labelStyle}>Ngưỡng tin cậy (0–1)</label>
+                <input type="number" style={inputStyle} value={form.anti_noise.confidence_threshold} step={0.05} min={0} max={1} onChange={e => setForm(f => ({ ...f, anti_noise: { ...f.anti_noise, confidence_threshold: +e.target.value } }))} />
+              </div>
+              <div>
+                <label style={labelStyle}>Tối đa cảnh báo/giờ</label>
+                <input type="number" style={inputStyle} value={form.anti_noise.max_alerts_per_hour} min={1} onChange={e => setForm(f => ({ ...f, anti_noise: { ...f.anti_noise, max_alerts_per_hour: +e.target.value } }))} />
+              </div>
+            </div>
+          </div>
+
+          {/* Enabled toggle */}
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'16px' }}>
+            <div style={{ fontSize:'12px', color:'var(--text-dim)' }}>Kích hoạt quy tắc ngay</div>
+            <div className={`toggle ${form.enabled ? 'on' : ''}`} onClick={() => setForm(f => ({ ...f, enabled: !f.enabled }))}></div>
+          </div>
+
+          {/* Footer buttons */}
+          <div style={{ display:'flex', gap:'8px', justifyContent:'flex-end' }}>
+            <div className="grid-btn" onClick={onClose} style={{ padding:'8px 18px' }}>Hủy</div>
+            <div className="grid-btn" onClick={handleSave} style={{ padding:'8px 24px', background:'rgba(0,200,245,0.1)', border:'1px solid var(--accent)', color:'var(--accent)', fontWeight:700, opacity: saving ? 0.6 : 1, pointerEvents: saving ? 'none' : 'auto' }}>
+              {saving ? 'Đang lưu...' : (isNew ? 'TẠO QUY TẮC' : 'LƯU THAY ĐỔI')}
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── Zone Camera Picker Modal ────────────────────────────────────────────────
+const ZoneCameraPicker = ({ cameras, onSelect, onClose }) => (
+  <div style={{ position:'fixed', inset:0, zIndex:9000, background:'rgba(0,10,20,0.85)', backdropFilter:'blur(4px)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+    <div style={{ width:'380px', background:'var(--bg-panel)', border:'1px solid var(--border)', borderRadius:'8px', padding:'20px' }}>
+      <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:'15px', color:'var(--accent)', letterSpacing:'1px', marginBottom:'14px' }}>
+        CHỌN CAMERA ĐỂ VẼ VÙNG ROI
+      </div>
+      <div style={{ display:'flex', flexDirection:'column', gap:'8px' }}>
+        {cameras.map(cam => (
+          <div key={cam.id} className="grid-btn" style={{ padding:'10px 14px', textAlign:'left', display:'flex', alignItems:'center', gap:'10px' }} onClick={() => { onSelect(cam.id); onClose(); }}>
+            <span style={{ color:'var(--accent)' }}>📹</span>
+            <span>{cam.name || `CAM-${cam.id}`}</span>
+            <span style={{ marginLeft:'auto', fontSize:'10px', color:'var(--text-dim)', fontFamily:"'Share Tech Mono',monospace" }}>ID:{cam.id}</span>
+          </div>
+        ))}
+        {cameras.length === 0 && <div style={{ color:'var(--text-dim)', fontSize:'12px', textAlign:'center', padding:'20px' }}>Không có camera nào.</div>}
+      </div>
+      <div className="grid-btn" onClick={onClose} style={{ marginTop:'12px', textAlign:'center', padding:'8px' }}>Hủy</div>
+    </div>
+  </div>
+);
+
+// ─── User Editor Modal ──────────────────────────────────────────────────────
+const UserEditorModal = ({ user, onClose, onSave }) => {
+  const isNew = !user.id;
+  const [form, setForm] = useState({
+    username: user.username || '',
+    password: '',
+    role_id: user.role_id || 2,
+    full_name: user.full_name || ''
+  });
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    if (!form.username.trim() || (isNew && !form.password.trim())) return;
+    setSaving(true);
+    await onSave({ ...user, ...form });
+    setSaving(false);
+  };
+
+  const inputStyle = { width:'100%', background:'var(--bg)', border:'1px solid var(--border)', color:'var(--text)', padding:'6px 10px', borderRadius:'4px', fontFamily:"'Share Tech Mono',monospace", fontSize:'11px', outline:'none', boxSizing:'border-box' };
+  const labelStyle = { fontSize:'10px', color:'var(--text-dim)', letterSpacing:'1px', marginBottom:'4px', display:'block' };
+
+  return (
+    <div style={{ position:'fixed', inset:0, zIndex:9000, background:'rgba(0,10,20,0.9)', backdropFilter:'blur(6px)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ width:'400px', background:'var(--bg-panel)', border:'1px solid var(--border)', borderRadius:'10px', padding:'20px' }}>
+        <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:'16px', color:'var(--accent)', marginBottom:'15px' }}>
+          {isNew ? 'THÊM NGƯỜI DÙNG' : 'SỬA NGƯỜI DÙNG'}
+        </div>
+        
+        <div style={{marginBottom:'12px'}}>
+          <label style={labelStyle}>Tên đăng nhập *</label>
+          <input disabled={!isNew} style={inputStyle} value={form.username} onChange={e => setForm({...form, username: e.target.value})} />
+        </div>
+        {isNew && (
+          <div style={{marginBottom:'12px'}}>
+            <label style={labelStyle}>Mật khẩu khởi tạo *</label>
+            <input type="password" style={inputStyle} value={form.password} onChange={e => setForm({...form, password: e.target.value})} />
+          </div>
+        )}
+        <div style={{marginBottom:'12px'}}>
+          <label style={labelStyle}>Họ và tên</label>
+          <input style={inputStyle} value={form.full_name} onChange={e => setForm({...form, full_name: e.target.value})} />
+        </div>
+        <div style={{marginBottom:'16px'}}>
+          <label style={labelStyle}>Phân quyền</label>
+          <select style={{...inputStyle, padding:'4px'}} value={form.role_id} onChange={e => setForm({...form, role_id: +e.target.value})}>
+            <option value={1}>Administrator</option>
+            <option value={2}>Operator</option>
+          </select>
+        </div>
+        <div style={{ display:'flex', gap:'8px', justifyContent:'flex-end' }}>
+          <div className="grid-btn" onClick={onClose} style={{ padding:'6px 12px' }}>Hủy</div>
+          <div className="grid-btn" onClick={handleSave} style={{ padding:'6px 16px', background:'rgba(0,200,245,0.1)', color:'var(--accent)', opacity: saving?0.6:1, pointerEvents: saving?'none':'auto' }}>Lưu</div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── Change Password Modal ──────────────────────────────────────────────────
+const ChangePasswordModal = ({ userId, onClose, onSave }) => {
+  const [form, setForm] = useState({ current_password: '', new_password: '', confirm_password: '' });
+  const [saving, setSaving] = useState(false);
+  
+  const handleSave = async () => {
+    if (!form.new_password || form.new_password !== form.confirm_password) return alert("Mật khẩu mới không khớp!");
+    setSaving(true);
+    await onSave(form.current_password, form.new_password);
+    setSaving(false);
+  };
+
+  const inputStyle = { width:'100%', background:'var(--bg)', border:'1px solid var(--border)', color:'var(--text)', padding:'6px 10px', borderRadius:'4px', fontFamily:"'Share Tech Mono',monospace", fontSize:'11px', outline:'none', boxSizing:'border-box' };
+  const labelStyle = { fontSize:'10px', color:'var(--text-dim)', letterSpacing:'1px', marginBottom:'4px', display:'block' };
+
+  return (
+    <div style={{ position:'fixed', inset:0, zIndex:9000, background:'rgba(0,10,20,0.9)', backdropFilter:'blur(6px)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ width:'350px', background:'var(--bg-panel)', border:'1px solid var(--border)', borderRadius:'10px', padding:'20px' }}>
+        <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:'16px', color:'var(--accent)', marginBottom:'15px' }}>ĐỔI MẬT KHẨU</div>
+        <div style={{marginBottom:'12px'}}>
+          <label style={labelStyle}>Mật khẩu hiện tại</label>
+          <input type="password" style={inputStyle} value={form.current_password} onChange={e => setForm({...form, current_password: e.target.value})} />
+          <div style={{fontSize: '9px', color: 'var(--text-dim)', marginTop: '2px'}}>Để trống nếu Admin thay đổi mật khẩu bên thứ ba</div>
+        </div>
+        <div style={{marginBottom:'12px'}}>
+          <label style={labelStyle}>Mật khẩu mới</label>
+          <input type="password" style={inputStyle} value={form.new_password} onChange={e => setForm({...form, new_password: e.target.value})} />
+        </div>
+        <div style={{marginBottom:'16px'}}>
+          <label style={labelStyle}>Xác nhận mật khẩu mới</label>
+          <input type="password" style={inputStyle} value={form.confirm_password} onChange={e => setForm({...form, confirm_password: e.target.value})} />
+        </div>
+        <div style={{ display:'flex', gap:'8px', justifyContent:'flex-end' }}>
+          <div className="grid-btn" onClick={onClose} style={{ padding:'6px 12px' }}>Hủy</div>
+          <div className="grid-btn" onClick={handleSave} style={{ padding:'6px 16px', background:'rgba(0,200,245,0.1)', color:'var(--accent)', opacity: saving?0.6:1, pointerEvents: saving?'none':'auto' }}>Lưu</div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const SettingsView = () => {
   const cameras = useVmsStore((state) => state.cameras);
   const setCameras = useVmsStore((state) => state.setCameras);
@@ -86,6 +436,8 @@ const SettingsView = () => {
   const [activeNav, setActiveNav] = useState('cfgCameras');
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [auditLogs, setAuditLogs] = useState([]);
+  const [auditSearch, setAuditSearch] = useState('');
+  const [auditCategoryFilter, setAuditCategoryFilter] = useState('all');
   const [users, setUsers] = useState([]);
   const [devices, setDevices] = useState([]);
   const [settings, setSettings] = useState(defaultSettings);
@@ -94,13 +446,22 @@ const SettingsView = () => {
   const [isDirty, setIsDirty] = useState(false);
   const [toast, setToast] = useState(null);
 
+  const [editingUser, setEditingUser] = useState(null);
+  const [editingPasswordStore, setEditingPasswordStore] = useState(null);
+
   // ─── Rules & Zones State ──────────────────────────────
   const [rules, setRules] = useState([]);
   const [zones, setZones] = useState([]);
   const [editingCameraForZone, setEditingCameraForZone] = useState(null);
+  // BUG: "SỬA VÙNG" used to drop the zone_id and unconditionally call
+  // addZone() in onSave, silently duplicating the zone on every edit.
+  // Track the full zone being edited so the save handler can branch.
+  const [editingZone, setEditingZone] = useState(null);
   const [show2FAModal, setShow2FAModal] = useState(false);
   const [patrolCameraId, setPatrolCameraId] = useState(null);
   const [loadingRules, setLoadingRules] = useState(false);
+  const [editingRule, setEditingRule] = useState(null); // null = modal closed
+  const [zoneCameraPickerOpen, setZoneCameraPickerOpen] = useState(false);
 
   // ─── Counter Zones State ─────────────────────
   const [counterZones, setCounterZones] = useState([
@@ -318,8 +679,8 @@ const SettingsView = () => {
                         <span>{cam.name}</span>
                         {cam.status === 'online' && (
                           <div style={{display:'flex', gap:'8px', fontSize:'10px', opacity:0.6, color:'var(--primary)', fontWeight:600}}>
-                            <span>{cam.bitrate_kbps ? `${(cam.bitrate_kbps/1024).toFixed(1)} Mbps` : '1.2 Mbps'}</span>
-                            <span>CPU: {cam.cpu_usage_percent || 15}%</span>
+                            <span>{cam.bitrate_kbps ? `${(cam.bitrate_kbps/1024).toFixed(1)} Mbps` : '—'}</span>
+                            <span>CPU: {cam.cpu_usage_percent != null ? `${cam.cpu_usage_percent}%` : '—'}</span>
                           </div>
                         )}
                       </div>
@@ -562,56 +923,71 @@ const SettingsView = () => {
             <div>
               <div className="config-section-title">Quản lý Quy tắc AI (Rule Engine)</div>
               <div style={{display:'flex', gap:'8px', marginBottom:'12px'}}>
-                <div className="config-btn" onClick={() => {
-                   const newRule = { name: 'Quy tắc mới', event_type: 'intrusion', enabled: true, severity: 'high', actions: [] };
-                   apiClient.addRule(newRule).then(res => {
-                     if (res.success) {
-                        refreshRules();
-                        showToast('Đã tạo quy tắc mới', 'success');
-                     } else {
-                        showToast(res.error || 'Không thể tạo quy tắc', 'error');
-                     }
-                   });
-                }}>+ Tạo Quy tắc mới</div>
+                <div className="config-btn" onClick={() => setEditingRule({})}>+ Tạo Quy tắc mới</div>
               </div>
 
               {loadingRules ? (
                 <div className="ai-dot-spin" style={{margin:'40px auto'}}></div>
               ) : (
                 <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(320px, 1fr))', gap:'12px'}}>
-                  {rules.map(rule => (
-                    <div key={rule.rule_id} className="glass" style={{padding:'16px', borderRadius:'10px', border:'1px solid var(--border)'}}>
-                       <div style={{display:'flex', justifyContent:'space-between', alignItems:'baseline', marginBottom:'10px'}}>
+                  {rules.map(rule => {
+                    const cameraNames = (rule.camera_ids || []).map(id => {
+                      const cam = cameras.find(c => c.id === id);
+                      return cam ? (cam.name || `CAM-${cam.id}`) : `ID:${id}`;
+                    });
+                    const eventTypes = rule.conditions?.flatMap(c => c.event_types || []) || [];
+                    return (
+                      <div key={rule.rule_id} className="glass" style={{padding:'16px', borderRadius:'10px', border:'1px solid var(--border)'}}>
+                        <div style={{display:'flex', justifyContent:'space-between', alignItems:'baseline', marginBottom:'8px'}}>
                           <div style={{fontFamily:'Rajdhani', fontWeight:700, fontSize:'15px', color:'var(--accent)'}}>{rule.name}</div>
                           <div className={`toggle ${rule.enabled ? 'on' : ''}`} onClick={() => {
-                             apiClient.updateRule(rule.rule_id, { ...rule, enabled: !rule.enabled }).then((res) => {
-                                if (res.success) refreshRules();
-                             });
+                            apiClient.updateRule(rule.rule_id, { ...rule, enabled: !rule.enabled }).then(res => {
+                              if (res.success) refreshRules();
+                            });
                           }}></div>
-                       </div>
-                       
-                       <div className="config-desc" style={{marginBottom:'10px'}}>
-                          Loại: <span style={{color:'var(--accent3)'}}>{rule.event_type}</span> · 
-                          Nghiêm trọng: <span className={`alarm-sev ${rule.severity === 'high' ? 'critical' : 'medium'}`}>{rule.severity}</span>
-                       </div>
+                        </div>
 
-                       <div style={{display:'flex', gap:'5px', marginTop:'15px'}}>
-                          <button className="grid-btn" style={{flex:1}} onClick={() => setEditingCameraForZone(cameras[0]?.id || 1)}>
-                             ⚙ CẤU HÌNH VÙNG
+                        {rule.description && (
+                          <div style={{fontSize:'11px', color:'var(--text-secondary)', marginBottom:'6px'}}>{rule.description}</div>
+                        )}
+
+                        <div style={{fontSize:'10px', color:'var(--text-dim)', marginBottom:'4px', fontFamily:"'Share Tech Mono',monospace"}}>
+                          📹 {cameraNames.length > 0 ? cameraNames.join(', ') : 'Tất cả camera'}
+                        </div>
+
+                        {eventTypes.length > 0 && (
+                          <div style={{display:'flex', flexWrap:'wrap', gap:'4px', marginBottom:'8px'}}>
+                            {eventTypes.map(et => (
+                              <span key={et} style={{fontSize:'9px', padding:'2px 6px', borderRadius:'3px', background:'rgba(0,200,245,0.1)', border:'1px solid rgba(0,200,245,0.3)', color:'var(--accent)', fontFamily:"'Share Tech Mono',monospace"}}>
+                                {et}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        <div style={{fontSize:'10px', color:'var(--text-dim)', marginBottom:'10px'}}>
+                          Cooldown: {rule.anti_noise?.cooldown_sec ?? 60}s · Conf: {((rule.anti_noise?.confidence_threshold ?? 0.5) * 100).toFixed(0)}%
+                        </div>
+
+                        <div style={{display:'flex', gap:'5px'}}>
+                          <button className="grid-btn" style={{flex:1}} onClick={() => setEditingRule(rule)}>
+                            ✏ CHỈNH SỬA
                           </button>
-                          <button className="grid-btn" style={{flex:1, color:'var(--danger)', border:'1px solid var(--danger)'}} onClick={() => {
-                             if(window.confirm('Xóa quy tắc này?')) {
-                                apiClient.deleteRule(rule.rule_id).then((res) => {
-                                  if (res.success) refreshRules();
-                                });
-                             }
-                          }}>
-                             XÓA
+                          <button className="grid-btn" style={{flex:1}} onClick={() => setZoneCameraPickerOpen(true)}>
+                            ⚙ VÙNG ROI
                           </button>
-                       </div>
-                    </div>
-                  ))}
-                  {rules.length === 0 && <div style={{gridColumn:'1/-1', textAlign:'center', color:'var(--text-dim)', padding:'40px'}}>Chưa có quy tắc nào.</div>}
+                          <button className="grid-btn" style={{padding:'5px 8px', color:'var(--danger)', border:'1px solid rgba(255,48,96,0.3)'}} onClick={() => {
+                            if (window.confirm('Xóa quy tắc này?')) {
+                              apiClient.deleteRule(rule.rule_id).then(res => {
+                                if (res.success) refreshRules();
+                              });
+                            }
+                          }}>✕</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {rules.length === 0 && <div style={{gridColumn:'1/-1', textAlign:'center', color:'var(--text-dim)', padding:'40px'}}>Chưa có quy tắc nào. Bấm "+ Tạo Quy tắc mới".</div>}
                 </div>
               )}
             </div>
@@ -645,7 +1021,12 @@ const SettingsView = () => {
           {/* USERS */}
           {activeNav === 'cfgUsers' && (
             <div>
-              <div className="config-section-title">Quản lý Tài khoản (Nhân sự)</div>
+              <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'16px'}}>
+                <div className="config-section-title" style={{marginBottom:0}}>Quản lý Tài khoản (Nhân sự)</div>
+                <div className="config-btn" onClick={() => setEditingUser({})} style={{background:'var(--accent)', color:'#000', fontWeight:'bold'}}>
+                  + Thêm Tài khoản
+                </div>
+              </div>
               {users.length > 0 ? (
                 <table className="lpr-table">
                   <thead>
@@ -676,10 +1057,18 @@ const SettingsView = () => {
                            </span>
                         </td>
                         <td style={{textAlign:'center', display:'flex', gap:'5px', justifyContent:'center'}}>
+                           <div className="config-btn" style={{padding:'4px 8px', fontSize:'10px'}} onClick={() => setEditingUser(u)}>Sửa</div>
+                           <div className="config-btn" style={{padding:'4px 8px', fontSize:'10px'}} onClick={() => setEditingPasswordStore(u.id)}>Đổi pass</div>
                            {!u.two_factor_enabled && (
                               <div className="config-btn" style={{padding:'4px 8px', fontSize:'10px', background:'var(--accent)', color:'#000'}} onClick={() => setShow2FAModal(true)}>Bật 2FA</div>
                            )}
-                           <div className="config-btn danger" style={{padding:'4px 8px'}} onClick={() => window.alert('Tính năng quản trị bị khóa do phân quyền API')}>Xóa</div>
+                           <div className="config-btn danger" style={{padding:'4px 8px'}} onClick={async () => {
+                             if (window.confirm(`Xóa tài khoản ${u.username}?`)) {
+                               const res = await apiClient.deleteUser(u.id);
+                               if (res.success) { showToast('Đã xóa người dùng', 'success'); refreshUsers(); }
+                               else { showToast(res.error || 'Lỗi xóa người dùng', 'error'); }
+                             }
+                           }}>Xóa</div>
                         </td>
                       </tr>
                     ))}
@@ -728,15 +1117,15 @@ const SettingsView = () => {
                   <div><div className="config-label">Bật Cổng REST API</div><div className="config-desc">Máy nội bộ: http://{settings.net_ip}:{settings.net_web_port}/api</div></div>
                   <div className={`toggle ${settings.api_enabled ? 'on' : ''}`} onClick={() => handleToggle('api_enabled')}></div>
                 </div>
-                <div className="config-row">
-                  <div><div className="config-label">Access Token / Sinh mã Key</div></div>
-                  <div style={{display:'flex', gap:'5px'}}>
-                    <input className="config-input" value="vms_sk_live_2026_xYz...Hk" disabled type="password" style={{width:'150px'}} />
-                    <div className="config-btn" onClick={() => { navigator.clipboard.writeText('vms_sk_live_2026_xYzHk'); showToast('Đã copy API Key!', 'success'); }}>Copy</div>
+                <div className="config-row" style={{flexDirection:'column', alignItems:'flex-start', gap:'6px'}}>
+                  <div><div className="config-label">Access Token / Sinh mã Key</div>
+                    <div className="config-desc" style={{color:'var(--warning, #ffb800)'}}>
+                      Quản lý API key chưa khả dụng. Hiện hệ thống dùng JWT đăng nhập để xác thực mọi request — chưa hỗ trợ phát hành/rotate API key cố định.
+                    </div>
                   </div>
                 </div>
                 <div className="config-row">
-                  <div><div className="config-label">API Rate Limit (Chống DDoD)</div></div>
+                  <div><div className="config-label">API Rate Limit (Chống DDoS)</div></div>
                   <select className="config-select" value={settings.api_rate_limit} onChange={e => handleChange('api_rate_limit', e.target.value)}>
                     <option value="100 req/phút">100 req/phút</option>
                     <option value="500 req/phút">500 req/phút</option>
@@ -818,18 +1207,66 @@ const SettingsView = () => {
           })()}
 
           {/* AUDIT */}
-          {activeNav === 'cfgAudit' && (
+          {activeNav === 'cfgAudit' && (() => {
+            const filteredLogs = auditLogs.filter((log) => {
+              if (auditCategoryFilter !== 'all') {
+                const action = (log.action || '').toLowerCase();
+                if (auditCategoryFilter === 'auth' && !action.includes('login') && !action.includes('logout') && !action.includes('auth')) return false;
+                if (auditCategoryFilter === 'config' && !action.includes('settings') && !action.includes('config') && !action.includes('update') && !action.includes('create') && !action.includes('delete')) return false;
+                if (auditCategoryFilter === 'alert' && !action.includes('alert') && !action.includes('event')) return false;
+              }
+              if (!auditSearch.trim()) return true;
+              const q = auditSearch.toLowerCase();
+              return [log.username, log.action, log.details].some((f) => f && String(f).toLowerCase().includes(q));
+            });
+
+            const exportAuditCsv = () => {
+              const headers = ['Thời gian', 'User', 'Hành động', 'Chi tiết'];
+              const rows = filteredLogs.map((log) => [
+                log.created_at ? new Date(log.created_at * 1000).toLocaleString('vi-VN') : '',
+                log.username || `User ${log.user_id}`,
+                log.action || '',
+                log.details || '',
+              ]);
+              const csv = '﻿' + [headers, ...rows]
+                .map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(','))
+                .join('\n');
+              const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `audit_logs_${Date.now()}.csv`;
+              a.click();
+              URL.revokeObjectURL(url);
+            };
+
+            return (
             <div>
               <div className="config-section-title">Nhật Ký Hệ thống (Audit Logs)</div>
               <div style={{display:'flex', gap:'6px', marginBottom:'8px'}}>
-                <input className="config-input" placeholder="Tìm kiếm log..." style={{flex:1}} />
-                <select className="config-select"><option>Tất cả</option><option>Đăng nhập</option><option>Cấu hình</option><option>Cảnh báo</option></select>
-                <div className="config-btn">Xuất CSV</div>
+                <input
+                  className="config-input"
+                  placeholder="Tìm kiếm log (user, action, chi tiết)..."
+                  style={{flex:1}}
+                  value={auditSearch}
+                  onChange={(e) => setAuditSearch(e.target.value)}
+                />
+                <select
+                  className="config-select"
+                  value={auditCategoryFilter}
+                  onChange={(e) => setAuditCategoryFilter(e.target.value)}
+                >
+                  <option value="all">Tất cả</option>
+                  <option value="auth">Đăng nhập</option>
+                  <option value="config">Cấu hình</option>
+                  <option value="alert">Cảnh báo</option>
+                </select>
+                <div className="config-btn" onClick={exportAuditCsv}>Xuất CSV</div>
               </div>
               <table className="lpr-table">
                 <thead><tr><th style={{textAlign:'left', paddingLeft:10}}>Thời gian</th><th style={{textAlign:'left'}}>User</th><th style={{textAlign:'left'}}>Hành động</th><th style={{textAlign:'left'}}>Lệnh thực thi & Chi tiết</th></tr></thead>
                 <tbody>
-                  {auditLogs.length > 0 ? auditLogs.map((log, idx) => (
+                  {filteredLogs.length > 0 ? filteredLogs.map((log, idx) => (
                     <tr key={log.id || idx}>
                       <td style={{fontFamily:"'Share Tech Mono',monospace", fontSize:'11px', padding:'10px', color:'var(--text-secondary)'}}>{log.created_at ? new Date(log.created_at * 1000).toLocaleString('vi-VN') : '-'}</td>
                       <td style={{fontWeight:'bold', color:'var(--accent)'}}>{log.username || `User ${log.user_id}`}</td>
@@ -837,12 +1274,13 @@ const SettingsView = () => {
                       <td style={{fontSize:'12px', maxWidth:'280px', textOverflow:'ellipsis', overflow:'hidden'}} title={log.details}>{log.details || '-'}</td>
                     </tr>
                   )) : (
-                    <tr><td colSpan="4" style={{textAlign:'center', padding:'20px', color:'var(--text-dim)'}}>Đang tải lịch sử các hành động quản trị viên...</td></tr>
+                    <tr><td colSpan="4" style={{textAlign:'center', padding:'20px', color:'var(--text-dim)'}}>{auditLogs.length === 0 ? 'Đang tải lịch sử các hành động quản trị viên...' : 'Không có log nào khớp bộ lọc.'}</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
-          )}
+            );
+          })()}
 
 
           {/* ═══════════ COUNTER ═══════════ */}
@@ -851,7 +1289,8 @@ const SettingsView = () => {
               <div className="config-section-title">Cấu Hình Đếm Người / Xe (Line Crossing)</div>
               <div style={{display:'flex', gap:'8px', marginBottom:'12px'}}>
                 <div className="config-btn" onClick={() => {
-                  setCounterZones(prev => [...prev, { id: Date.now(), name: `Zone ${prev.length+1}`, camera: cameras[0]?.name || 'CAM-01', type: 'bidirectional', in: 0, out: 0, enabled: true }]);
+                  const cam = cameras[0];
+                  setCounterZones(prev => [...prev, { id: Date.now(), name: `Zone ${prev.length+1}`, camera_id: cam?.id || null, camera: cam?.name || 'CAM-01', type: 'bidirectional', in: 0, out: 0, enabled: true }]);
                   showToast('Đã thêm vùng đếm mới', 'success');
                 }}>+ Thêm Vùng Đếm</div>
               </div>
@@ -866,8 +1305,21 @@ const SettingsView = () => {
                         setIsDirty(true);
                       }}></div>
                     </div>
-                    <div style={{fontSize:'10px', color:'var(--text-secondary)', marginBottom:'8px'}}>
-                      📹 {zone.camera} · <span style={{color:'var(--accent)'}}>{zone.type === 'vehicle' ? '🚗 Xe' : '🚶 Người'}</span>
+                    <div style={{fontSize:'10px', color:'var(--text-secondary)', marginBottom:'6px', display:'flex', alignItems:'center', gap:'6px'}}>
+                      <span>📹</span>
+                      <select
+                        value={zone.camera_id || ''}
+                        onChange={e => {
+                          const cam = cameras.find(c => c.id === +e.target.value);
+                          setCounterZones(prev => prev.map(z => z.id === zone.id ? { ...z, camera_id: +e.target.value, camera: cam?.name || `CAM-${e.target.value}` } : z));
+                          setIsDirty(true);
+                        }}
+                        style={{background:'var(--bg)', border:'1px solid var(--border)', color:'var(--text)', padding:'2px 6px', borderRadius:'3px', fontFamily:"'Share Tech Mono',monospace", fontSize:'10px', outline:'none'}}
+                      >
+                        <option value="">Chọn camera...</option>
+                        {cameras.map(c => <option key={c.id} value={c.id}>{c.name || `CAM-${c.id}`}</option>)}
+                      </select>
+                      <span style={{color:'var(--accent)'}}>{zone.type === 'vehicle' ? '🚗 Xe' : '🚶 Người'}</span>
                     </div>
                     <div style={{display:'flex', gap:'8px'}}>
                       <div style={{flex:1, background:'rgba(50,232,39,0.08)', border:'1px solid rgba(50,232,39,0.2)', borderRadius:'4px', padding:'8px', textAlign:'center'}}>
@@ -897,8 +1349,8 @@ const SettingsView = () => {
             <div>
               <div className="config-section-title">Vùng Giám Sát ROI (Region of Interest)</div>
               <div style={{display:'flex', gap:'8px', marginBottom:'12px'}}>
-                <div className="config-btn" onClick={() => setEditingCameraForZone(cameras[0]?.id || 1)}>
-                   + Vẽ Vùng ROI Mới
+                <div className="config-btn" onClick={() => setZoneCameraPickerOpen(true)}>
+                  + Vẽ Vùng ROI Mới
                 </div>
               </div>
 
@@ -913,7 +1365,10 @@ const SettingsView = () => {
                        📹 Camera ID: {zone.camera_id} · Điểm: {zone.points?.length || 0}
                     </div>
                     <div style={{display:'flex', gap:'5px'}}>
-                        <button className="grid-btn" style={{flex:1}} onClick={() => setEditingCameraForZone(zone.camera_id)}>SỬA VÙNG</button>
+                        <button className="grid-btn" style={{flex:1}} onClick={() => {
+                            setEditingZone(zone);
+                            setEditingCameraForZone(zone.camera_id);
+                        }}>SỬA VÙNG</button>
                         <button className="grid-btn danger" style={{padding:'5px', color:'var(--danger)'}} onClick={() => {
                            apiClient.deleteZone(zone.zone_id).then((res) => {
                              if (res.success) refreshZones();
@@ -965,7 +1420,7 @@ const SettingsView = () => {
               </div>
               <div style={{marginTop:'15px', padding:'12px', background:'var(--bg-card)', border:'1px solid var(--border)', borderRadius:'4px', display:'flex', alignItems:'center', gap:'10px'}}>
                 <svg viewBox="0 0 14 14" fill="none" stroke="var(--text-dim)" strokeWidth="1.5" style={{width:'16px', height:'16px', flexShrink:0}}><circle cx="7" cy="7" r="5.5"/><path d="M7 4.5v3M7 9.5h.01"/></svg>
-                <span style={{fontSize:'11px', color:'var(--text-secondary)'}}>Để tạo Role mới hoặc chỉnh sửa quyền, sử dụng API: <code style={{color:'var(--accent)', fontSize:'10px'}}>POST /api/roles</code></span>
+                <span style={{fontSize:'11px', color:'var(--text-secondary)'}}>Quyền hạn được quản lý qua API: <code style={{color:'var(--accent)', fontSize:'10px'}}>PUT /api/permissions/&#123;userId&#125;</code></span>
               </div>
             </div>
           )}
@@ -1059,15 +1514,31 @@ const SettingsView = () => {
 
       {/* AI Zone Editor Modal */}
       {editingCameraForZone && (
-        <AiRuleEditor 
-          cameraId={editingCameraForZone} 
-          onClose={() => setEditingCameraForZone(null)} 
+        <AiRuleEditor
+          cameraId={editingCameraForZone}
+          initialZone={editingZone}
+          onClose={() => { setEditingCameraForZone(null); setEditingZone(null); }}
           onSave={(zoneData) => {
-             apiClient.addZone({ ...zoneData, name: `Vùng ${zones.length + 1}` }).then(res => {
+             const closeAndRefresh = () => {
+                refreshZones();
+                setEditingCameraForZone(null);
+                setEditingZone(null);
+             };
+             const isEdit = Boolean(zoneData.zone_id);
+             const op = isEdit
+                ? apiClient.updateZone(zoneData.zone_id, {
+                    type: zoneData.type,
+                    points: zoneData.points,
+                    polygon: zoneData.points,
+                    camera_id: zoneData.camera_id,
+                    camera_ids: [zoneData.camera_id],
+                    name: editingZone?.name || `Vùng ${zoneData.zone_id}`,
+                  })
+                : apiClient.addZone({ ...zoneData, name: `Vùng ${zones.length + 1}` });
+             op.then(res => {
                 if (res.success) {
-                   refreshZones();
-                   setEditingCameraForZone(null);
-                   showToast('Đã lưu vùng giám sát AI thành công!', 'success');
+                   closeAndRefresh();
+                   showToast(isEdit ? 'Đã cập nhật vùng giám sát!' : 'Đã lưu vùng giám sát AI thành công!', 'success');
                 } else {
                    showToast('Lỗi lưu vùng: ' + (res.error || 'Unknown'), 'error');
                 }
@@ -1093,9 +1564,77 @@ const SettingsView = () => {
 
       {/* PTZ Patrol Modal */}
       {patrolCameraId && (
-        <PtzPatrolModal 
-          cameraId={patrolCameraId} 
-          onClose={() => setPatrolCameraId(null)} 
+        <PtzPatrolModal
+          cameraId={patrolCameraId}
+          onClose={() => setPatrolCameraId(null)}
+        />
+      )}
+
+      {/* Rule Editor Modal */}
+      {editingRule !== null && (
+        <RuleEditorModal
+          rule={editingRule}
+          cameras={cameras}
+          onClose={() => setEditingRule(null)}
+          onSave={async (ruleData) => {
+            let res;
+            if (ruleData.rule_id) {
+              res = await apiClient.updateRule(ruleData.rule_id, ruleData);
+            } else {
+              res = await apiClient.addRule(ruleData);
+            }
+            if (res.success) {
+              setEditingRule(null);
+              refreshRules();
+              showToast(ruleData.rule_id ? 'Đã cập nhật quy tắc' : 'Đã tạo quy tắc mới', 'success');
+            } else {
+              showToast(res.error || 'Không thể lưu quy tắc', 'error');
+            }
+          }}
+        />
+      )}
+
+      {/* Zone Camera Picker */}
+      {zoneCameraPickerOpen && (
+        <ZoneCameraPicker
+          cameras={cameras}
+          onSelect={(camId) => setEditingCameraForZone(camId)}
+          onClose={() => setZoneCameraPickerOpen(false)}
+        />
+      )}
+
+      {/* User Modals */}
+      {editingUser !== null && (
+        <UserEditorModal 
+          user={editingUser} 
+          onClose={() => setEditingUser(null)} 
+          onSave={async (data) => {
+            const res = editingUser.id 
+              ? await apiClient.updateUser(editingUser.id, data) 
+              : await apiClient.addUser(data);
+            if (res.success) {
+              showToast(editingUser.id ? 'Đã sửa thông tin' : 'Đã thêm người dùng', 'success');
+              setEditingUser(null);
+              refreshUsers();
+            } else {
+              showToast(res.error || 'Lỗi thao tác người dùng', 'error');
+            }
+          }}
+        />
+      )}
+      {editingPasswordStore !== null && (
+        <ChangePasswordModal 
+          userId={editingPasswordStore} 
+          onClose={() => setEditingPasswordStore(null)} 
+          onSave={async (curPwd, newPwd) => {
+            const res = await apiClient.changePassword(editingPasswordStore, curPwd, newPwd);
+            if (res.success) {
+              showToast('Đã đổi mật khẩu thành công', 'success');
+              setEditingPasswordStore(null);
+            } else {
+              showToast(res.error || 'Lỗi đổi mật khẩu', 'error');
+            }
+          }}
         />
       )}
     </div>

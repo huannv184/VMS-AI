@@ -6,11 +6,44 @@ const LoginView = ({ onLoginSuccess }) => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [step, setStep] = useState(1); // 1: Login, 2: 2FA
+  // 1: Login, 2: 2FA, 3: Mandatory password change (SEC-001)
+  const [step, setStep] = useState(1);
   const [twoFactorCode, setTwoFactorCode] = useState('');
   const [tempToken, setTempToken] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // SEC-001: backend may respond with requires_password_change=true and a
+  // password_change_pending temp_token in lieu of an access token. The UI
+  // must route the user to step 3 — the previous version ignored the flag
+  // and treated `data.token == null` as a generic "wrong credentials" error,
+  // which left default-password admins stranded with no recovery.
+  const routePostAuthResult = (result) => {
+    if (!result?.success) {
+      setError(result?.error || 'Tài khoản hoặc mật khẩu không chính xác.');
+      return false;
+    }
+    if (result.data?.requires_2fa) {
+      setTempToken(result.data.temp_token || '');
+      setStep(2);
+      return true;
+    }
+    if (result.data?.password_change_required) {
+      setTempToken(result.data.temp_token || '');
+      setNewPassword('');
+      setConfirmPassword('');
+      setStep(3);
+      return true;
+    }
+    if (result.data?.token) {
+      onLoginSuccess();
+      return true;
+    }
+    setError('Tài khoản hoặc mật khẩu không chính xác.');
+    return false;
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -19,18 +52,7 @@ const LoginView = ({ onLoginSuccess }) => {
 
     try {
       const result = await apiClient.login(username, password);
-      if (result.success) {
-        if (result.data?.requires_2fa) {
-          setTempToken(result.data.temp_token || '');
-          setStep(2);
-        } else if (result.data?.token) {
-          onLoginSuccess();
-        } else {
-          setError('Tài khoản hoặc mật khẩu không chính xác.');
-        }
-      } else {
-        setError(result.error || 'Tài khoản hoặc mật khẩu không chính xác.');
-      }
+      routePostAuthResult(result);
     } catch {
       setError('Không thể kết nối tới máy chủ Backend.');
     } finally {
@@ -41,18 +63,47 @@ const LoginView = ({ onLoginSuccess }) => {
   const handle2FASubmit = async (e) => {
     e.preventDefault();
     if (twoFactorCode.length !== 6) return;
-    
+
     setLoading(true);
     setError('');
     try {
       const result = await apiClient.verify2FA(tempToken, twoFactorCode);
+      // 2FA verify can also flip into the password-change gate when the
+      // admin used 2FA but is still on the factory-default password.
+      routePostAuthResult(result);
+    } catch {
+      setError('Lỗi xác thực 2FA.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handlePasswordChangeSubmit = async (e) => {
+    e.preventDefault();
+    if (newPassword.length < 8) {
+      setError('Mật khẩu mới phải có ít nhất 8 ký tự.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError('Mật khẩu xác nhận không khớp.');
+      return;
+    }
+    if (newPassword === password) {
+      setError('Mật khẩu mới không được trùng mật khẩu cũ.');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+    try {
+      const result = await apiClient.changePasswordOnLogin(tempToken, newPassword);
       if (result.success && result.data?.token) {
         onLoginSuccess();
       } else {
-        setError(result.error || 'Mã xác thực không đúng hoặc đã hết hạn.');
+        setError(result.error || 'Không đổi được mật khẩu. Vui lòng đăng nhập lại.');
       }
     } catch {
-      setError('Lỗi xác thực 2FA.');
+      setError('Lỗi đổi mật khẩu.');
     } finally {
       setLoading(false);
     }
@@ -71,13 +122,13 @@ const LoginView = ({ onLoginSuccess }) => {
            <p>SYSTEM ACCESS REQUIRED</p>
         </div>
 
-        {step === 1 ? (
+        {step === 1 && (
           <form onSubmit={handleSubmit} className="login-form">
             <div className="login-input-group">
               <User size={16} className="input-icon" />
-              <input 
-                type="text" 
-                placeholder="USERNAME" 
+              <input
+                type="text"
+                placeholder="USERNAME"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 required
@@ -86,9 +137,9 @@ const LoginView = ({ onLoginSuccess }) => {
 
             <div className="login-input-group">
               <Lock size={16} className="input-icon" />
-              <input 
-                type={showPassword ? "text" : "password"} 
-                placeholder="PASSWORD" 
+              <input
+                type={showPassword ? "text" : "password"}
+                placeholder="PASSWORD"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
@@ -100,8 +151,8 @@ const LoginView = ({ onLoginSuccess }) => {
 
             {error && <div className="login-error">{error}</div>}
 
-            <button 
-              type="submit" 
+            <button
+              type="submit"
               className={`login-btn ${loading ? 'loading' : ''}`}
               disabled={loading}
             >
@@ -114,19 +165,21 @@ const LoginView = ({ onLoginSuccess }) => {
               )}
             </button>
           </form>
-        ) : (
+        )}
+
+        {step === 2 && (
           <form onSubmit={handle2FASubmit} className="login-form">
             <div style={{ textAlign: 'center', marginBottom: '10px' }}>
                <Shield size={24} color="var(--accent3)" />
                <div style={{ fontSize: '12px', fontWeight: 700, color: 'var(--accent3)', marginTop: '5px' }}>TWO-FACTOR AUTHENTICATION</div>
                <div style={{ fontSize: '10px', color: 'rgba(255,255,255,0.4)', marginTop: '3px' }}>Enter the 6-digit code from your app</div>
             </div>
-            
+
             <div className="login-input-group">
               <Lock size={16} className="input-icon" />
-              <input 
-                type="text" 
-                placeholder="000000" 
+              <input
+                type="text"
+                placeholder="000000"
                 value={twoFactorCode}
                 onChange={(e) => setTwoFactorCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
                 required
@@ -137,8 +190,8 @@ const LoginView = ({ onLoginSuccess }) => {
 
             {error && <div className="login-error">{error}</div>}
 
-            <button 
-              type="submit" 
+            <button
+              type="submit"
               className={`login-btn ${loading ? 'loading' : ''}`}
               disabled={loading || twoFactorCode.length !== 6}
               style={{ background: 'var(--accent3)' }}
@@ -146,11 +199,71 @@ const LoginView = ({ onLoginSuccess }) => {
               {loading ? <div className="spinner-small"></div> : 'VERIFY & LOGIN'}
             </button>
             <div style={{ textAlign: 'center', marginTop: '10px' }}>
-              <span 
+              <span
                 style={{ fontSize: '11px', color: 'rgba(255,255,255,0.4)', cursor: 'pointer', textDecoration: 'underline' }}
                 onClick={() => setStep(1)}
               >
                 Back to Login
+              </span>
+            </div>
+          </form>
+        )}
+
+        {step === 3 && (
+          <form onSubmit={handlePasswordChangeSubmit} className="login-form">
+            <div style={{ textAlign: 'center', marginBottom: '10px' }}>
+               <Shield size={24} color="var(--danger)" />
+               <div style={{ fontSize: '12px', fontWeight: 700, color: 'var(--danger)', marginTop: '5px' }}>PASSWORD CHANGE REQUIRED</div>
+               <div style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', marginTop: '3px' }}>
+                 Default credentials detected. Set a new password to continue.
+               </div>
+            </div>
+
+            <div className="login-input-group">
+              <Lock size={16} className="input-icon" />
+              <input
+                type={showPassword ? 'text' : 'password'}
+                placeholder="NEW PASSWORD (min 8 chars)"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                required
+                minLength={8}
+                maxLength={256}
+                autoFocus
+              />
+              <div className="pwd-toggle" onClick={() => setShowPassword(!showPassword)}>
+                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+              </div>
+            </div>
+
+            <div className="login-input-group">
+              <Lock size={16} className="input-icon" />
+              <input
+                type={showPassword ? 'text' : 'password'}
+                placeholder="CONFIRM NEW PASSWORD"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                required
+                minLength={8}
+                maxLength={256}
+              />
+            </div>
+
+            {error && <div className="login-error">{error}</div>}
+
+            <button
+              type="submit"
+              className={`login-btn ${loading ? 'loading' : ''}`}
+              disabled={loading || newPassword.length < 8 || confirmPassword.length < 8}
+            >
+              {loading ? <div className="spinner-small"></div> : 'SET NEW PASSWORD & ACCESS'}
+            </button>
+            <div style={{ textAlign: 'center', marginTop: '10px' }}>
+              <span
+                style={{ fontSize: '11px', color: 'rgba(255,255,255,0.4)', cursor: 'pointer', textDecoration: 'underline' }}
+                onClick={() => { setStep(1); setError(''); setTempToken(''); }}
+              >
+                Cancel
               </span>
             </div>
           </form>

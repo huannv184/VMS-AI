@@ -185,10 +185,17 @@ public:
     static RuleEngine& getInstance();
     
     // Rule CRUD
-    bool addRule(const CompositeRule& rule);
+    // BUG-H5 FIX: addRule returns the assigned rule_id (0 on failure) so
+    // callers don't have to look at the input copy — the copy is what we
+    // mutated, the caller's original was const&. Returning the id keeps the
+    // POST handler honest about what id the client was actually given.
+    int addRule(const CompositeRule& rule);
     bool updateRule(const CompositeRule& rule);
     bool removeRule(int rule_id);
-    CompositeRule* getRule(int rule_id);
+    // BUG-H4 FIX: was returning a raw pointer into the internal vector after
+    // releasing the lock — any concurrent addRule() push_back could invalidate
+    // it (UAF). Returning by value is the safe equivalent for read-only use.
+    std::optional<CompositeRule> getRule(int rule_id);
     std::vector<CompositeRule> getAllRules();
     int getNextRuleId();
     
@@ -234,6 +241,7 @@ private:
     struct NoiseState {
         std::chrono::system_clock::time_point last_trigger;
         std::chrono::system_clock::time_point first_seen;  // For debounce
+        std::chrono::system_clock::time_point last_seen;   // For debounce gap detection
         int consecutive_count{0};
     };
     std::unordered_map<int, NoiseState> noise_state_;  // key = rule_id

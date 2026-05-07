@@ -1,6 +1,10 @@
 #include "api/device_controller.h"
+#include "database/audit_repository.h"
 #include "database/db_manager.h"
+#include "middleware/auth_middleware.h"
+#include "server/vms_app.h"
 #include "utils/api_utils.h"
+#include "utils/crypto.h"
 #include "utils/http_digest_client.h"
 #include "utils/logger.h"
 #include "utils/validator.h"
@@ -11,6 +15,7 @@
 #include <QVariant>
 #include <ctime>
 #include <optional>
+#include <unordered_set>
 
 using json = nlohmann::json;
 
@@ -44,6 +49,65 @@ static std::optional<std::string> validateDeviceConnection(const std::string& ip
     return std::nullopt;
 }
 
+// BUG-C4 FIX: never serialise the encrypted-password column to API clients.
+// Even though it is now AES-CBC ciphertext rather than plaintext (see below),
+// the envelope format reveals the IV and lets an attacker mount offline
+// dictionary attacks if they capture the response. Internal callers that need
+// the cleartext (e.g. RTSP probing) must read it directly from the DB and
+// decrypt via Crypto::decrypt — they should not go through this serializer.
+static const std::unordered_set<std::string>& sensitiveDeviceColumns() {
+    static const std::unordered_set<std::string> cols = { "password" };
+    return cols;
+}
+
+// BUG-C4 regression FIX: callers that need the cleartext password for digest
+// auth (reboot, channel-probe sync) must read the column directly and decrypt
+// it — `queryDevices()` deliberately strips the `password` column from its
+// JSON output. Going through that helper meant `pass` was always empty and
+// every digest call landed on the device with empty Authorization → 401.
+struct DeviceConnection {
+    std::string ip;
+    int port = 80;
+    std::string username;
+    std::string password; // cleartext, server-side only
+    std::string brand;
+    int channel_count = 0;
+    bool found = false;
+};
+
+static DeviceConnection loadDeviceConnection(int device_id) {
+    DeviceConnection conn;
+    QSqlDatabase db = database::DbManager::getInstance().getThreadConnection();
+    if (!db.isOpen()) return conn;
+
+    QSqlQuery q(db);
+    q.prepare("SELECT ip_address, port, username, password, brand, channel_count "
+              "FROM devices WHERE id = ?");
+    q.bindValue(0, device_id);
+    if (!q.exec() || !q.next()) return conn;
+
+    conn.ip       = q.value(0).toString().toStdString();
+    conn.port     = q.value(1).toInt();
+    if (conn.port <= 0) conn.port = 80;
+    conn.username = q.value(2).toString().toStdString();
+    std::string stored_pwd = q.value(3).toString().toStdString();
+    conn.brand    = q.value(4).toString().toStdString();
+    conn.channel_count = q.value(5).toInt();
+
+    if (!stored_pwd.empty()) {
+        try {
+            conn.password = vms::utils::Crypto::decrypt(stored_pwd);
+        } catch (const std::exception& e) {
+            // Pre-C4 rows are still cleartext; treat decrypt failure as cleartext
+            // pass-through so existing devices keep working until rotated.
+            LOG_WARN("[DeviceCtrl] decrypt failed for device {} ({}); using stored value as cleartext", device_id, e.what());
+            conn.password = stored_pwd;
+        }
+    }
+    conn.found = true;
+    return conn;
+}
+
 static json queryDevices(const std::string& sql, const std::vector<std::string>& params = {}) {
     QSqlDatabase db = database::DbManager::getInstance().getThreadConnection();
     if (!db.isOpen()) return json::array();
@@ -58,12 +122,14 @@ static json queryDevices(const std::string& sql, const std::vector<std::string>&
         return json::array();
     }
 
+    const auto& redacted = sensitiveDeviceColumns();
     json results = json::array();
     QSqlRecord rec = query.record();
     while (query.next()) {
         json row;
         for (int i = 0; i < rec.count(); ++i) {
             std::string name = rec.fieldName(i).toStdString();
+            if (redacted.count(name)) continue; // skip ciphertext, never expose
             QVariant val = query.value(i);
             if (val.isNull()) { row[name] = nullptr; }
             else if (val.typeId() == QMetaType::LongLong || val.typeId() == QMetaType::Int) { row[name] = val.toLongLong(); }
@@ -77,13 +143,16 @@ static json queryDevices(const std::string& sql, const std::vector<std::string>&
 
 void DeviceController::registerRoutes(vms::server::VmsApp& app) {
 
-    // GET /api/devices — List all devices
+    // GET /api/devices — List all devices (DEVICE_READ)
     CROW_ROUTE(app, "/api/devices")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
+
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::DEVICE_READ, origin)) return std::move(*err);
 
         auto devices = queryDevices(
             "SELECT id, name, type, ip_address, port, brand, model, username, "
@@ -92,13 +161,16 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
         return ApiUtils::createResponse({{"devices", devices}}, 200, origin);
     });
 
-    // POST /api/devices — Add device
+    // POST /api/devices — Add device (DEVICE_WRITE)
     CROW_ROUTE(app, "/api/devices")
     .methods(crow::HTTPMethod::POST)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
+
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::DEVICE_WRITE, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);
@@ -119,14 +191,25 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createErrorResponse(validation_error.value(), 400, origin);
             }
 
-            QSqlDatabase db = database::DbManager::getInstance().getThreadConnection();
+            auto& db_mgr = database::DbManager::getInstance();
+            QSqlDatabase db = db_mgr.getThreadConnection();
             if (!db.isOpen()) return ApiUtils::createErrorResponse("Database not available", 500, origin);
 
             QSqlQuery query(db);
-            const char* sql = "INSERT INTO devices (name, type, ip_address, port, brand, model, username, password, channel_count, is_online, updated_at) "
-                              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, strftime('%s', 'now'))";
+            // strftime('%s','now') is SQLite-only — go through sqlNowEpoch()
+            // so the same INSERT runs on PostgreSQL too.
+            const std::string sql_str =
+                "INSERT INTO devices (name, type, ip_address, port, brand, model, username, password, channel_count, is_online, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, " + db_mgr.sqlNowEpoch() + ")";
 
-            query.prepare(sql);
+            // BUG-C4 FIX: encrypt password at rest. Stored as "v1:<iv_b64>:<ct_b64>"
+            // and decrypted on use via Crypto::decrypt. Empty password is left empty
+            // so we don't store noise rows.
+            std::string stored_password = password.empty()
+                ? std::string{}
+                : vms::utils::Crypto::encrypt(password);
+
+            query.prepare(QString::fromStdString(sql_str));
             query.bindValue(0, QString::fromStdString(name));
             query.bindValue(1, QString::fromStdString(type));
             query.bindValue(2, QString::fromStdString(ip));
@@ -134,7 +217,7 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             query.bindValue(4, QString::fromStdString(brand));
             query.bindValue(5, QString::fromStdString(model));
             query.bindValue(6, QString::fromStdString(username));
-            query.bindValue(7, QString::fromStdString(password));
+            query.bindValue(7, QString::fromStdString(stored_password));
             query.bindValue(8, channel_count);
 
             if (!query.exec()) {
@@ -143,6 +226,10 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
 
             int new_id = query.lastInsertId().toInt();
             LOG_INFO("[DeviceCtrl] Added device '{}' (ID={}) at {}", name, new_id, ip);
+
+            database::AuditRepository audit;
+            audit.insertLog(ctx.user->id, "CREATE_DEVICE",
+                            "Created device '" + name + "' (id=" + std::to_string(new_id) + ", ip=" + ip + ")");
 
             return ApiUtils::createResponse({
                 {"id", new_id}, {"name", name}
@@ -153,20 +240,29 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
         }
     });
 
-    // PUT /api/devices/<id> — Update device
+    // PUT /api/devices/<id> — Update device (DEVICE_WRITE)
     CROW_ROUTE(app, "/api/devices/<int>")
     .methods(crow::HTTPMethod::PUT, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int device_id) {
+    ([&app](const crow::request& req, int device_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
 
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::DEVICE_WRITE, origin)) return std::move(*err);
+
         try {
             auto body = json::parse(req.body);
-            QSqlDatabase db = database::DbManager::getInstance().getThreadConnection();
+            auto& db_mgr = database::DbManager::getInstance();
+            QSqlDatabase db = db_mgr.getThreadConnection();
             if (!db.isOpen()) return ApiUtils::createErrorResponse("Database not available", 500, origin);
 
-            auto existing_devices = queryDevices("SELECT ip_address, port, username, password FROM devices WHERE id = ?", {std::to_string(device_id)});
+            // BUG-C4 FIX: queryDevices() now strips the password column, so we
+            // can no longer pull the existing password through it. Use the body
+            // value if supplied; otherwise validate connection without needing
+            // to know the existing cleartext (we only check fields actually being
+            // changed).
+            auto existing_devices = queryDevices("SELECT ip_address, port, username FROM devices WHERE id = ?", {std::to_string(device_id)});
             if (existing_devices.empty()) {
                 return ApiUtils::createErrorResponse("Device not found", 404, origin);
             }
@@ -175,11 +271,18 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             std::string ip = body.value("ip_address", existing.value("ip_address", ""));
             int port = body.value("port", existing.value("port", 80));
             std::string username = body.value("username", existing.value("username", ""));
-            std::string password = body.value("password", existing.value("password", ""));
-            if (body.contains("ip_address") || body.contains("port") || body.contains("username") || body.contains("password")) {
+            // Only validate password format when the request actually changes it.
+            if (body.contains("password") && body["password"].is_string()) {
+                std::string password = body["password"].get<std::string>();
                 if (auto validation_error = validateDeviceConnection(ip, port, username, password); validation_error.has_value()) {
                     return ApiUtils::createErrorResponse(validation_error.value(), 400, origin);
                 }
+            } else if (body.contains("ip_address") || body.contains("port") || body.contains("username")) {
+                // No password change but other connection fields moved — re-validate
+                // those without needing the cleartext password.
+                if (!isValidDeviceHost(ip)) return ApiUtils::createErrorResponse("Invalid ip_address", 400, origin);
+                if (!vms::Validator::isValidPort(port)) return ApiUtils::createErrorResponse("Invalid port", 400, origin);
+                if (!vms::Validator::isSafeCredential(username)) return ApiUtils::createErrorResponse("Invalid username", 400, origin);
             }
 
             // Build dynamic UPDATE
@@ -201,7 +304,12 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             addField("model", "model");
             addField("firmware", "firmware");
             addField("username", "username");
-            addField("password", "password");
+            // BUG-C4 FIX: encrypt the password before persisting on UPDATE too.
+            if (body.contains("password") && body["password"].is_string()) {
+                std::string raw_pwd = body["password"].get<std::string>();
+                sets.push_back("password = ?");
+                values.push_back(raw_pwd.empty() ? std::string{} : vms::utils::Crypto::encrypt(raw_pwd));
+            }
 
             if (body.contains("port")) {
                 sets.push_back("port = ?");
@@ -212,7 +320,8 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
                 values.push_back(std::to_string(body["channel_count"].get<int>()));
             }
 
-            sets.push_back("updated_at = strftime('%s', 'now')");
+            // updated_at via sqlNowEpoch() so the same UPDATE runs on PG/SQLite.
+            sets.push_back("updated_at = " + db_mgr.sqlNowEpoch());
 
             std::string sql = "UPDATE devices SET ";
             for (size_t i = 0; i < sets.size(); ++i) {
@@ -233,6 +342,9 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             }
 
             LOG_INFO("[DeviceCtrl] Updated device {}", device_id);
+            database::AuditRepository audit;
+            audit.insertLog(ctx.user->id, "UPDATE_DEVICE",
+                            "Updated device id=" + std::to_string(device_id));
             return ApiUtils::createResponse(json::object(), 200, origin);
 
         } catch (const std::exception& e) {
@@ -240,11 +352,15 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
         }
     });
 
-    // DELETE /api/devices/<id> — Delete device
+    // DELETE /api/devices/<id> — Delete device (DEVICE_WRITE)
     CROW_ROUTE(app, "/api/devices/<int>")
     .methods(crow::HTTPMethod::DELETE)
-    ([](const crow::request& req, int device_id) {
+    ([&app](const crow::request& req, int device_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
+
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::DEVICE_WRITE, origin)) return std::move(*err);
+
         QSqlDatabase db = database::DbManager::getInstance().getThreadConnection();
         if (!db.isOpen()) return ApiUtils::createErrorResponse("Database not available", 500, origin);
 
@@ -253,22 +369,29 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
         del_query.bindValue(0, device_id);
         if (del_query.exec()) {
             LOG_INFO("[DeviceCtrl] Deleted device {}", device_id);
+            database::AuditRepository audit;
+            audit.insertLog(ctx.user->id, "DELETE_DEVICE",
+                            "Deleted device id=" + std::to_string(device_id));
             return ApiUtils::createResponse(json::object(), 200, origin);
         }
         return ApiUtils::createErrorResponse("Failed to delete device", 500, origin);
     });
 
-    // GET /api/devices/<id>/channels — List NVR camera channels
+    // GET /api/devices/<id>/channels — List NVR camera channels (DEVICE_READ)
     CROW_ROUTE(app, "/api/devices/<int>/channels")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int device_id) {
+    ([&app](const crow::request& req, int device_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
 
-        // Get device info — credentials fetched server-side only, never exposed in response
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::DEVICE_READ, origin)) return std::move(*err);
+
+        // /channels only generates URL paths from brand+channel_count — no
+        // credentials needed here. Keep the route free of decrypt overhead.
         auto devices = queryDevices(
-            "SELECT id, name, ip_address, port, brand, model, username, password, channel_count "
+            "SELECT id, name, ip_address, port, brand, model, username, channel_count "
             "FROM devices WHERE id = ?",
             {std::to_string(device_id)});
         if (devices.empty()) {
@@ -276,9 +399,6 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
         }
 
         auto& dev = devices[0];
-        std::string ip = dev.value("ip_address", "");
-        std::string user = dev.value("username", "");
-        std::string pass = dev.value("password", "");
         std::string brand = dev.value("brand", "");
         int channel_count = dev.value("channel_count", 16);
 
@@ -307,39 +427,34 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             channel["brand"] = brand;
             channels.push_back(channel);
         }
-        // Suppress unused-variable warnings for server-side-only vars
-        (void)user; (void)pass;
 
         return ApiUtils::createResponse({{"channels", channels}, {"device_id", device_id}}, 200, origin);
     });
 
-    // POST /api/devices/<id>/sync — Sync/discover cameras on NVR
+    // POST /api/devices/<id>/sync — Sync/discover cameras on NVR (DEVICE_WRITE)
     CROW_ROUTE(app, "/api/devices/<int>/sync")
     .methods(crow::HTTPMethod::POST, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int device_id) {
+    ([&app](const crow::request& req, int device_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
 
-        auto devices = queryDevices(
-            "SELECT id, ip_address, port, brand, username, password "
-            "FROM devices WHERE id = ?",
-            {std::to_string(device_id)});
-        if (devices.empty()) {
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::DEVICE_WRITE, origin)) return std::move(*err);
+
+        auto conn = loadDeviceConnection(device_id);
+        if (!conn.found) {
             return ApiUtils::createErrorResponse("Device not found", 404, origin);
         }
-
-        auto& dev = devices[0];
-        std::string ip = dev.value("ip_address", "");
-        int port = dev.value("port", 80);
-        std::string user = dev.value("username", "");
-        std::string pass = dev.value("password", "");
-        std::string brand = dev.value("brand", "");
+        const std::string& ip = conn.ip;
+        int port = conn.port;
+        const std::string& user = conn.username;
+        const std::string& pass = conn.password;
 
         // Try to detect channel count via HTTP probe
         int detected_channels = 0;
         bool probe_success = false;
-        std::string brand_lower = brand;
+        std::string brand_lower = conn.brand;
         std::transform(brand_lower.begin(), brand_lower.end(), brand_lower.begin(), ::tolower);
 
         if (brand_lower.find("hikvision") != std::string::npos) {
@@ -386,12 +501,20 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
         if (detected_channels <= 0) detected_channels = 16; // Fallback
 
         // Update device with detected channel count and mark online
+        auto& sync_db_mgr = database::DbManager::getInstance();
+        const std::string now_expr = sync_db_mgr.sqlNowEpoch();
         std::string update_sql = "UPDATE devices SET channel_count = " + std::to_string(detected_channels) +
                                  ", is_online = " + std::to_string(probe_success ? 1 : 0) +
-                                 ", last_seen = strftime('%s', 'now'), updated_at = strftime('%s', 'now') WHERE id = " + std::to_string(device_id);
-        database::DbManager::getInstance().execute(update_sql);
+                                 ", last_seen = " + now_expr + ", updated_at = " + now_expr +
+                                 " WHERE id = " + std::to_string(device_id);
+        sync_db_mgr.execute(update_sql);
 
         LOG_INFO("[DeviceCtrl] Synced device {} — detected {} channels", device_id, detected_channels);
+
+        database::AuditRepository audit;
+        audit.insertLog(ctx.user->id, "SYNC_DEVICE",
+                        "Synced device id=" + std::to_string(device_id) +
+                        ", channels=" + std::to_string(detected_channels));
 
         return ApiUtils::createResponse({
             {"device_id", device_id},
@@ -400,39 +523,47 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
     });
 
     // POST /api/devices/<id>/reboot — Remote reboot
+    // Reboot is more dangerous than write — limit to SYSTEM_ADMIN.
+    // An operator (role 2) holding DEVICE_WRITE can still configure/sync, but
+    // can't physically restart an NVR/DVR while it's recording on a customer
+    // site.
     CROW_ROUTE(app, "/api/devices/<int>/reboot")
     .methods(crow::HTTPMethod::POST, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int device_id) {
+    ([&app](const crow::request& req, int device_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
 
-        auto devices = queryDevices("SELECT * FROM devices WHERE id = ?", {std::to_string(device_id)});
-        if (devices.empty()) {
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
+
+        auto conn = loadDeviceConnection(device_id);
+        if (!conn.found) {
             return ApiUtils::createErrorResponse("Device not found", 404, origin);
         }
 
-        auto& dev = devices[0];
-        std::string ip = dev.value("ip_address", "");
-        int port = dev.value("port", 80);
-        std::string user = dev.value("username", "");
-        std::string pass = dev.value("password", "");
-        std::string brand = dev.value("brand", "");
-
         bool success = false;
-        std::string brand_lower = brand;
+        std::string brand_lower = conn.brand;
         std::transform(brand_lower.begin(), brand_lower.end(), brand_lower.begin(), ::tolower);
 
         if (brand_lower.find("hikvision") != std::string::npos) {
-            auto response = vms::http::putDigest(ip, port, "/ISAPI/System/reboot", user, pass, "", "application/xml", 5L, 10L);
+            auto response = vms::http::putDigest(conn.ip, conn.port, "/ISAPI/System/reboot",
+                                                 conn.username, conn.password, "", "application/xml", 5L, 10L);
             success = response.ok() || response.body.find("OK") != std::string::npos ||
                       response.body.find("reboot") != std::string::npos;
         } else if (brand_lower.find("dahua") != std::string::npos) {
-            auto response = vms::http::getDigest(ip, port, "/cgi-bin/magicBox.cgi?action=reboot", user, pass, 5L, 10L);
+            auto response = vms::http::getDigest(conn.ip, conn.port, "/cgi-bin/magicBox.cgi?action=reboot",
+                                                 conn.username, conn.password, 5L, 10L);
             success = response.ok() || response.body.find("OK") != std::string::npos;
         }
 
-        LOG_INFO("[DeviceCtrl] Reboot device {} ({}): {}", device_id, ip, success ? "OK" : "FAILED");
+        LOG_INFO("[DeviceCtrl] Reboot device {} ({}): {}", device_id, conn.ip, success ? "OK" : "FAILED");
+
+        database::AuditRepository audit;
+        audit.insertLog(ctx.user->id, "REBOOT_DEVICE",
+                        "Reboot device id=" + std::to_string(device_id) +
+                        " ip=" + conn.ip +
+                        " result=" + (success ? "OK" : "FAILED"));
 
         if (!success) return ApiUtils::createErrorResponse("Reboot failed or unsupported brand", 500, origin);
         return ApiUtils::createResponse({
@@ -440,15 +571,26 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
         }, 200, origin);
     });
 
-    // GET /api/devices/<id>/info — Device info
+    // GET /api/devices/<id>/info — Device info (DEVICE_READ)
     CROW_ROUTE(app, "/api/devices/<int>/info")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int device_id) {
+    ([&app](const crow::request& req, int device_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
 
-        auto devices = queryDevices("SELECT * FROM devices WHERE id = ?", {std::to_string(device_id)});
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::DEVICE_READ, origin)) return std::move(*err);
+
+        // BUG-C4 FIX: explicitly list non-sensitive columns instead of SELECT *.
+        // Even with the queryDevices serialiser stripping `password`, defence in
+        // depth: don't fetch ciphertext over the wire from DB at all when we
+        // never intend to send it back.
+        auto devices = queryDevices(
+            "SELECT id, name, type, ip_address, port, brand, model, username, "
+            "channel_count, is_online, firmware, created_at, updated_at "
+            "FROM devices WHERE id = ?",
+            {std::to_string(device_id)});
         if (devices.empty()) {
             return ApiUtils::createErrorResponse("Device not found", 404, origin);
         }

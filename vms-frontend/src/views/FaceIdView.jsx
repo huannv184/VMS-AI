@@ -8,14 +8,15 @@ const FaceIdView = () => {
   const [activeTab, setActiveTab] = useState('VERIFIED'); // VERIFIED, UNKNOWN, ADD_NEW
   const [persons, setPersons] = useState([]);
   const [recognitionLogs, setRecognitionLogs] = useState([]);
+  const [unknownLogs, setUnknownLogs] = useState([]);
   const [selectedPerson, setSelectedPerson] = useState(null);
-  
+
   // Add new form state
   const [newName, setNewName] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [previewImage, setPreviewImage] = useState(null);
   const [isAdding, setIsAdding] = useState(false);
-  
+
   const fileInputRef = useRef(null);
 
   // Fetch initial data
@@ -23,10 +24,16 @@ const FaceIdView = () => {
     try {
       const pRes = await apiClient.getPersons();
       if (pRes.success) setPersons(pRes.data?.persons || []);
-      
+
       const evtRes = await apiClient.getEvents({ event_type: 'FACE_RECOGNIZED', limit: 20 });
       if (evtRes.success) {
         setRecognitionLogs(evtRes.data?.events || []);
+      }
+
+      // UNKNOWN: phát hiện khuôn mặt chưa nhận diện được (Unknown / chưa khớp DB)
+      const unkRes = await apiClient.getEvents({ event_type: 'FACE_UNKNOWN', limit: 30 });
+      if (unkRes.success) {
+        setUnknownLogs(unkRes.data?.events || []);
       }
     } catch (e) {
       console.error("Failed to fetch faces", e);
@@ -37,8 +44,11 @@ const FaceIdView = () => {
     fetchData();
     const intv = setInterval(() => {
       apiClient.getEvents({ event_type: 'FACE_RECOGNIZED', limit: 20 })
-      .then((res) => { if (res.success) setRecognitionLogs(res.data?.events || []); })
-      .catch(()=>{});
+        .then((res) => { if (res.success) setRecognitionLogs(res.data?.events || []); })
+        .catch(() => {});
+      apiClient.getEvents({ event_type: 'FACE_UNKNOWN', limit: 30 })
+        .then((res) => { if (res.success) setUnknownLogs(res.data?.events || []); })
+        .catch(() => {});
     }, 5000);
     return () => clearInterval(intv);
   }, []);
@@ -165,10 +175,32 @@ const FaceIdView = () => {
           
           {/* TAB: UNKNOWN */}
           {activeTab === 'UNKNOWN' && (
-             <div style={{textAlign:'center', padding:'60px 20px', color:'var(--text-dim)'}}>
+            unknownLogs.length === 0 ? (
+              <div style={{textAlign:'center', padding:'60px 20px', color:'var(--text-dim)'}}>
                 <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1" style={{marginBottom: 15, opacity: 0.3}}><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-                <div style={{fontSize: 13, fontWeight: 600, letterSpacing: 1}}>KHÔNG TÌM THẤY NGƯỜI LẠ MẶT DỮ LIỆU CŨ</div>
-             </div>
+                <div style={{fontSize: 13, fontWeight: 600, letterSpacing: 1}}>CHƯA GHI NHẬN KHUÔN MẶT LẠ</div>
+                <div style={{fontSize: 10, marginTop: 5}}>Hệ thống sẽ liệt kê các khuôn mặt chưa khớp với danh sách "Đã xác minh" tại đây.</div>
+              </div>
+            ) : (
+              <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(160px, 1fr))', gap:'12px', alignContent:'start'}}>
+                {unknownLogs.map((log) => (
+                  <div key={log.id} style={{background:'var(--bg-card)', border:'1px solid var(--danger)', borderRadius:'4px', overflow:'hidden'}}>
+                    <div style={{height:'140px', background:'#111', display:'flex', alignItems:'center', justifyContent:'center', position:'relative', overflow:'hidden'}}>
+                      {log.snapshot_url ? (
+                        <img src={`${API_BASE}${log.snapshot_url}`} alt="unknown" style={{width:'100%', height:'100%', objectFit:'cover'}} onError={(e) => { e.target.style.display = 'none'; }} />
+                      ) : (
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="1.5"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                      )}
+                      <div style={{position:'absolute', top:'5px', right:'5px', background:'rgba(255,48,96,0.85)', padding:'2px 4px', borderRadius:'2px', fontFamily:"'Share Tech Mono',monospace", fontSize:'9px', color:'#fff'}}>UNKNOWN</div>
+                    </div>
+                    <div style={{padding:'10px'}}>
+                      <div style={{fontSize:'11px', color:'var(--text-primary)', whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{log.camera_name || `CAM-${log.camera_id ?? '?'}`}</div>
+                      <div style={{fontSize:'9px', color:'var(--text-dim)', fontFamily:"'Share Tech Mono',monospace", marginTop:'4px'}}>{formatTime(log.timestamp)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
           )}
 
           {/* TAB: ADD NEW */}
@@ -270,7 +302,9 @@ const FaceIdView = () => {
                     </div>
                     <div style={{display:'flex', justifyContent:'space-between', marginBottom:'8px'}}>
                       <span style={{fontSize:'10px', color:'var(--text-secondary)'}}>Ngày tạo</span>
-                      <span style={{fontSize:'10px', color:'var(--text-primary)', fontFamily:"'Share Tech Mono',monospace"}}>{new Date(selectedPerson.created_at * 1000).toLocaleDateString()}</span>
+                      <span style={{fontSize:'10px', color:'var(--text-primary)', fontFamily:"'Share Tech Mono',monospace"}}>
+                        {selectedPerson.created_at ? new Date(normalizeTimestamp(selectedPerson.created_at)).toLocaleDateString() : '-'}
+                      </span>
                     </div>
                     <div style={{display:'flex', justifyContent:'space-between'}}>
                       <span style={{fontSize:'10px', color:'var(--text-secondary)'}}>ID Hệ thống</span>

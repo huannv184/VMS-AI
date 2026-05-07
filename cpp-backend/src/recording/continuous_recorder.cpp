@@ -8,6 +8,7 @@
 #include <chrono>
 #include <regex>
 #include <fstream>
+#include <QThread>
 
 namespace fs = std::filesystem;
 
@@ -49,7 +50,12 @@ bool ContinuousRecorder::start() {
 
     should_stop_ = false;
     running_ = true;
-    recorder_thread_ = std::thread(&ContinuousRecorder::recorderLoop, this);
+
+    // QThread gives the recorder an event loop so QProcess signals (stderrReady,
+    // finished, etc.) are delivered. std::thread has no event loop — QProcess I/O
+    // never fires in it, causing silent recording failures.
+    recorder_qthread_ = QThread::create([this]() { recorderLoop(); });
+    recorder_qthread_->start();
 
     LOG_INFO("[ContinuousRecorder-{}] Started → {}", camera_id_, seg_dir);
     return true;
@@ -59,13 +65,20 @@ void ContinuousRecorder::stop() {
     if (!running_.load()) return;
 
     should_stop_ = true;
-    
-    if (ffmpeg_) {
-        ffmpeg_->stop();
+
+    {
+        std::lock_guard<std::mutex> lk(ffmpeg_mutex_);
+        if (ffmpeg_) ffmpeg_->stop();
     }
 
-    if (recorder_thread_.joinable()) {
-        recorder_thread_.join();
+    if (recorder_qthread_) {
+        recorder_qthread_->quit();
+        if (!recorder_qthread_->wait(8000)) {
+            recorder_qthread_->terminate();
+            recorder_qthread_->wait(2000);
+        }
+        delete recorder_qthread_;
+        recorder_qthread_ = nullptr;
     }
 
     running_ = false;
@@ -74,10 +87,12 @@ void ContinuousRecorder::stop() {
 
 void ContinuousRecorder::kill() {
     should_stop_ = true;
+    std::lock_guard<std::mutex> lk(ffmpeg_mutex_);
     if (ffmpeg_) ffmpeg_->kill();
 }
 
 void ContinuousRecorder::writeRawData(const uint8_t* data, int size) {
+    std::lock_guard<std::mutex> lk(ffmpeg_mutex_);
     if (ffmpeg_ && ffmpeg_->isRunning()) {
         ffmpeg_->writeStdin(reinterpret_cast<const char*>(data), size);
     }
@@ -118,15 +133,16 @@ void ContinuousRecorder::recorderLoop() {
 
         LOG_INFO("[ContinuousRecorder-{}] Starting FFmpeg: segment_time={}s", camera_id_, segment_sec_);
 
-        ffmpeg_ = std::make_unique<core::FFmpegProcess>();
-        
-        QObject::connect(ffmpeg_.get(), &core::FFmpegProcess::stderrReady, [this](const QByteArray& data) {
-            std::string err_str = data.toStdString();
-            // Optional: trim newline if needed
-            if (!err_str.empty() && err_str.back() == '\n') err_str.pop_back();
-            if (!err_str.empty() && err_str.back() == '\r') err_str.pop_back();
-            LOG_WARN("[ContinuousRecorder-{}] FFmpeg stderr: {}", camera_id_, err_str);
-        });
+        {
+            std::lock_guard<std::mutex> lk(ffmpeg_mutex_);
+            ffmpeg_ = std::make_unique<core::FFmpegProcess>();
+            QObject::connect(ffmpeg_.get(), &core::FFmpegProcess::stderrReady, [this](const QByteArray& data) {
+                std::string err_str = data.toStdString();
+                if (!err_str.empty() && err_str.back() == '\n') err_str.pop_back();
+                if (!err_str.empty() && err_str.back() == '\r') err_str.pop_back();
+                LOG_WARN("[ContinuousRecorder-{}] FFmpeg stderr: {}", camera_id_, err_str);
+            });
+        }
 
         if (!ffmpeg_->start(cmd.str())) {
             LOG_ERROR("[ContinuousRecorder-{}] Failed to start FFmpeg", camera_id_);
@@ -141,12 +157,12 @@ void ContinuousRecorder::recorderLoop() {
 
         restart_count = 0;
 
-        // Monitor FFmpeg process
+        // Monitor FFmpeg process — scan every 10s so segments appear promptly in DB.
+        int scan_tick = 0;
         while (!should_stop_.load() && ffmpeg_ && ffmpeg_->isRunning()) {
-            // Every 30 seconds, scan for new completed segments and register them
-            std::this_thread::sleep_for(std::chrono::seconds(30));
-            
-            if (!should_stop_.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (!should_stop_.load() && ++scan_tick >= 2) {  // every 10s
+                scan_tick = 0;
                 scanAndRegisterSegments();
                 pruneOldSegments();
             }
@@ -203,11 +219,21 @@ void ContinuousRecorder::scanAndRegisterSegments() {
             // Calculate timestamps
             // FFmpeg segment_list gives relative seconds from start
             // We need to figure out absolute timestamps from file modification time
+            // A more portable way to get file time
             auto file_mod_time = fs::last_write_time(full_path);
-            auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                file_mod_time - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
-            );
-            time_t end_time = std::chrono::system_clock::to_time_t(sctp);
+            
+            // To ensure C++17 compatibility across MSVC/GCC, we approximate time_t
+            // by using the clock differences. std::filesystem::file_time_type in MSVC C++17 
+            // can't just be cast to system_clock without this trick.
+            auto file_mod_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(file_mod_time.time_since_epoch()).count();
+            auto file_clock_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(fs::file_time_type::clock::now().time_since_epoch()).count();
+            auto sys_clock_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            
+            // Absolute time in ns = System_Now_ns - (File_Clock_Now_ns - File_Mod_Time_ns)
+            auto abs_time_ns = sys_clock_now_ns - (file_clock_now_ns - file_mod_time_ns);
+            
+            time_t end_time = static_cast<time_t>(abs_time_ns / 1000000000LL);
+
             time_t start_time = end_time - segment_sec_;
 
             size_t file_size = fs::file_size(full_path);
@@ -223,7 +249,18 @@ void ContinuousRecorder::scanAndRegisterSegments() {
             }
 
             if (!already_exists) {
-                repo.insertSegment(camera_id_, full_path, start_time, end_time, file_size, "completed");
+                if (repo.insertSegment(camera_id_, full_path, start_time, end_time, file_size, "completed")) {
+                    LOG_INFO("[ContinuousRecorder-{}] Registered segment: {} ({}s)", camera_id_, filename, segment_sec_);
+                } else {
+                    // Segment is on disk but DB row was not written. The next
+                    // retention sweep can mistake this for an orphan and
+                    // delete a valid recent recording — surface the failure
+                    // loudly instead of leaving the disk/DB drift silent.
+                    LOG_ERROR("[ContinuousRecorder-{}] insertSegment returned false for {} "
+                              "(file exists on disk but is NOT registered; "
+                              "may be pruned as orphan)",
+                              camera_id_, full_path);
+                }
             }
         }
     } catch (const std::exception& e) {

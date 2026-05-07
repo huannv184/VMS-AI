@@ -1,8 +1,11 @@
 #include "core/brands/axis_core.hpp"
 #include "core/brands/AxisAdapter.hpp"
+#include "utils/logger.h"
 #include <vector>
 #include <string>
 #include <nlohmann/json.hpp>
+#include <chrono>
+#include <thread>
 
 namespace vms {
 namespace core {
@@ -129,35 +132,17 @@ bool AxisCore::ptzControl(const CameraDiscovery::DiscoveryConfig& cfg, const std
     return adapter.ptzControl(cmd);
 }
 
+// BUG-EVENTS-01 (2026-05-07): pre-fix, this called a no-op
+// `AxisAdapter::startEventSubscription` and then spun a `keepalive` loop —
+// real Axis VAPIX 3 event subscription was never wired. See ONVIFCore for
+// the full lesson; same shape, same fix.
 void AxisCore::pullEvents(const CameraDiscovery::DiscoveryConfig& cfg, std::function<bool(const std::string&)> onEvent) {
-    vms::CameraConfig vcfg;
-    vcfg.ip = cfg.host;
-    vcfg.username = cfg.username;
-    vcfg.password = cfg.password;
-    vcfg.httpPort = cfg.http_port;
-    vms::AxisAdapter adapter(vcfg);
-    
-    if (!adapter.connect()) return;
-
-    std::atomic<bool> isRunning{true};
-    adapter.startEventSubscription([&](const vms::CameraEvent& ev) {
-        std::string typeMap = "EventNotificationAlert"; 
-        if (ev.type == vms::CameraEvent::Type::Motion) typeMap = "VMD";
-        else if (ev.type == vms::CameraEvent::Type::LineCrossing) typeMap = "linedetection";
-        else if (ev.type == vms::CameraEvent::Type::Intrusion) typeMap = "fielddetection";
-
-        std::string fakeXml = std::string(60, ' ') + "<EventNotificationAlert><eventType>" + typeMap + "</eventType></EventNotificationAlert>";
-        if (!onEvent(fakeXml)) {
-            isRunning = false;
-        }
-    }, nullptr);
-
-    while (isRunning) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        if (!onEvent("keepalive")) {
-            isRunning = false;
-        }
-    }
+    LOG_WARN("[AxisCore] Hardware event subscription is NOT implemented "
+             "for Axis host {}:{}. Real Axis events require VAPIX 3 event "
+             "stream wiring. Sleeping 60s before returning.",
+             cfg.host, cfg.http_port);
+    (void)onEvent;
+    std::this_thread::sleep_for(std::chrono::seconds(60));
 }
 
 } // namespace brands

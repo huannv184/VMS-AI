@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { LayoutGrid, PlayCircle, BarChart2, Bell, Settings, Map, ShieldAlert, Users, Footprints, Car, UserCheck, MonitorPlay, ScanSearch, MapPin } from 'lucide-react';
+import { LayoutGrid, PlayCircle, BarChart2, Bell, Settings, Map, ShieldAlert, Users, Footprints, Car, UserCheck, MonitorPlay, ScanSearch, MapPin, LogOut } from 'lucide-react';
 import useVmsStore from '../store/useVmsStore';
+import apiClient from '../api/apiClient';
 
 const Topbar = ({ activeTab, setActiveTab }) => {
   const isConnected = useVmsStore((state) => state.isConnected);
@@ -8,6 +9,8 @@ const Topbar = ({ activeTab, setActiveTab }) => {
   const alarms = useVmsStore((state) => state.alarms);
 
   const [clock, setClock] = useState(new Date().toLocaleTimeString('vi-VN'));
+  const [currentUser, setCurrentUser] = useState(null);
+  const [showUserMenu, setShowUserMenu] = useState(false);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -15,6 +18,29 @@ const Topbar = ({ activeTab, setActiveTab }) => {
     }, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiClient.getCurrentUser().then((res) => {
+      if (cancelled) return;
+      if (res?.success && res.data) {
+        setCurrentUser(res.data?.user || res.data);
+      }
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleLogout = async () => {
+    // BUG-C3 FIX: tell the backend to bump token_version (invalidates JWT +
+    // cookie) BEFORE we drop the token locally. Order matters — the request
+    // needs the auth header to identify the caller.
+    try { await apiClient.logout(); } catch (_) {}
+    apiClient.clearToken();
+    window.dispatchEvent(new Event('vms_logout'));
+  };
+
+  const userInitials = (currentUser?.username || 'AD').slice(0, 2).toUpperCase();
+  const userLabel = currentUser?.full_name || currentUser?.username || 'Admin';
 
   const onlineCams = cameras.filter(c => c.status === 'online').length;
   const totalCams = cameras.length;
@@ -93,9 +119,37 @@ const Topbar = ({ activeTab, setActiveTab }) => {
         <div className="icon-btn" title="System Settings" style={{color: activeTab === 'settings' ? 'var(--accent)' : 'var(--text-secondary)'}} onClick={() => setActiveTab('settings')}>
           <Settings size={16} />
         </div>
-        <div className="user-chip">
-          <div className="user-avatar">AD</div>
-          <span>Admin</span>
+        <div
+          className="user-chip"
+          onClick={() => setShowUserMenu((v) => !v)}
+          style={{ cursor: 'pointer', position: 'relative' }}
+          title={currentUser ? `${userLabel} (#${currentUser.id ?? '-'})` : 'Đăng nhập'}
+        >
+          <div className="user-avatar">{userInitials}</div>
+          <span>{userLabel}</span>
+          {showUserMenu && (
+            <div
+              style={{
+                position: 'absolute', top: '100%', right: 0, marginTop: 6, zIndex: 50,
+                background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 4,
+                minWidth: 140, boxShadow: '0 4px 16px rgba(0,0,0,0.6)'
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div
+                style={{ padding: '8px 12px', fontSize: 12, color: 'var(--text)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
+                onClick={() => { setShowUserMenu(false); setActiveTab('settings'); }}
+              >
+                <Settings size={12} /> Cài đặt
+              </div>
+              <div
+                style={{ padding: '8px 12px', fontSize: 12, color: 'var(--danger)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, borderTop: '1px solid var(--border)' }}
+                onClick={() => { setShowUserMenu(false); handleLogout(); }}
+              >
+                <LogOut size={12} /> Đăng xuất
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

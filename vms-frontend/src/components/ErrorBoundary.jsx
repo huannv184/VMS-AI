@@ -15,6 +15,10 @@ class ErrorBoundary extends React.Component {
     this.setState({ error, errorInfo });
   }
 
+  resetError = () => {
+    this.setState({ hasError: false, error: null, errorInfo: null });
+  };
+
   render() {
     if (this.state.hasError) {
       return (
@@ -26,9 +30,14 @@ class ErrorBoundary extends React.Component {
             <br />
             {this.state.errorInfo && this.state.errorInfo.componentStack}
           </details>
-          <button style={{ marginTop: '20px', padding: '10px 20px', background: '#444', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }} onClick={() => window.location.reload()}>
-            Reload Application
-          </button>
+          <div style={{ marginTop: '20px', display: 'flex', gap: '10px' }}>
+            <button style={{ padding: '10px 20px', background: '#444', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }} onClick={this.resetError}>
+              Try Again
+            </button>
+            <button style={{ padding: '10px 20px', background: '#666', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }} onClick={() => window.location.reload()}>
+              Reload Application
+            </button>
+          </div>
         </div>
       );
     }

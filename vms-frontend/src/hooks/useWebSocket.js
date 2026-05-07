@@ -5,11 +5,17 @@ import { resolveWsUrl } from '../utils/streamingConfig';
 import { API_BASE_URL } from '../utils/runtimeUrls';
 import apiClient from '../api/apiClient';
 
+// Backend emits Unix seconds (std::chrono::seconds). new Date(seconds) treats
+// the number as milliseconds and renders 1970 timestamps; multiply by 1000.
+// Tolerates already-ms values (anything > 9999999999 is past year 2286 in s).
+const normalizeTimestamp = (v) => (v > 9999999999 ? v : v * 1000);
+
 const useWebSocket = () => {
   const socket        = useRef(null);
   const reconnectRef  = useRef(null);
   const connectRef    = useRef(null);
   const authRejected  = useRef(false);
+  const alarmIdCounter= useRef(0);
 
   const addFace           = useVmsStore((s) => s.addFace);
   const addAlarm          = useVmsStore((s) => s.addAlarm);
@@ -92,7 +98,7 @@ const useWebSocket = () => {
             type:       payload.label || 'UNKNOWN',
             confidence: payload.confidence || 0,
             time:       payload.timestamp
-              ? new Date(payload.timestamp).toLocaleTimeString('vi-VN')
+              ? new Date(normalizeTimestamp(payload.timestamp)).toLocaleTimeString('vi-VN')
               : new Date().toLocaleTimeString('vi-VN'),
             avatar: payload.face_image_path
               ? `${API_BASE}${payload.face_image_path}` : null,
@@ -104,9 +110,11 @@ const useWebSocket = () => {
         case 'alert':
         case 'event':
           addAlarm({
-            id:       payload.id || Date.now(),
+            // Date.now() ties at sub-ms when bursty events arrive in the same tick.
+            // Combine with a per-message counter to keep React keys unique.
+            id:       payload.id || `${Date.now()}-${++alarmIdCounter.current}`,
             time:     payload.timestamp
-              ? new Date(payload.timestamp).toLocaleTimeString('vi-VN')
+              ? new Date(normalizeTimestamp(payload.timestamp)).toLocaleTimeString('vi-VN')
               : new Date().toLocaleTimeString('vi-VN'),
             type:     payload.label || payload.event_type || 'AI',
             desc:     payload.message || payload.description || 'Phát hiện sự kiện AI',
@@ -174,8 +182,8 @@ const useWebSocket = () => {
         try {
           const data = JSON.parse(event.data);
           handleMessage(data);
-        } catch {
-          // Malformed message — skip
+        } catch (e) {
+          console.warn('[WS] Malformed JSON message — dropping:', e.message);
         }
       }
     };

@@ -5,6 +5,8 @@
 
 #include "api/reid_controller.h"
 #include "core/reid_engine.h"
+#include "middleware/auth_middleware.h"
+#include "server/vms_app.h"
 #include "utils/api_utils.h"
 #include "utils/logger.h"
 #include <nlohmann/json.hpp>
@@ -41,40 +43,16 @@ static std::vector<unsigned char> base64Decode(const std::string& encoded) {
 void ReIDController::registerRoutes(vms::server::VmsApp& app) {
     LOG_INFO("Registering Re-ID routes...");
 
-    // GET /api/reid/gallery — Active gallery
-    CROW_ROUTE(app, "/api/reid/gallery")
-    .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req) {
-        std::string origin = ApiUtils::resolveCorsOrigin(req);
-        if (req.method == crow::HTTPMethod::OPTIONS)
-            return ApiUtils::createResponse(json::object(), 204, origin);
-
-        try {
-            auto& engine = vms::core::ReIDEngine::getInstance();
-            auto gallery = engine.getActiveGallery();
-            
-            json result = json::array();
-            for (const auto& entry : gallery) {
-                result.push_back(entry.toJSON());
-            }
-            
-            return ApiUtils::createResponse({
-                {"gallery", result},
-                {"count", result.size()},
-                {"statistics", engine.getStatistics()}
-            }, 200, origin);
-        } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
-        }
-    });
-
-    // GET /api/reid/trail/<int> — Cross-camera trail
+    // GET /api/reid/trail/<int> — Cross-camera trail (REID_READ)
     CROW_ROUTE(app, "/api/reid/trail/<int>")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int global_id) {
+    ([&app](const crow::request& req, int global_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
+
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::REID_READ, origin)) return std::move(*err);
 
         try {
             auto& engine = vms::core::ReIDEngine::getInstance();
@@ -95,13 +73,16 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
         }
     });
 
-    // POST /api/reid/search — Search by image
+    // POST /api/reid/search — Search by image (REID_READ — read-only query)
     CROW_ROUTE(app, "/api/reid/search")
     .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options)
             return ApiUtils::createResponse(json::object(), 204, origin);
+
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::REID_READ, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);
@@ -150,30 +131,27 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
         }
     });
 
-    // GET /api/reid/config
+    // GET/PUT /api/reid/config — GET=REID_READ, PUT=REID_WRITE
     CROW_ROUTE(app, "/api/reid/config")
-    .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req) {
+    .methods(crow::HTTPMethod::GET, crow::HTTPMethod::Put, crow::HTTPMethod::OPTIONS)
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
 
-        auto& engine = vms::core::ReIDEngine::getInstance();
-        return ApiUtils::createResponse(engine.getConfig().toJSON(), 200, origin);
-    });
-
-    // PUT /api/reid/config
-    CROW_ROUTE(app, "/api/reid/config")
-    .methods(crow::HTTPMethod::Put)
-    ([](const crow::request& req) {
-        std::string origin = ApiUtils::resolveCorsOrigin(req);
-        if (req.method == crow::HTTPMethod::Options)
-            return ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        const Permission needed = (req.method == crow::HTTPMethod::GET)
+            ? Permission::REID_READ : Permission::REID_WRITE;
+        if (auto err = ApiUtils::requirePermission(ctx, needed, origin)) return std::move(*err);
 
         try {
-            auto body = json::parse(req.body);
             auto& engine = vms::core::ReIDEngine::getInstance();
-            
+
+            if (req.method == crow::HTTPMethod::GET) {
+                return ApiUtils::createResponse(engine.getConfig().toJSON(), 200, origin);
+            }
+
+            auto body = json::parse(req.body);
             auto config = engine.getConfig();
             if (body.contains("enabled")) config.enabled = body["enabled"].get<bool>();
             if (body.contains("match_threshold")) {
@@ -191,26 +169,49 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
         }
     });
 
-    // DELETE /api/reid/gallery — Clear gallery
+    // GET/DELETE /api/reid/gallery — GET=REID_READ, DELETE=REID_WRITE
     CROW_ROUTE(app, "/api/reid/gallery")
-    .methods(crow::HTTPMethod::Delete)
-    ([](const crow::request& req) {
+    .methods(crow::HTTPMethod::GET, crow::HTTPMethod::Delete, crow::HTTPMethod::OPTIONS)
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
-        if (req.method == crow::HTTPMethod::Options)
+        if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
 
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        const Permission needed = (req.method == crow::HTTPMethod::GET)
+            ? Permission::REID_READ : Permission::REID_WRITE;
+        if (auto err = ApiUtils::requirePermission(ctx, needed, origin)) return std::move(*err);
+
         auto& engine = vms::core::ReIDEngine::getInstance();
+        if (req.method == crow::HTTPMethod::GET) {
+            auto gallery = engine.getActiveGallery();
+
+            json result = json::array();
+            for (const auto& entry : gallery) {
+                result.push_back(entry.toJSON());
+            }
+
+            return ApiUtils::createResponse({
+                {"gallery", result},
+                {"count", result.size()},
+                {"statistics", engine.getStatistics()}
+            }, 200, origin);
+        }
+
         engine.clearGallery();
         return ApiUtils::createResponse(json::object(), 200, origin);
     });
 
-    // GET /api/reid/statistics
+    // GET /api/reid/statistics (REID_READ)
     CROW_ROUTE(app, "/api/reid/statistics")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
+
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::REID_READ, origin)) return std::move(*err);
 
         auto& engine = vms::core::ReIDEngine::getInstance();
         return ApiUtils::createResponse(engine.getStatistics(), 200, origin);

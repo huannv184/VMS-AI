@@ -16,6 +16,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QAbstractSocket>
 
 namespace vms {
 namespace streaming {
@@ -135,6 +136,12 @@ void CameraStreamManager::onNewConnection() {
     connect(socket.data(), &QWebSocket::textMessageReceived, this, &CameraStreamManager::processTextMessage);
     connect(socket.data(), &QWebSocket::binaryMessageReceived, this, &CameraStreamManager::processBinaryMessage);
     connect(socket.data(), &QWebSocket::disconnected, this, &CameraStreamManager::socketDisconnected);
+
+    // Disable Nagle's algorithm: WebSocket frames are self-framed and latency-sensitive.
+    // Without TCP_NODELAY, the kernel may buffer small writes up to 40ms before sending.
+    if (auto* tcp = socket->findChild<QAbstractSocket*>()) {
+        tcp->setSocketOption(QAbstractSocket::LowDelayOption, 1);
+    }
 
     // Default: unauthenticated until AUTH message is received (when auth is enabled)
     socket->setProperty("vms_authed", false);
@@ -494,12 +501,14 @@ void CameraStreamManager::broadcastRawFrame(
 
 void CameraStreamManager::broadcastH264Frame(
     int camera_id,
-    const std::vector<unsigned char>& nalu_data,
+    const QByteArray& nalu_data,
     const std::vector<inference::TrackedObject>& objects,
     uint64_t timestamp_us,
     bool is_keyframe,
     const std::string& codec,
-    const std::string& decoder_config_b64
+    const std::string& decoder_config_b64,
+    int frame_width,
+    int frame_height
 ) {
     {
         std::shared_lock<std::shared_mutex> lock(camera_mutex_);
@@ -510,6 +519,8 @@ void CameraStreamManager::broadcastH264Frame(
     meta_json["ts_us"] = timestamp_us;
     meta_json["keyframe"] = is_keyframe;
     meta_json["codec"] = codec;
+    meta_json["width"] = frame_width > 0 ? frame_width : 640;
+    meta_json["height"] = frame_height > 0 ? frame_height : 360;
     if (!decoder_config_b64.empty()) meta_json["decoder_config"] = decoder_config_b64;
 
     nlohmann::json obj_arr = nlohmann::json::array();
@@ -540,7 +551,7 @@ void CameraStreamManager::broadcastH264Frame(
     write_u32_be(packet, static_cast<uint32_t>(nalu_data.size()));
 
     packet.append(meta_str.c_str(), static_cast<int>(meta_len));
-    packet.append(reinterpret_cast<const char*>(nalu_data.data()), static_cast<int>(nalu_data.size()));
+    packet.append(nalu_data);
 
     forEachClient(camera_id, [&](const ClientInfo& client) {
         sendBinaryDropIfBusy(client, packet, is_keyframe);

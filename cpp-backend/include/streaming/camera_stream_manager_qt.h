@@ -80,12 +80,14 @@ public:
 
     void broadcastH264Frame(
         int camera_id,
-        const std::vector<unsigned char>& nalu_data,
+        const QByteArray& nalu_data,
         const std::vector<inference::TrackedObject>& objects,
         uint64_t timestamp_us = 0,
         bool is_keyframe = false,
         const std::string& codec = "avc1.42E01E",
-        const std::string& decoder_config_b64 = ""
+        const std::string& decoder_config_b64 = "",
+        int frame_width = 640,
+        int frame_height = 360
     );
 
     void broadcastFmp4Fragment(

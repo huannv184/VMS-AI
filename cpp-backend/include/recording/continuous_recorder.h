@@ -4,8 +4,10 @@
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <ctime>
 #include <chrono>
+#include <QThread>
 
 namespace vms {
 
@@ -66,7 +68,12 @@ private:
 
     std::atomic<bool> should_stop_{false};
     std::atomic<bool> running_{false};
-    std::thread recorder_thread_;
+    // QThread gives the recorder an event loop so QProcess signals fire correctly.
+    QThread* recorder_qthread_{nullptr};
+    // ffmpeg_ is reseated by recorderLoop on each restart and read by stop()/
+    // writeRawData() from external threads. Without ffmpeg_mutex_ the unique_ptr
+    // could be torn between operator-> dispatch and the new make_unique<>.
+    std::mutex ffmpeg_mutex_;
     std::unique_ptr<core::FFmpegProcess> ffmpeg_;
     
     // Per-instance prune timer (previously was a buggy static local)

@@ -339,6 +339,86 @@ bool StorageManager::uploadFile(const std::string& local_path, const std::string
     return true;
 }
 
+// Header callback: scrape `Content-Range: bytes <start>-<end>/<total>` and
+// stash the parsed total into the long long pointed to by userdata.
+static size_t curlContentRangeHeaderCb(char* buffer, size_t size, size_t nitems, void* userdata) {
+    const size_t total = size * nitems;
+    auto* total_size_out = static_cast<long long*>(userdata);
+    constexpr const char* kPrefix = "content-range:";
+    constexpr size_t kPrefixLen = 14;
+    if (total > kPrefixLen) {
+        // Header names are case-insensitive — compare lower.
+        bool match = true;
+        for (size_t i = 0; i < kPrefixLen; ++i) {
+            char c = buffer[i];
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+            if (c != kPrefix[i]) { match = false; break; }
+        }
+        if (match) {
+            std::string_view line(buffer + kPrefixLen, total - kPrefixLen);
+            // Format: " bytes start-end/total\r\n"  OR  " bytes */total\r\n"
+            const auto slash = line.find('/');
+            if (slash != std::string_view::npos) {
+                auto rest = line.substr(slash + 1);
+                long long parsed = 0;
+                bool ok = !rest.empty();
+                for (char c : rest) {
+                    if (c == '\r' || c == '\n' || c == ' ' || c == '\t') break;
+                    if (c < '0' || c > '9') { ok = false; break; }
+                    parsed = parsed * 10 + (c - '0');
+                }
+                if (ok) *total_size_out = parsed;
+            }
+        }
+    }
+    return total;
+}
+
+StorageManager::RangeResult
+StorageManager::getObjectRange(const std::string& object_key, size_t start, size_t length) {
+    RangeResult out;
+    if (length == 0) return out;
+    if (driver_ != "minio" || !initialized_.load() || !storage_ready_.load()) return out;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return out;
+
+    std::string uri = "/" + config_.bucket_recordings + "/" + object_key;
+    std::string url = config_.endpoint + uri;
+    std::string range_value = "bytes=" + std::to_string(start) + "-" +
+                              std::to_string(start + length - 1);
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.data);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, curlContentRangeHeaderCb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &out.total_size);
+    // Cap how much body we'll accept even if the server ignores Range and
+    // returns 200 with the full object — protects against a misconfigured
+    // backend forcing a multi-GB load into memory.
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)(length + 1024 * 1024));
+
+    struct curl_slist* headers = nullptr;
+    // Range header is NOT in our SignedHeaders list — that's intentional and
+    // matches the simplified signing used elsewhere in this file. MinIO does
+    // not enforce strict-signed-Range, so the request is accepted and the
+    // server slices the object server-side.
+    headers = curl_slist_append(headers, ("Range: " + range_value).c_str());
+    applySigV4(curl, headers, "GET", uri, config_.endpoint,
+               config_.access_key, config_.secret_key);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        out.data.clear();
+    }
+    return out;
+}
+
 std::vector<char> StorageManager::getObject(const std::string& object_key) {
     std::vector<char> data;
     if (driver_ != "minio" || !initialized_.load() || !storage_ready_.load()) return data;

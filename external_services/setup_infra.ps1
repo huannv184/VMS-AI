@@ -27,7 +27,7 @@ $pgBin = Join-Path $pgDir "bin"
 $initDb = Join-Path $pgBin "initdb.exe"
 if (-not (Test-Path (Join-Path $pgData "PG_VERSION"))) {
     Write-Host "Initializing PostgreSQL database cluster..." -ForegroundColor Yellow
-    & $initDb -D $pgData -U postgres --auth-local=trust --auth-host=trust
+    & $initDb -D $pgData -U postgres --auth-local=md5 --auth-host=md5
 }
 
 # 3. Download MediaMTX (RTSP/WebRTC Server)
@@ -56,9 +56,10 @@ Write-Host "Starting PostgreSQL..." -ForegroundColor Green
 Start-Process -FilePath (Join-Path `$pgBin "pg_ctl.exe") -ArgumentList "start -D `"`$pgData`"" -NoNewWindow
 
 Write-Host "Starting MinIO..." -ForegroundColor Green
-# Default credentials: minioadmin / minioadmin
-`$env:MINIO_ROOT_USER = "minioadmin"
-`$env:MINIO_ROOT_PASSWORD = "minioadmin"
+if (-not `$env:MINIO_ROOT_USER -or -not `$env:MINIO_ROOT_PASSWORD) {
+    Write-Host "ERROR: Set MINIO_ROOT_USER and MINIO_ROOT_PASSWORD before running this script." -ForegroundColor Red
+    exit 1
+}
 Start-Process -FilePath `$minioExe -ArgumentList "server `"`$minioData`" --console-address :9001" -NoNewWindow
 
 Write-Host "Starting MediaMTX..." -ForegroundColor Green

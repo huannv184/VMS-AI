@@ -41,6 +41,7 @@ private:
     std::deque<VideoPacket> buffer_;
     mutable std::mutex mutex_;
     size_t max_duration_ms_;
+    size_t total_bytes_{0};
 };
 
 } // namespace recording

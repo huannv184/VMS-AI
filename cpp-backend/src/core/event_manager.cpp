@@ -6,11 +6,14 @@
 #include <thread>
 #include <fstream>
 #include <filesystem>
+#include <atomic>
+#include <algorithm>
 #include <nlohmann/json.hpp>
 #include "database/db_manager.h"
 #include "core/alert_manager.h"
 #include "events/rule_engine.h"
 #include "events/event_types.h"
+#include "streaming/camera_stream_manager_qt.h"
 
 namespace vms {
 namespace core {
@@ -37,55 +40,104 @@ bool EventManager::createEvent(const Event& event) {
         return false;
     }
 
-    bool result = event_repo_->insertEvent(event);
+    // Ensure every event has a unique ID before insertion.
+    // Callers that omit event.id would otherwise insert with id="" causing all
+    // subsequent events to be silently dropped by INSERT OR IGNORE / ON CONFLICT.
+    Event ev = event;
+    if (ev.id.empty()) {
+        ev.id = generateEventId();
+    }
+
+    bool result = event_repo_->insertEvent(ev);
 
     if (result) {
-        LOG_DEBUG("Event created: {}", event.id);
-        
-        // --- Milestone 6: Multi-Rule Alert Dispatching ---
+        LOG_DEBUG("Event created: {}", ev.id);
+
         try {
-            vms::core::AlertManager::getInstance().processEvent(event);
+            nlohmann::json ws_payload;
+            ws_payload["type"]       = "alert";
+            ws_payload["event_type"] = ev.event_type;
+            ws_payload["id"]         = ev.id;
+            ws_payload["camera_id"]  = ev.camera_id;
+            ws_payload["timestamp"]  = ev.timestamp;
+            ws_payload["description"]= ev.description;
+            ws_payload["severity"]   = ev.severity;
+            ws_payload["snapshot_url"] = ev.snapshot_path;
+
+            if (!ev.metadata_json.empty()) {
+                try {
+                    auto meta = nlohmann::json::parse(ev.metadata_json);
+                    if (meta.contains("confidence")) ws_payload["confidence"] = meta["confidence"];
+                    if (meta.contains("bbox"))       ws_payload["bbox"]       = meta["bbox"];
+                } catch (...) {}
+            }
+
+            auto& ws = vms::streaming::CameraStreamManager::getInstance();
+            if (ev.camera_id > 0) {
+                ws.broadcastEvent(ev.camera_id, ws_payload);
+            }
+            ws.broadcastEvent(0, ws_payload);
+        } catch (const std::exception& e) {
+            LOG_THROTTLED_ERROR(5000, "EventManager: WS broadcast failed: {}", e.what());
+        }
+
+        try {
+            vms::core::AlertManager::getInstance().processEvent(ev);
         } catch (const std::exception& e) {
             LOG_ERROR("EventManager: AlertManager failed to process event: {}", e.what());
         }
 
-        // --- Execute Advanced Rule Engine ---
         try {
+            static std::atomic<uint64_t> raw_event_id_counter{1};
+
             vms::events::RawEvent raw;
-            raw.event_id = std::hash<std::string>{}(event.id);
-            raw.camera_id = event.camera_id;
-            
-            // Map event type
-            std::string type_lower = event.event_type;
-            std::transform(type_lower.begin(), type_lower.end(), type_lower.begin(), ::tolower);
-            if (type_lower.find("face") != std::string::npos) {
-                raw.type = vms::events::EventType::FACE_RECOGNIZED;
-            } else if (type_lower == "person_detected" || type_lower == "intrusion") {
-                raw.type = vms::events::EventType::INTRUSION;
-            } else if (type_lower == "loitering") {
-                raw.type = vms::events::EventType::LOITERING;
-            } else if (type_lower == "ppe_violation" || type_lower == "ppe") {
-                raw.type = vms::events::EventType::PPE_VIOLATION;
-            } else {
-                raw.type = vms::events::EventType::UNKNOWN;
-            }
-            
+            raw.event_id = raw_event_id_counter.fetch_add(1, std::memory_order_relaxed);
+            raw.camera_id = ev.camera_id;
+
+            std::string type_upper = ev.event_type;
+            std::transform(type_upper.begin(), type_upper.end(), type_upper.begin(), ::toupper);
+            raw.type = vms::events::stringToEventType(type_upper);
+
             raw.timestamp = std::chrono::system_clock::now();
-            raw.severity = vms::events::EventSeverity::MEDIUM; // default
+            raw.severity = vms::events::EventSeverity::MEDIUM;
             raw.confidence = 1.0f;
-            
-            // Extract confidence from metadata
-            if (!event.metadata_json.empty()) {
+
+            // BUG-6 FIX: populate object_class / track_id / zone_id / bbox / world_position
+            // from metadata so RuleEngine condition types OBJECT/ZONE/CAMERA/CONFIDENCE
+            // can actually filter. Previously these stayed at defaults → conditions
+            // referencing them never matched → AI rules silently no-oped.
+            if (!ev.metadata_json.empty()) {
                 try {
-                    auto meta = nlohmann::json::parse(event.metadata_json);
-                    if (meta.contains("confidence")) {
+                    auto meta = nlohmann::json::parse(ev.metadata_json);
+                    raw.metadata = meta;
+                    if (meta.contains("confidence") && meta["confidence"].is_number()) {
                         raw.confidence = meta["confidence"].get<float>();
+                    }
+                    if (meta.contains("severity") && meta["severity"].is_string()) {
+                        raw.severity = vms::events::stringToEventSeverity(meta["severity"].get<std::string>());
+                    }
+                    if (meta.contains("type") && meta["type"].is_string()) {
+                        raw.object_class = meta["type"].get<std::string>();
+                    } else if (meta.contains("class_name") && meta["class_name"].is_string()) {
+                        raw.object_class = meta["class_name"].get<std::string>();
+                    }
+                    if (meta.contains("track_id") && meta["track_id"].is_number_integer()) {
+                        raw.track_id = meta["track_id"].get<int>();
+                    }
+                    if (meta.contains("zone_id") && meta["zone_id"].is_number_integer()) {
+                        raw.zone_id = meta["zone_id"].get<int>();
+                    }
+                    if (meta.contains("bbox") && meta["bbox"].is_array() && meta["bbox"].size() >= 4) {
+                        int x1 = meta["bbox"][0].get<int>();
+                        int y1 = meta["bbox"][1].get<int>();
+                        int x2 = meta["bbox"][2].get<int>();
+                        int y2 = meta["bbox"][3].get<int>();
+                        raw.bbox = cv::Rect(x1, y1, std::max(0, x2 - x1), std::max(0, y2 - y1));
                     }
                 } catch(...) {}
             }
-            
-            raw.snapshot_path = event.snapshot_path;
-            
+
+            raw.snapshot_path = ev.snapshot_path;
             vms::events::RuleEngine::getInstance().evaluateEvent(raw);
         } catch (const std::exception& e) {
             LOG_ERROR("EventManager: RuleEngine failed to evaluate event: {}", e.what());
@@ -93,7 +145,7 @@ bool EventManager::createEvent(const Event& event) {
     } else {
         LOG_ERROR("Failed to create event");
     }
-    
+
     return result;
 }
 

@@ -107,48 +107,167 @@ ZoneManager& ZoneManager::getInstance() {
     return instance;
 }
 
-bool ZoneManager::addZone(const Zone& zone) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (zones_.find(zone.zone_id) != zones_.end()) {
-        LOG_WARN("[ZoneManager] Zone {} already exists", zone.zone_id);
-        return false;
+// ── DB helpers ────────────────────────────────────────────────────────────────
+
+static void dbUpsertZone(const Zone& zone) {
+    auto& db_mgr = vms::database::DbManager::getInstance();
+    QSqlDatabase db = db_mgr.getThreadConnection();
+    if (!db.isOpen()) return;
+
+    nlohmann::json poly = nlohmann::json::array();
+    for (const auto& pt : zone.polygon)
+        poly.push_back({{"x", pt.x}, {"y", pt.y}});
+
+    nlohmann::json cam_ids = nlohmann::json::array();
+    for (int cid : zone.camera_ids) cam_ids.push_back(cid);
+
+    // Dialect-aware upsert. SQLite uses INSERT OR REPLACE; PostgreSQL needs
+    // an explicit ON CONFLICT DO UPDATE clause. strftime('%s','now') is
+    // SQLite-only, so we route through DbManager::sqlNowEpoch() for the
+    // current-epoch expression.
+    const std::string now_expr = db_mgr.sqlNowEpoch();
+    QSqlQuery q(db);
+    if (db_mgr.isPostgres()) {
+        q.prepare(QString::fromStdString(
+            "INSERT INTO zones "
+            "(id, name, type, description, polygon_json, camera_ids_json, "
+            " max_occupancy, allow_loitering, loitering_threshold_sec, "
+            " enable_alerts, max_alerts_per_minute, metadata_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, " + now_expr + ") "
+            "ON CONFLICT (id) DO UPDATE SET "
+            " name=EXCLUDED.name, type=EXCLUDED.type, description=EXCLUDED.description, "
+            " polygon_json=EXCLUDED.polygon_json, camera_ids_json=EXCLUDED.camera_ids_json, "
+            " max_occupancy=EXCLUDED.max_occupancy, allow_loitering=EXCLUDED.allow_loitering, "
+            " loitering_threshold_sec=EXCLUDED.loitering_threshold_sec, "
+            " enable_alerts=EXCLUDED.enable_alerts, "
+            " max_alerts_per_minute=EXCLUDED.max_alerts_per_minute, "
+            " metadata_json=EXCLUDED.metadata_json, updated_at=EXCLUDED.updated_at"
+        ));
+    } else {
+        q.prepare(QString::fromStdString(
+            "INSERT OR REPLACE INTO zones "
+            "(id, name, type, description, polygon_json, camera_ids_json, "
+            " max_occupancy, allow_loitering, loitering_threshold_sec, "
+            " enable_alerts, max_alerts_per_minute, metadata_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, " + now_expr + ")"
+        ));
     }
-    
-    zones_[zone.zone_id] = zone;
-    zone_occupancy_[zone.zone_id] = 0;
-    
+    q.bindValue(0,  zone.zone_id);
+    q.bindValue(1,  QString::fromStdString(zone.name));
+    q.bindValue(2,  QString::fromStdString(zone.type));
+    q.bindValue(3,  QString::fromStdString(zone.description));
+    q.bindValue(4,  QString::fromStdString(poly.dump()));
+    q.bindValue(5,  QString::fromStdString(cam_ids.dump()));
+    q.bindValue(6,  zone.max_occupancy);
+    q.bindValue(7,  zone.allow_loitering ? 1 : 0);
+    q.bindValue(8,  zone.loitering_threshold_sec);
+    q.bindValue(9,  zone.enable_alerts ? 1 : 0);
+    q.bindValue(10, zone.max_alerts_per_minute);
+    q.bindValue(11, QString::fromStdString(zone.metadata.dump()));
+    if (!q.exec())
+        LOG_WARN("[ZoneManager] DB upsert failed for zone {}: {}", zone.zone_id,
+                 q.lastError().text().toStdString());
+}
+
+static void dbDeleteZone(int zone_id) {
+    QSqlDatabase db = vms::database::DbManager::getInstance().getThreadConnection();
+    if (!db.isOpen()) return;
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM zones WHERE id = ?");
+    q.bindValue(0, zone_id);
+    q.exec();
+}
+
+void ZoneManager::loadFromDb() {
+    QSqlDatabase db = vms::database::DbManager::getInstance().getThreadConnection();
+    if (!db.isOpen()) return;
+
+    QSqlQuery q(db);
+    if (!q.exec("SELECT id, name, type, description, polygon_json, camera_ids_json, "
+                "max_occupancy, allow_loitering, loitering_threshold_sec, "
+                "enable_alerts, max_alerts_per_minute, metadata_json FROM zones")) {
+        LOG_WARN("[ZoneManager] loadFromDb query failed: {}", q.lastError().text().toStdString());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Reset dependent maps so loadFromDb is idempotent — calling it again
+    // after zones are deleted from DB would otherwise leak occupancy entries.
+    zones_.clear();
+    zone_occupancy_.clear();
+    alert_rates_.clear();
+    int count = 0;
+    while (q.next()) {
+        Zone z;
+        z.zone_id = q.value(0).toInt();
+        z.name    = q.value(1).toString().toStdString();
+        z.type    = q.value(2).toString().toStdString();
+        z.description = q.value(3).toString().toStdString();
+        try {
+            auto poly = nlohmann::json::parse(q.value(4).toString().toStdString());
+            for (const auto& pt : poly)
+                z.polygon.push_back({pt.value("x", 0.0f), pt.value("y", 0.0f)});
+        } catch (...) {}
+        try {
+            auto cids = nlohmann::json::parse(q.value(5).toString().toStdString());
+            for (const auto& c : cids) z.camera_ids.push_back(c.get<int>());
+        } catch (...) {}
+        z.max_occupancy          = q.value(6).toInt();
+        z.allow_loitering        = q.value(7).toInt() != 0;
+        z.loitering_threshold_sec= q.value(8).toInt();
+        z.enable_alerts          = q.value(9).toInt() != 0;
+        z.max_alerts_per_minute  = q.value(10).toInt();
+        try { z.metadata = nlohmann::json::parse(q.value(11).toString().toStdString()); } catch (...) {}
+
+        zones_[z.zone_id] = z;
+        zone_occupancy_[z.zone_id] = 0;
+        ++count;
+    }
+    LOG_INFO("[ZoneManager] Loaded {} zones from DB", count);
+}
+
+// ── Public mutators ───────────────────────────────────────────────────────────
+
+bool ZoneManager::addZone(const Zone& zone) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Allow re-adding same zone_id (overwrite) so UI saves are idempotent
+        zones_[zone.zone_id] = zone;
+        zone_occupancy_.emplace(zone.zone_id, 0);
+    }
+    dbUpsertZone(zone);
     LOG_INFO("[ZoneManager] Added zone {}: {}", zone.zone_id, zone.name);
     return true;
 }
 
 bool ZoneManager::removeZone(int zone_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = zones_.find(zone_id);
-    if (it == zones_.end()) {
-        LOG_WARN("[ZoneManager] Zone {} not found", zone_id);
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = zones_.find(zone_id);
+        if (it == zones_.end()) {
+            LOG_WARN("[ZoneManager] Zone {} not found", zone_id);
+            return false;
+        }
+        zones_.erase(it);
+        zone_occupancy_.erase(zone_id);
+        alert_rates_.erase(zone_id);
     }
-    
-    zones_.erase(it);
-    zone_occupancy_.erase(zone_id);
-    alert_rates_.erase(zone_id);
-    
+    dbDeleteZone(zone_id);
     LOG_INFO("[ZoneManager] Removed zone {}", zone_id);
     return true;
 }
 
 bool ZoneManager::updateZone(const Zone& zone) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = zones_.find(zone.zone_id);
-    if (it == zones_.end()) {
-        LOG_WARN("[ZoneManager] Zone {} not found for update", zone.zone_id);
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = zones_.find(zone.zone_id);
+        if (it == zones_.end()) {
+            LOG_WARN("[ZoneManager] Zone {} not found for update", zone.zone_id);
+            return false;
+        }
+        it->second = zone;
     }
-    
-    it->second = zone;
+    dbUpsertZone(zone);
     LOG_INFO("[ZoneManager] Updated zone {}", zone.zone_id);
     return true;
 }
@@ -307,44 +426,61 @@ void ZoneManager::recordAlert(int zone_id) {
 
 nlohmann::json ZoneManager::getZoneStatistics(int zone_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    nlohmann::json stats;
-    
+
     auto zone_it = zones_.find(zone_id);
     if (zone_it == zones_.end()) {
+        nlohmann::json stats;
         stats["error"] = "Zone not found";
         return stats;
     }
-    
+
     auto& zone = zone_it->second;
-    
+
+    nlohmann::json stats;
     stats["zone_id"] = zone_id;
     stats["name"] = zone.name;
     stats["type"] = zone.type;
-    stats["current_occupancy"] = getCurrentOccupancy(zone_id);
+
+    // BUG-4 FIX: Trực tiếp đọc map thay vì gọi getCurrentOccupancy()
+    // (getCurrentOccupancy cố lock mutex_ đang được giữ → deadlock)
+    int occ = zone_occupancy_.count(zone_id) ? zone_occupancy_.at(zone_id) : 0;
+    stats["current_occupancy"] = occ;
     stats["max_occupancy"] = zone.max_occupancy;
-    
+
     if (zone.max_occupancy > 0) {
-        stats["occupancy_percentage"] = 
-            (getCurrentOccupancy(zone_id) * 100.0f) / zone.max_occupancy;
+        stats["occupancy_percentage"] = (occ * 100.0f) / zone.max_occupancy;
     }
-    
+
     // Recent alerts
     auto& rate_info = alert_rates_[zone_id];
     stats["alerts_last_minute"] = rate_info.recent_alerts.size();
-    
+
     return stats;
 }
 
 nlohmann::json ZoneManager::getAllStatistics() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     nlohmann::json all_stats = nlohmann::json::array();
-    
+
+    // BUG-4 FIX: build stats trực tiếp, không gọi getZoneStatistics()
+    // (gọi getZoneStatistics() sẽ cố lấy lock mutex_ lần nữa → deadlock)
     for (const auto& [zone_id, zone] : zones_) {
-        all_stats.push_back(getZoneStatistics(zone_id));
+        int occ = zone_occupancy_.count(zone_id) ? zone_occupancy_.at(zone_id) : 0;
+        nlohmann::json s;
+        s["zone_id"] = zone_id;
+        s["name"] = zone.name;
+        s["type"] = zone.type;
+        s["current_occupancy"] = occ;
+        s["max_occupancy"] = zone.max_occupancy;
+        if (zone.max_occupancy > 0) {
+            s["occupancy_percentage"] = (occ * 100.0f) / zone.max_occupancy;
+        }
+        s["alerts_last_minute"] = alert_rates_.count(zone_id)
+            ? alert_rates_.at(zone_id).recent_alerts.size() : 0;
+        all_stats.push_back(s);
     }
-    
+
     return all_stats;
 }
 
@@ -371,7 +507,11 @@ bool ZoneManager::loadFromDatabase() {
     }
     
     zones_.clear();
-    
+    // BUG-14 FIX: also reset the dependent maps so they don't hold counters/
+    // alert history for zone_ids that no longer exist after reload.
+    zone_occupancy_.clear();
+    alert_rates_.clear();
+
     while (query.next()) {
         Zone z;
         z.zone_id = query.value(0).toInt();
@@ -489,6 +629,22 @@ bool ZoneManager::saveToDatabase() {
     
     db_mgr.commit();
     return true;
+}
+
+bool ZoneManager::pointInPolygon(const cv::Point2f& point,
+                                 const std::vector<cv::Point2f>& polygon) {
+    if (polygon.size() < 3) return false;
+    bool inside = false;
+    const int n = static_cast<int>(polygon.size());
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        if (((polygon[i].y > point.y) != (polygon[j].y > point.y)) &&
+            (point.x < (polygon[j].x - polygon[i].x) *
+                       (point.y - polygon[i].y) /
+                       (polygon[j].y - polygon[i].y) + polygon[i].x)) {
+            inside = !inside;
+        }
+    }
+    return inside;
 }
 
 } // namespace vms::events

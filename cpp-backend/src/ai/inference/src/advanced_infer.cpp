@@ -8,6 +8,8 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace inference {
 
@@ -129,9 +131,9 @@ std::vector<BBox> AdvancedInfer::detect(const cv::Mat& image) {
                 return {};
             }
             
+            // parseYOLOv8Output does NOT run NMS — applyNMS is the single
+            // place IoU suppression happens. Keep these as two distinct steps.
             detections = parseYOLOv8Output(output, config_.conf_threshold, config_.nms_threshold, image.cols, image.rows);
-            // detections = applyNMS(detections, config_.nms_threshold); // NMS is now inside if implied by usage? No, keeping applyNMS call just in case or remove if it's double.
-            // Wait, previous logic called applyNMS explicitly.
             detections = applyNMS(detections, config_.nms_threshold);
             
             detections.erase(
@@ -154,15 +156,36 @@ std::vector<BBox> AdvancedInfer::detect(const cv::Mat& image) {
 }
 
 cv::Mat AdvancedInfer::preprocessYOLO(const cv::Mat& image, int target_w, int target_h) {
+    // Letterbox: preserve aspect ratio + grey-pad to (target_w, target_h).
+    // YOLOv8/YOLO11 were trained with letterboxed inputs; plain cv::resize
+    // squashes 16:9 cameras into 1:1 → measurable accuracy regression
+    // (smaller mAP, more false negatives) on people/cars.
+    const float src_w = static_cast<float>(image.cols);
+    const float src_h = static_cast<float>(image.rows);
+    const float scale = std::min(target_w / src_w, target_h / src_h);
+
+    const int new_w = std::max(1, static_cast<int>(std::round(src_w * scale)));
+    const int new_h = std::max(1, static_cast<int>(std::round(src_h * scale)));
+    const int pad_x = (target_w - new_w) / 2;
+    const int pad_y = (target_h - new_h) / 2;
+
+    yolo_letterbox_scale_ = scale;
+    yolo_letterbox_pad_x_ = pad_x;
+    yolo_letterbox_pad_y_ = pad_y;
+
     cv::Mat resized;
-    cv::resize(image, resized, cv::Size(target_w, target_h));
-    
+    cv::resize(image, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_LINEAR);
+
+    // Grey 114 is the Ultralytics default fill colour
+    cv::Mat canvas(target_h, target_w, image.type(), cv::Scalar(114, 114, 114));
+    resized.copyTo(canvas(cv::Rect(pad_x, pad_y, new_w, new_h)));
+
     cv::Mat rgb;
-    cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
-    
+    cv::cvtColor(canvas, rgb, cv::COLOR_BGR2RGB);
+
     cv::Mat float_img;
     rgb.convertTo(float_img, CV_32FC3, 1.0 / 255.0);
-    
+
     return float_img;
 }
 
@@ -199,47 +222,162 @@ std::vector<BBox> AdvancedInfer::parseYOLOv8Output(
     const int num_predictions = 8400;
     const int output_dims = 84;
 
-    if (output.size() < num_predictions * output_dims) {
-        std::cerr << "[AdvancedInfer] Invalid output size: "
-                  << output.size() << std::endl;
+    // DIAG: log output size + max confidence once every 200 calls so we can verify
+    // the engine output matches the (1, 84, 8400) layout this parser assumes.
+    static std::atomic<int> diag_counter{0};
+    bool diag_now = (diag_counter.fetch_add(1) % 200 == 0);
+
+    if (output.size() < (size_t)(num_predictions * output_dims)) {
+        std::cerr << "[AdvancedInfer] Invalid output size: " << output.size()
+                  << " (expected >= " << (num_predictions * output_dims) << ")" << std::endl;
         return boxes;
     }
+    if (diag_now) {
+        std::cerr << "[AdvancedInfer] YOLO output size=" << output.size()
+                  << " (expected " << (num_predictions * output_dims) << ")"
+                  << " conf_thres=" << conf_thres << std::endl;
+    }
 
-    const float scale_x = static_cast<float>(orig_width) / config_.input_width;
-    const float scale_y = static_cast<float>(orig_height) / config_.input_height;
+    // Unscale through letterbox: (model_coord - pad) / scale → source coord.
+    // scale=0 fallback to old behaviour (e.g. inference path that bypassed preprocessYOLO).
+    const float lb_scale = (yolo_letterbox_scale_ > 0.0f) ? yolo_letterbox_scale_ : 1.0f;
+    const float lb_pad_x = static_cast<float>(yolo_letterbox_pad_x_);
+    const float lb_pad_y = static_cast<float>(yolo_letterbox_pad_y_);
 
     boxes.reserve(num_predictions / 10);
 
-    for (int i = 0; i < num_predictions; ++i) {
-        float cx = output[0 * num_predictions + i];
-        float cy = output[1 * num_predictions + i];
-        float w  = output[2 * num_predictions + i];
-        float h  = output[3 * num_predictions + i];
+    // YOLO output layout — Ultralytics exports YOLOv8/v11 to TensorRT in TWO
+    // possible shapes depending on exporter version:
+    //   - "channels-first" (1, 84, 8400) → output[c*8400 + i] = ch c of pred i
+    //   - "channels-last"  (1, 8400, 84) → output[i*84 + c]   = ch c of pred i
+    //
+    // Auto-detect on first frame: try both layouts, the one producing higher
+    // max class score is the correct one (the other layout reads cross-feature
+    // values which are uncorrelated noise, max around 0.05-0.2).
+    //
+    // Override: VMS_YOLO_OUTPUT_LAYOUT=channels_last|channels_first (default auto)
+    // Sigmoid: 2026-04-26 evidence shows our YOLO11 TRT engine emits POST-SIGMOID
+    // probabilities (max in [0.05, 0.87], a real object scores ~0.6-0.9, empty
+    // scene ~0.05). Re-applying sigmoid would push every anchor's max above 0.5,
+    // producing kept=8400/8400 false positives. So default OFF.
+    // Set VMS_YOLO_APPLY_SIGMOID=1 if a future engine ships raw logits instead.
+    enum class Layout { Auto, ChannelsFirst, ChannelsLast };
+    static const Layout layout_mode = []() {
+        const char* env = std::getenv("VMS_YOLO_OUTPUT_LAYOUT");
+        if (!env || !*env) return Layout::Auto;
+        std::string s(env);
+        if (s == "channels_last" || s == "last") return Layout::ChannelsLast;
+        if (s == "channels_first" || s == "first") return Layout::ChannelsFirst;
+        return Layout::Auto;
+    }();
+    static std::atomic<int> detected_layout{-1}; // -1=undecided, 0=first, 1=last
 
-        float best_conf = 0.0f;
+    static const bool apply_sigmoid = []() {
+        const char* env = std::getenv("VMS_YOLO_APPLY_SIGMOID");
+        if (!env || !*env) return false;  // engine output is already post-sigmoid
+        return std::atoi(env) != 0;
+    }();
+
+    auto sigmoid = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
+
+    // Auto-detect layout once: probe first prediction in both layouts and pick
+    // whichever produces a sane max class score (>= 0.3 raw). Falls through to
+    // ChannelsFirst if neither is clearly better.
+    int decided_layout = detected_layout.load(std::memory_order_relaxed);
+    if (decided_layout == -1) {
+        if (layout_mode == Layout::ChannelsFirst) {
+            decided_layout = 0;
+        } else if (layout_mode == Layout::ChannelsLast) {
+            decided_layout = 1;
+        } else {
+            // Probe both layouts. A correct layout reads class scores which
+            // must lie in either [0, 1] (sigmoid'd) or roughly [-10, 10]
+            // (raw logits). A WRONG layout reads coordinate channels which
+            // contain pixel values up to ~640 — instantly disqualifying.
+            //
+            // So: pick the layout whose max class score is in the SANE range.
+            // If both are sane, pick the higher one. If neither is sane,
+            // default to channels_first (Ultralytics' standard export).
+            float max_first = 0.0f, max_last = 0.0f;
+            for (int i = 0; i < num_predictions; ++i) {
+                for (int c = 0; c < num_classes; ++c) {
+                    float v_first = output[(4 + c) * num_predictions + i];
+                    float v_last  = output[i * output_dims + (4 + c)];
+                    if (v_first > max_first) max_first = v_first;
+                    if (v_last  > max_last)  max_last  = v_last;
+                }
+            }
+            const float SANE_MAX = 20.0f; // sigmoid'd <=1, logits typically <=10
+            const bool first_sane = max_first <= SANE_MAX;
+            const bool last_sane  = max_last  <= SANE_MAX;
+            const char* reason = "default";
+            if (first_sane && !last_sane) {
+                decided_layout = 0; reason = "channels_last reads coords (>20)";
+            } else if (last_sane && !first_sane) {
+                decided_layout = 1; reason = "channels_first reads coords (>20)";
+            } else if (first_sane && last_sane) {
+                decided_layout = (max_last > max_first) ? 1 : 0;
+                reason = "both sane, picked larger";
+            } else {
+                decided_layout = 0; reason = "neither sane, default channels_first";
+            }
+            std::cerr << "[AdvancedInfer] YOLO layout autodetect: "
+                      << "max_first=" << max_first << " max_last=" << max_last
+                      << " → using " << (decided_layout == 1 ? "channels_last" : "channels_first")
+                      << " (" << reason << ")" << std::endl;
+        }
+        detected_layout.store(decided_layout, std::memory_order_relaxed);
+    }
+    const bool channels_last = (decided_layout == 1);
+
+    float global_max_conf_raw = 0.0f;
+    int global_max_cls = -1;
+    float global_max_conf = 0.0f; // post-sigmoid value used for decisions
+
+    auto at = [&](int i, int c) -> float {
+        return channels_last ? output[i * output_dims + c]
+                              : output[c * num_predictions + i];
+    };
+
+    for (int i = 0; i < num_predictions; ++i) {
+        float cx = at(i, 0);
+        float cy = at(i, 1);
+        float w  = at(i, 2);
+        float h  = at(i, 3);
+
+        float best_conf_raw = 0.0f;
         int best_class = -1;
 
         for (int c = 0; c < num_classes; ++c) {
-            float conf = output[(4 + c) * num_predictions + i];
-            if (conf > best_conf) {
-                best_conf = conf;
+            float conf = at(i, 4 + c);
+            if (conf > best_conf_raw) {
+                best_conf_raw = conf;
                 best_class = c;
             }
         }
 
+        if (best_conf_raw > global_max_conf_raw) {
+            global_max_conf_raw = best_conf_raw;
+            global_max_cls = best_class;
+        }
+
+        float best_conf = apply_sigmoid ? sigmoid(best_conf_raw) : best_conf_raw;
+        if (best_conf > global_max_conf) global_max_conf = best_conf;
+
         if (best_conf < conf_thres)
             continue;
 
-        cx *= scale_x;
-        cy *= scale_y;
-        w  *= scale_x;
-        h  *= scale_y;
+        // Strip letterbox padding then divide by uniform scale.
+        cx = (cx - lb_pad_x) / lb_scale;
+        cy = (cy - lb_pad_y) / lb_scale;
+        w  /= lb_scale;
+        h  /= lb_scale;
 
         BBox box;
-        box.x1 = cx - w * 0.5f;
-        box.y1 = cy - h * 0.5f;
-        box.x2 = cx + w * 0.5f;
-        box.y2 = cy + h * 0.5f;
+        box.x1 = std::max(0.0f, cx - w * 0.5f);
+        box.y1 = std::max(0.0f, cy - h * 0.5f);
+        box.x2 = std::min(static_cast<float>(orig_width),  cx + w * 0.5f);
+        box.y2 = std::min(static_cast<float>(orig_height), cy + h * 0.5f);
         box.score = best_conf;
         box.class_id = best_class;
 
@@ -250,6 +388,15 @@ std::vector<BBox> AdvancedInfer::parseYOLOv8Output(
         }
 
         boxes.push_back(box);
+    }
+
+    if (diag_now) {
+        std::cerr << "[AdvancedInfer] YOLO layout=" << (channels_last ? "last" : "first")
+                  << " sigmoid=" << (apply_sigmoid ? "on" : "off")
+                  << " max_conf_raw=" << global_max_conf_raw
+                  << " max_conf=" << global_max_conf
+                  << " (cls=" << global_max_cls << ")"
+                  << " kept=" << boxes.size() << "/" << num_predictions << std::endl;
     }
 
     return boxes;
@@ -312,14 +459,25 @@ std::vector<BBox> AdvancedInfer::applyNMS(
 }
 
 // ============================================================================
-// FACE DETECTION (SCRFD) - Stub implementations
+// FACE DETECTION (SCRFD) — UNIMPLEMENTED on AdvancedInfer.
+//
+// Production face detection runs through `MultiModelInfer::detectFaces` (real
+// SCRFD parsing + post-processing in `multi_model_infer.cpp`). The methods
+// below were never wired and were previously `return {};` stubs — that's an
+// operational lie if a new caller ever picks them up: the empty result looks
+// indistinguishable from "no faces in frame". They now throw so any future
+// instantiation fails loud at first call.
 // ============================================================================
 
-std::vector<FaceDetection> AdvancedInfer::detectFaces(const cv::Mat& frame) {
-    if (frame.empty() || !scrfd_engine_ || !scrfd_engine_->isLoaded()) {
-        return {};
-    }
-    return {};
+[[noreturn]] static void faceMethodNotImplemented(const char* fn) {
+    throw std::logic_error(
+        std::string("AdvancedInfer::") + fn +
+        " is not implemented. Use MultiModelInfer for production face inference; "
+        "AdvancedInfer is for object/fire/plate detection only.");
+}
+
+std::vector<FaceDetection> AdvancedInfer::detectFaces(const cv::Mat& /*frame*/) {
+    faceMethodNotImplemented("detectFaces");
 }
 
 cv::Mat AdvancedInfer::preprocessSCRFD(const cv::Mat& image) {
@@ -337,25 +495,25 @@ cv::Mat AdvancedInfer::preprocessSCRFD(const cv::Mat& image) {
 }
 
 std::vector<FaceDetection> AdvancedInfer::parseSCRFDOutput(
-    const std::vector<std::vector<float>>& outputs,
-    int orig_width, int orig_height)
+    const std::vector<std::vector<float>>& /*outputs*/,
+    int /*orig_width*/, int /*orig_height*/)
 {
-    return {};
+    faceMethodNotImplemented("parseSCRFDOutput");
 }
 
 std::vector<FaceDetection> AdvancedInfer::nmsForFaces(
-    const std::vector<FaceDetection>& faces,
-    float threshold)
+    const std::vector<FaceDetection>& /*faces*/,
+    float /*threshold*/)
 {
-    return {};
+    faceMethodNotImplemented("nmsForFaces");
 }
 
 // ============================================================================
 // FACE RECOGNITION (ARCFACE)
 // ============================================================================
 
-std::vector<float> AdvancedInfer::extractFaceFeature(const cv::Mat& face_image) {
-    return {};
+std::vector<float> AdvancedInfer::extractFaceFeature(const cv::Mat& /*face_image*/) {
+    faceMethodNotImplemented("extractFaceFeature");
 }
 
 cv::Mat AdvancedInfer::preprocessArcFace(const cv::Mat& face_image) {
@@ -372,8 +530,8 @@ cv::Mat AdvancedInfer::preprocessArcFace(const cv::Mat& face_image) {
     return float_img;
 }
 
-std::string AdvancedInfer::recognizeFace(const cv::Mat& face_image, float* similarity) {
-    return "unknown";
+std::string AdvancedInfer::recognizeFace(const cv::Mat& /*face_image*/, float* /*similarity*/) {
+    faceMethodNotImplemented("recognizeFace");
 }
 
 cv::Mat AdvancedInfer::alignFace(const cv::Mat& image, const FaceDetection& face) {
@@ -457,14 +615,17 @@ size_t AdvancedInfer::getDatabaseSize() const {
     return face_database_.size();
 }
 
-bool AdvancedInfer::loadDatabase(const std::string& filepath) {
-    // Stub
-    return true;
+bool AdvancedInfer::loadDatabase(const std::string& /*filepath*/) {
+    // Database persistence not implemented on AdvancedInfer. Returning
+    // `false` (rather than throwing) so callers see a clean "could not load"
+    // signal — boot paths often try this opportunistically and we don't want
+    // to abort startup just because no file was provided. Pair with
+    // `saveDatabase` below.
+    return false;
 }
 
-bool AdvancedInfer::saveDatabase(const std::string& filepath) const {
-    // Stub
-    return true;
+bool AdvancedInfer::saveDatabase(const std::string& /*filepath*/) const {
+    return false;
 }
 
 // ============================================================================

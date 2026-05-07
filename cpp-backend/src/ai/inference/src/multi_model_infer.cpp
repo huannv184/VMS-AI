@@ -375,14 +375,33 @@ std::vector<FaceDetectionResult> MultiModelInfer::detectFaces(const cv::Mat& fra
     }
     
     try {
-        // Preprocess
+        // Preprocess — InsightFace SCRFD spec (matches scrfd/tools/scrfd.py):
+        //   blobFromImage(img, scale=1/128, size=(640,640), mean=(127.5,127.5,127.5), swapRB=True)
+        //   • Swap BGR → RGB
+        //   • (pixel - 127.5) / 128 → range ~[-1, 1]
+        //   • LETTERBOX (preserve aspect ratio) — quan trọng vì frame 640×360 (16:9)
+        //     resize thẳng lên 640×640 sẽ stretch theo trục dọc 1.78x → mặt người
+        //     bị méo elongated → SCRFD trained trên ảnh aspect-correct → score sụt
+        //     từ ~0.5 xuống ~0.15. Letterbox giữ tỷ lệ + pad đen.
+        const int net_size = config_.scrfd_input_size;
+        const float scale_letterbox = std::min((float)net_size / frame.cols,
+                                               (float)net_size / frame.rows);
+        const int new_w = static_cast<int>(std::round(frame.cols * scale_letterbox));
+        const int new_h = static_cast<int>(std::round(frame.rows * scale_letterbox));
+        const int pad_x = (net_size - new_w) / 2;
+        const int pad_y = (net_size - new_h) / 2;
+
         cv::Mat resized;
-        cv::resize(frame, resized, cv::Size(config_.scrfd_input_size, config_.scrfd_input_size));
-        
+        cv::resize(frame, resized, cv::Size(new_w, new_h));
+
+        // Pad về 640×640 với value=0 (sau normalize sẽ ~ -1.0 vùng pad)
+        cv::Mat letterboxed = cv::Mat::zeros(net_size, net_size, frame.type());
+        resized.copyTo(letterboxed(cv::Rect(pad_x, pad_y, new_w, new_h)));
+
         cv::Mat rgb;
-        cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
-        rgb.convertTo(rgb, CV_32F, 1.0 / 255.0);  // [0, 1]
-        
+        cv::cvtColor(letterboxed, rgb, cv::COLOR_BGR2RGB);
+        rgb.convertTo(rgb, CV_32F, 1.0 / 128.0, -127.5 / 128.0);
+
         // Convert to CHW
         std::vector<float> input_tensor(1 * 3 * config_.scrfd_input_size * config_.scrfd_input_size);
         std::vector<cv::Mat> channels(3);
@@ -410,9 +429,10 @@ std::vector<FaceDetectionResult> MultiModelInfer::detectFaces(const cv::Mat& fra
         // Parse outputs
         const std::vector<int> strides = {8, 16, 32};
         const int input_size = config_.scrfd_input_size;
-        
-        float scale_x = static_cast<float>(frame.cols) / input_size;
-        float scale_y = static_cast<float>(frame.rows) / input_size;
+
+        // Letterbox unscale: bbox trong tọa độ 640×640 padded → bỏ padding rồi
+        // chia scale_letterbox để về tọa độ frame gốc.
+        const float inv_scale = 1.0f / scale_letterbox;
         float detection_threshold = config_.scrfd_conf_threshold;
         
         // Debug: Log output sizes
@@ -471,29 +491,39 @@ std::vector<FaceDetectionResult> MultiModelInfer::detectFaces(const cv::Mat& fra
                 float cx = (anchor_x + 0.5f) * stride;
                 float cy = (anchor_y + 0.5f) * stride;
                 
-                // Decode bbox - use odd channels (1,3,5,7)
+                // Decode bbox: channels==8 means DFL regression (reg_max=1 → 2 bins per side)
+                // Layout per anchor: [l0,l1, t0,t1, r0,r1, b0,b1]
+                // Expected distance = softmax(v0,v1) · [0,stride] = exp(v1)/(exp(v0)+exp(v1)) * stride
                 float x1, y1, x2, y2;
-                
+
+                auto dfl_dist = [](float v0, float v1, float stride_val) -> float {
+                    float max_v = (v0 > v1) ? v0 : v1;
+                    float e0 = std::exp(v0 - max_v);
+                    float e1 = std::exp(v1 - max_v);
+                    return (e1 / (e0 + e1)) * stride_val;
+                };
+
                 if (bbox_channels == 8) {
-                    float dist_l = bboxes[i * 8 + 1] * stride;
-                    float dist_t = bboxes[i * 8 + 3] * stride;
-                    float dist_r = bboxes[i * 8 + 5] * stride;
-                    float dist_b = bboxes[i * 8 + 7] * stride;
-                    
-                    x1 = (cx - dist_l) * scale_x;
-                    y1 = (cy - dist_t) * scale_y;
-                    x2 = (cx + dist_r) * scale_x;
-                    y2 = (cy + dist_b) * scale_y;
+                    float dist_l = dfl_dist(bboxes[i * 8 + 0], bboxes[i * 8 + 1], stride);
+                    float dist_t = dfl_dist(bboxes[i * 8 + 2], bboxes[i * 8 + 3], stride);
+                    float dist_r = dfl_dist(bboxes[i * 8 + 4], bboxes[i * 8 + 5], stride);
+                    float dist_b = dfl_dist(bboxes[i * 8 + 6], bboxes[i * 8 + 7], stride);
+
+                    // Toạ độ trong ảnh letterbox 640×640 → trừ pad → chia scale
+                    x1 = (cx - dist_l - pad_x) * inv_scale;
+                    y1 = (cy - dist_t - pad_y) * inv_scale;
+                    x2 = (cx + dist_r - pad_x) * inv_scale;
+                    y2 = (cy + dist_b - pad_y) * inv_scale;
                 } else {
                     float dist_l = bboxes[i * 4 + 0] * stride;
                     float dist_t = bboxes[i * 4 + 1] * stride;
                     float dist_r = bboxes[i * 4 + 2] * stride;
                     float dist_b = bboxes[i * 4 + 3] * stride;
-                    
-                    x1 = (cx - dist_l) * scale_x;
-                    y1 = (cy - dist_t) * scale_y;
-                    x2 = (cx + dist_r) * scale_x;
-                    y2 = (cy + dist_b) * scale_y;
+
+                    x1 = (cx - dist_l - pad_x) * inv_scale;
+                    y1 = (cy - dist_t - pad_y) * inv_scale;
+                    x2 = (cx + dist_r - pad_x) * inv_scale;
+                    y2 = (cy + dist_b - pad_y) * inv_scale;
                 }
                 
                 // Clamp
@@ -504,16 +534,19 @@ std::vector<FaceDetectionResult> MultiModelInfer::detectFaces(const cv::Mat& fra
                 
                 if (x2 <= x1 || y2 <= y1) continue;
                 
-                // Size filter
+                // Size filter — siết chặt để loại false positive trên texture
                 float width = x2 - x1;
                 float height = y2 - y1;
                 float area = width * height;
                 float frame_area = static_cast<float>(frame.cols * frame.rows);
-                
-                if (area < frame_area * 0.0005f || area > frame_area * 0.95f) continue;
-                
+
+                // Min 16×16 = 256px (face dưới mức này không reliable cho ArcFace).
+                if (area < 256.0f || area > frame_area * 0.7f) continue;
+
+                // Real face: aspect ~ 0.6-1.4 (taller than wide, gần vuông).
+                // Cũ (0.2-5.0) cho phép face dài như cột đèn → false positive.
                 float aspect_ratio = width / height;
-                if (aspect_ratio < 0.2f || aspect_ratio > 5.0f) continue;
+                if (aspect_ratio < 0.55f || aspect_ratio > 1.6f) continue;
                 
                 FaceDetectionResult face;
                 face.x1 = x1;
@@ -522,15 +555,15 @@ std::vector<FaceDetectionResult> MultiModelInfer::detectFaces(const cv::Mat& fra
                 face.y2 = y2;
                 face.confidence = score;
                 
-                // Parse landmarks
+                // Parse landmarks (also unscale through letterbox)
                 if (landmark_channels == 20) {
                     for (int j = 0; j < 5; ++j) {
                         float lm_x = landmarks[i * 20 + j * 4 + 0];
                         float lm_y = landmarks[i * 20 + j * 4 + 1];
-                        
-                        lm_x = (cx + lm_x * stride) * scale_x;
-                        lm_y = (cy + lm_y * stride) * scale_y;
-                        
+
+                        lm_x = (cx + lm_x * stride - pad_x) * inv_scale;
+                        lm_y = (cy + lm_y * stride - pad_y) * inv_scale;
+
                         face.landmarks.points[j * 2] = lm_x;
                         face.landmarks.points[j * 2 + 1] = lm_y;
                     }
@@ -538,10 +571,10 @@ std::vector<FaceDetectionResult> MultiModelInfer::detectFaces(const cv::Mat& fra
                     for (int j = 0; j < 5; ++j) {
                         float lm_x = landmarks[i * 10 + j * 2 + 0];
                         float lm_y = landmarks[i * 10 + j * 2 + 1];
-                        
-                        lm_x = (cx + lm_x * stride) * scale_x;
-                        lm_y = (cy + lm_y * stride) * scale_y;
-                        
+
+                        lm_x = (cx + lm_x * stride - pad_x) * inv_scale;
+                        lm_y = (cy + lm_y * stride - pad_y) * inv_scale;
+
                         face.landmarks.points[j * 2] = lm_x;
                         face.landmarks.points[j * 2 + 1] = lm_y;
                     }
@@ -669,7 +702,12 @@ void MultiModelInfer::matchFaces(std::vector<FaceDetectionResult>& faces) {
 }
 
 cv::Mat MultiModelInfer::alignFace(const cv::Mat& frame, const FaceDetectionResult& face) {
-    if (face.landmarks.points[0] < 0) {
+    // Check if landmarks are valid: all-zero means detection had no landmark output
+    bool landmarks_valid = false;
+    for (int lm_i = 0; lm_i < 10; lm_i++) {
+        if (face.landmarks.points[lm_i] != 0.0f) { landmarks_valid = true; break; }
+    }
+    if (!landmarks_valid) {
         // Fallback to simple crop if landmarks aren't valid
         int x1 = static_cast<int>(face.x1);
         int y1 = static_cast<int>(face.y1);

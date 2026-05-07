@@ -43,9 +43,6 @@ bool isDbIndependentApiPath(const std::string& path, bool auth_enabled) {
         path == "/api/cameras/discover" ||
         startsWith(path, "/api/cameras/discover/status/") ||
         startsWith(path, "/api/cameras/discover/results/") ||
-        path == "/api/scan/start" ||
-        startsWith(path, "/api/scan/status/") ||
-        startsWith(path, "/api/scan/results/") ||
         startsWith(path, "/api/snapshots") ||
         startsWith(path, "/api/reid/")) {
         return true;
@@ -105,9 +102,13 @@ void AuthMiddleware::before_handle(crow::request& req, crow::response& res, cont
     }
     
     // 1. Skip Public API Routes (keep this list minimal)
-    if (path == "/api/auth/login" || 
+    // BUG-C2 FIX: removed /api/events/fire-test — that endpoint persists a real
+    // event and broadcasts WS, RuleEngine, AlertRouter chains. Leaving it on the
+    // public allowlist let any unauthenticated client trigger fake alerts at will.
+    if (path == "/api/auth/login" ||
         path == "/api/auth/2fa/verify" ||
-        path == "/api/health") {  
+        path == "/api/health" ||
+        path == "/api/system/streaming-config") {  // PUBLIC: frontend cần trước khi login
         return;
     }
 
@@ -296,6 +297,24 @@ bool AuthMiddleware::validateToken(const std::string& token, vms::core::User& us
         
         int user_id = std::stoi(suffix.substr(0, dash_pos));
         std::string timestamp_str = suffix.substr(dash_pos + 1);
+        
+        // H2: Revalidate against DB — checks is_active and token_version.
+        vms::database::UserRepository repo2;
+        auto db_user = repo2.getUserById(user_id);
+        if (!db_user || !db_user->is_active) {
+            LOG_THROTTLED_WARN(5000, "Legacy token rejected: user {} is inactive or deleted", user_id);
+            return false;
+        }
+
+        // Legacy tokens don't carry a version, so we must assume they are version 0.
+        // If the DB version has been bumped, all legacy tokens are invalidated.
+        if (db_user->token_version != 0) {
+            LOG_THROTTLED_WARN(5000, "Legacy token rejected: session revoked for user {} "
+                               "(legacy tokens are invalidated when version > 0)", user_id);
+            return false;
+        }
+        
+        user_out = *db_user;
         
         // Validate token expiration (from config)
         long long token_ts = std::stoll(timestamp_str);

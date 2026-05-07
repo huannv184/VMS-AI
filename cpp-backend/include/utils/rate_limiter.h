@@ -91,6 +91,11 @@ public:
         recordSuccess("user:" + username);
     }
 
+    size_t getTrackedEntriesCount() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return entries_.size();
+    }
+
 private:
     RateLimiter() = default;
 
@@ -100,15 +105,21 @@ private:
     };
 
     void evictStale() {
-        // Evict entries that haven't been used in 24h to prevent unbounded map growth.
-        const auto cutoff = std::chrono::steady_clock::now() - std::chrono::hours(24);
+        auto now = std::chrono::steady_clock::now();
+        // Periodical cleanup: only every 10 minutes, and only if we have enough entries
+        if (now - last_eviction_ < std::chrono::minutes(10) && entries_.size() < 1000) {
+            return;
+        }
+
+        // Full cleanup: entries with no active lockout and no recent attempts
+        const auto cutoff = now - std::chrono::hours(24);
         for (auto it = entries_.begin(); it != entries_.end();) {
             const auto& e = it->second;
-            const bool idle = e.locked_until < cutoff &&
+            const bool idle = e.locked_until < now &&
                               (e.attempts.empty() || e.attempts.back() < cutoff);
             it = idle ? entries_.erase(it) : std::next(it);
         }
-        last_eviction_ = std::chrono::steady_clock::now();
+        last_eviction_ = now;
     }
 
     std::mutex mutex_;

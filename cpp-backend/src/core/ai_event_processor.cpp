@@ -1,6 +1,13 @@
 #include "core/ai_event_processor.h"
 #include "core/event_manager.h"
+#include <QByteArray>
+#include "core/attendance_tracker.h"
+#include "core/camera_pipeline_manager.h"
+#include "core/people_count_tracker.h"
 #include "core/roi_manager.h"
+#include "core/tracker_state_manager.h"
+#include "events/rule_engine.h"
+#include "events/event_types.h"
 #include "utils/logger.h"
 #include "utils/storage_manager.h"
 #include <filesystem>
@@ -12,12 +19,30 @@ namespace vms {
 namespace core {
 
 AiEventProcessor::AiEventProcessor() {
+    // Bounded worker pool drains the per-frame metadata queue. Workers are
+    // joined in the destructor so the singleton's mutexes and caches stay
+    // alive for the entire lifetime of any in-flight job.
+    event_workers_.reserve(MAX_EVENT_THREADS);
+    for (int i = 0; i < MAX_EVENT_THREADS; ++i) {
+        event_workers_.emplace_back(&AiEventProcessor::eventWorkerLoop, this);
+    }
     // Single background thread drains MinIO upload queue.
     // Decouples network I/O from the event-processing threads entirely.
     upload_worker_ = std::thread(&AiEventProcessor::uploadWorkerLoop, this);
 }
 
 AiEventProcessor::~AiEventProcessor() {
+    // Stop event workers first — they enqueue uploads, so they must drain
+    // before the upload worker is asked to stop, otherwise the last few
+    // snapshots would be silently dropped.
+    {
+        std::lock_guard<std::mutex> lk(event_queue_mutex_);
+        event_stop_ = true;
+    }
+    event_queue_cv_.notify_all();
+    for (auto& t : event_workers_) {
+        if (t.joinable()) t.join();
+    }
     {
         std::lock_guard<std::mutex> lk(upload_mutex_);
         upload_stop_ = true;
@@ -63,54 +88,85 @@ void AiEventProcessor::enqueueUpload(std::string local_path, std::string object_
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-void AiEventProcessor::processMetadata(int camera_id, const nlohmann::json& metadata, const std::vector<uchar>& jpeg_data) {
-    if (metadata.is_null() || !metadata.contains("objects") || metadata["objects"].empty() || jpeg_data.empty()) {
+void AiEventProcessor::processMetadata(int camera_id, const nlohmann::json& metadata, const cv::Mat& frame) {
+    if (metadata.is_null() || !metadata.contains("objects") || metadata["objects"].empty() || frame.empty()) {
         return;
     }
 
-    // Cap concurrent event threads. If all slots are busy, drop this batch
-    // rather than spawning an unbounded number of threads.
-    int prev = active_event_threads_.load(std::memory_order_acquire);
-    if (prev >= MAX_EVENT_THREADS) {
-        return; // system under load — skip this batch
-    }
-    if (!active_event_threads_.compare_exchange_strong(prev, prev + 1,
-                                                       std::memory_order_acq_rel)) {
-        return; // lost the race — another thread just filled a slot
-    }
+    // Resolve the frame timestamp once. Worker emits ms; if missing fall back
+    // to wall-clock so TrackerStateManager's GC still ticks.
+    int64_t ts_ms = metadata.value("timestamp_ms",
+                       metadata.value("timestamp",
+                           static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count())));
 
-    // Copy by value for thread safety. jpeg_data copy is ~10-40 KB — acceptable.
-    std::thread([this, camera_id, metadata, jpeg_data]() {
+    EventJob job;
+    job.camera_id = camera_id;
+    job.metadata  = metadata;
+    job.frame     = frame.clone(); // workers own their pixels independently of the pipeline cache
+    job.ts_ms     = ts_ms;
+
+    {
+        std::lock_guard<std::mutex> lk(event_queue_mutex_);
+        if (event_stop_) return; // shutting down — drop
+        if (event_queue_.size() >= static_cast<size_t>(MAX_EVENT_QUEUE)) {
+            // Bounded queue: drop oldest under load so newer state isn't starved
+            // by stale frames piling up. Same effective drop policy as the prior
+            // detached-thread cap, but without unbounded thread spawn.
+            event_queue_.pop();
+        }
+        event_queue_.push(std::move(job));
+    }
+    event_queue_cv_.notify_one();
+}
+
+void AiEventProcessor::eventWorkerLoop() {
+    while (true) {
+        EventJob job;
+        {
+            std::unique_lock<std::mutex> lk(event_queue_mutex_);
+            event_queue_cv_.wait(lk, [this] { return !event_queue_.empty() || event_stop_; });
+            if (event_stop_ && event_queue_.empty()) break;
+            job = std::move(event_queue_.front());
+            event_queue_.pop();
+        }
         try {
-            // Decode JPEG once for all objects in this frame — was decoded N times before.
-            cv::Mat frame = cv::imdecode(jpeg_data, cv::IMREAD_COLOR);
-
-            for (const auto& obj : metadata["objects"]) {
+            for (const auto& obj : job.metadata["objects"]) {
                 std::string type = obj.value("type", obj.value("class_name", ""));
-                int track_id = obj.value("track_id", -1);
                 int class_id = obj.value("class_id", -1);
 
                 if (class_id == 100 || type == "Face" || type == "face") {
-                    if (track_id != -1) {
-                        processFace(camera_id, obj, frame);
-                    }
+                    processFace(job.camera_id, obj, job.frame);
                 } else if (class_id == 0 || type == "person" || type == "Person") {
-                    processIntrusion(camera_id, obj, frame);
-                    processLineCrossing(camera_id, obj, frame);
+                    processIntrusion(job.camera_id, obj, job.frame);
                 }
             }
+            // Single tracker advance + line crossing pass per frame so the
+            // greedy IoU matching sees all person detections together.
+            processLineCrossings(job.camera_id, job.metadata, job.frame, job.ts_ms);
         } catch (const std::exception& e) {
             LOG_ERROR("AiEventProcessor: Failed to process metadata: {}", e.what());
         }
-        active_event_threads_.fetch_sub(1, std::memory_order_release);
-    }).detach();
+    }
 }
 
 // ── Per-event handlers ────────────────────────────────────────────────────────
 
 void AiEventProcessor::processFace(int camera_id, const nlohmann::json& obj, const cv::Mat& frame) {
     int track_id = obj.value("track_id", -1);
-    std::string key = std::to_string(camera_id) + ":" + std::to_string(track_id) + ":face";
+    std::string key;
+    if (track_id != -1) {
+        key = std::to_string(camera_id) + ":" + std::to_string(track_id) + ":face";
+    } else {
+        // Position-based cooldown key for unrecognized faces (50px grid quantization)
+        auto j_bbox = obj.value("bbox", nlohmann::json::array());
+        int cx = 0, cy = 0;
+        if (j_bbox.is_array() && j_bbox.size() >= 4) {
+            cx = (j_bbox[0].get<int>() + j_bbox[2].get<int>()) / 2;
+            cy = (j_bbox[1].get<int>() + j_bbox[3].get<int>()) / 2;
+        }
+        key = std::to_string(camera_id) + ":face:" + std::to_string(cx / 50) + ":" + std::to_string(cy / 50);
+    }
 
     if (isOnCooldown(key)) return;
 
@@ -121,9 +177,11 @@ void AiEventProcessor::processFace(int camera_id, const nlohmann::json& obj, con
     std::string snapshot_path = saveSnapshot(camera_id, crop);
 
     Event event;
+    event.id = EventManager::generateEventId();
     event.camera_id = camera_id;
     event.event_type = "FACE_RECOGNIZED";
     event.description = "Face detected with ID " + std::to_string(person_id);
+    event.snapshot_path = snapshot_path;
     event.timestamp = std::chrono::time_point_cast<std::chrono::seconds>(
         std::chrono::system_clock::now()).time_since_epoch().count();
 
@@ -133,21 +191,50 @@ void AiEventProcessor::processFace(int camera_id, const nlohmann::json& obj, con
     enhanced_meta["snapshot_url"] = snapshot_path;
     event.metadata_json = enhanced_meta.dump();
 
+    // EventManager::createEvent triggers RuleEngine::evaluateEvent internally
+    // (event_manager.cpp). Calling it again here would double every action:
+    // 2× snapshots, 2× clip recordings, 2× webhooks, 2× alert broadcasts.
     EventManager::getInstance().createEvent(event);
+    CameraPipelineManager::getInstance().triggerEventRecording(camera_id, event.id, 15, 5);
     setCooldown(key);
+
+    // AttendanceTracker only counts true recognitions (person_id from face DB > 0);
+    // Unknown faces (obj["person_id"] missing → -1) are dropped inside onFaceRecognized.
+    int recognized_pid = obj.value("person_id", -1);
+    if (recognized_pid > 0) {
+        AttendanceTracker::getInstance().onFaceRecognized(
+            camera_id, recognized_pid, static_cast<float>(confidence),
+            event.timestamp, snapshot_path);
+    }
+
     LOG_INFO("Face event: camera={} person_id={} conf={:.2f}", camera_id, person_id, confidence);
 }
 
 void AiEventProcessor::processIntrusion(int camera_id, const nlohmann::json& obj, const cv::Mat& frame) {
     int track_id = obj.value("track_id", -1);
-    std::string key = std::to_string(camera_id) + ":" + std::to_string(track_id) + ":person";
+    auto j_bbox = obj.value("bbox", nlohmann::json::array());
+
+    // Position-based cooldown when tracker is bypassed (track_id=-1) so that
+    // multiple persons in the same frame don't all share key `cam:-1:person`
+    // — the first person would otherwise lock out everyone for COOLDOWN_SECONDS.
+    // 50px grid is coarse enough for the same person stepping forward to keep
+    // the same key, fine enough to separate distinct persons in the frame.
+    std::string key;
+    if (track_id != -1) {
+        key = std::to_string(camera_id) + ":" + std::to_string(track_id) + ":person";
+    } else {
+        int cx = 0, cy = 0;
+        if (j_bbox.is_array() && j_bbox.size() >= 4) {
+            cx = (j_bbox[0].get<int>() + j_bbox[2].get<int>()) / 2;
+            cy = (j_bbox[1].get<int>() + j_bbox[3].get<int>()) / 2;
+        }
+        key = std::to_string(camera_id) + ":person:" + std::to_string(cx / 50) + ":" + std::to_string(cy / 50);
+    }
 
     if (isOnCooldown(key)) return;
 
     double confidence = obj.value("confidence", 0.0);
     if (confidence < 0.5) return;
-
-    auto j_bbox = obj.value("bbox", nlohmann::json::array());
 
     // ROI Filter Logic
     if (j_bbox.is_array() && j_bbox.size() >= 4) {
@@ -201,9 +288,11 @@ void AiEventProcessor::processIntrusion(int camera_id, const nlohmann::json& obj
     std::string snapshot_path = saveSnapshot(camera_id, crop);
 
     Event event;
+    event.id = EventManager::generateEventId();
     event.camera_id = camera_id;
-    event.event_type = "PERSON_DETECTED";
-    event.description = "Person detected";
+    event.event_type = "INTRUSION";
+    event.description = "Person detected in monitored area";
+    event.snapshot_path = snapshot_path;
     event.timestamp = std::chrono::time_point_cast<std::chrono::seconds>(
         std::chrono::system_clock::now()).time_since_epoch().count();
 
@@ -211,13 +300,81 @@ void AiEventProcessor::processIntrusion(int camera_id, const nlohmann::json& obj
     enhanced_meta["snapshot_url"] = snapshot_path;
     event.metadata_json = enhanced_meta.dump();
 
+    // EventManager::createEvent triggers RuleEngine internally — see processFace.
     EventManager::getInstance().createEvent(event);
+    CameraPipelineManager::getInstance().triggerEventRecording(camera_id, event.id, 20, 5);
     setCooldown(key);
+
     LOG_INFO("Person event: camera={} track={} conf={:.2f}", camera_id, track_id, confidence);
 }
 
-void AiEventProcessor::processLineCrossing(int camera_id, const nlohmann::json& obj, const cv::Mat& frame) {
-    // Reserved for future implementation
+void AiEventProcessor::processLineCrossings(int camera_id,
+                                            const nlohmann::json& metadata,
+                                            const cv::Mat& frame,
+                                            int64_t ts_ms) {
+    if (frame.empty() || !metadata.contains("objects")) return;
+
+    // Build DetectionInputs for person-class objects only. Face objects
+    // (class_id=100) carry no useful trajectory for occupancy counting.
+    std::vector<DetectionInput> dets;
+    dets.reserve(metadata["objects"].size());
+    for (const auto& obj : metadata["objects"]) {
+        const int class_id = obj.value("class_id", -1);
+        const std::string type = obj.value("type", obj.value("class_name", std::string{}));
+        if (class_id == 0 || type == "person" || type == "Person") {
+            dets.push_back(DetectionInput::fromJson(obj));
+        }
+    }
+    if (dets.empty()) return;
+
+    // Advance the per-camera tracker (greedy IoU). Tracker is thread-safe;
+    // multiple ai_event threads queued for the same camera serialize on the
+    // per-camera mutex inside the manager.
+    auto tracks = TrackerStateManager::getInstance().updateFrame(camera_id, dets, ts_ms);
+    if (tracks.empty()) return;
+
+    auto crossings = PeopleCountTracker::getInstance().checkCrossings(
+        camera_id, tracks, frame.cols, frame.rows, ts_ms);
+    if (crossings.empty()) return;
+
+    for (const auto& c : crossings) {
+        // Cooldown is already enforced inside PeopleCountTracker, so no
+        // extra cooldown_cache_ check here — that map is for face/intrusion.
+        cv::Rect roi(static_cast<int>(c.bbox.x),
+                     static_cast<int>(c.bbox.y),
+                     static_cast<int>(c.bbox.width),
+                     static_cast<int>(c.bbox.height));
+        roi &= cv::Rect(0, 0, frame.cols, frame.rows);
+        cv::Mat crop = (roi.area() > 0) ? frame(roi).clone() : frame;
+        std::string snapshot_path = saveSnapshot(camera_id, crop);
+
+        Event event;
+        event.id          = EventManager::generateEventId();
+        event.camera_id   = camera_id;
+        event.event_type  = (c.direction_code == "a_to_b") ? "LINE_CROSSING_A_TO_B"
+                                                            : "LINE_CROSSING_B_TO_A";
+        event.description = "Line '" + c.line_name + "' crossed (" + c.direction_label + ")";
+        event.snapshot_path = snapshot_path;
+        event.timestamp = c.ts_ms / 1000;
+
+        nlohmann::json meta = {
+            {"line_id",          c.line_id},
+            {"line_name",        c.line_name},
+            {"direction_code",   c.direction_code},
+            {"direction_label",  c.direction_label},
+            {"virtual_track_id", c.virtual_track_id},
+            {"person_id",        c.person_id},
+            {"object_class",     c.object_class},
+            {"snapshot_url",     snapshot_path},
+            {"bbox", {c.bbox.x, c.bbox.y, c.bbox.x + c.bbox.width, c.bbox.y + c.bbox.height}}
+        };
+        event.metadata_json = meta.dump();
+
+        EventManager::getInstance().createEvent(event);
+
+        LOG_INFO("Line crossing: camera={} line='{}' dir={} vid={} label='{}'",
+                 camera_id, c.line_name, c.direction_code, c.virtual_track_id, c.direction_label);
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

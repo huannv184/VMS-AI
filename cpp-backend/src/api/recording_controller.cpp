@@ -159,36 +159,96 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createErrorResponse("Recording not found", 404, origin);
             }
 
-            std::string object_key = event_opt->video_path;
-            std::vector<char> video_data;
-            std::string content_type = "video/mp4";
+            const std::string object_key = event_opt->video_path;
+            const std::string content_type = "video/mp4";
 
-            // 1. Try MinIO
-            if (vms::utils::StorageManager::getInstance().exists(object_key)) {
-                video_data = vms::utils::StorageManager::getInstance().getObject(object_key);
-            } 
-            // 2. Try Local
-            else {
-                std::string local_path = "recordings/" + object_key;
-                if (!std::filesystem::exists(local_path)) local_path = object_key;
-                
-                if (std::filesystem::exists(local_path)) {
-                    std::ifstream file(local_path, std::ios::binary);
-                    video_data = std::vector<char>((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-                }
+            // FIX F-06: previously this path read the whole file into a
+            // std::vector<char>, then COPIED it again into res.body — a
+            // 500 MB clip pinned ~1 GB of RSS per concurrent download. For
+            // local files use Crow's static-file serving (zero-copy + range
+            // support); for MinIO objects only allow ranged reads so we
+            // never buffer arbitrary-size objects in process memory.
+
+            // 1. Try local first — cheaper than a MinIO HEAD when both present.
+            std::string local_path = "recordings/" + object_key;
+            std::error_code ec;
+            if (!std::filesystem::exists(local_path, ec)) {
+                local_path = object_key;
+            }
+            if (std::filesystem::exists(local_path, ec)) {
+                crow::response res;
+                res.set_static_file_info(local_path);
+                res.set_header("Content-Type", content_type);
+                res.set_header("Accept-Ranges", "bytes");
+                std::string allowed = origin.empty() ? "*" : origin;
+                res.set_header("Access-Control-Allow-Origin", allowed);
+                return res;
             }
 
-            if (video_data.empty()) {
+            // 2. MinIO — bounded read only. Without Range header we refuse
+            //    to buffer the full object; the client must request ranges.
+            auto& storage = vms::utils::StorageManager::getInstance();
+            if (!storage.exists(object_key)) {
                 return ApiUtils::createErrorResponse("Recording data source missing", 404, origin);
             }
 
-            crow::response res;
-            res.code = 200;
+            const auto range_header = req.get_header_value("Range");
+            if (range_header.empty()) {
+                crow::response res(416);
+                res.set_header("Accept-Ranges", "bytes");
+                res.body = R"({"error":"Range header required for cloud-stored recordings"})";
+                std::string allowed = origin.empty() ? "*" : origin;
+                res.set_header("Access-Control-Allow-Origin", allowed);
+                return res;
+            }
+
+            // Parse client Range header. Open-ended (`bytes=N-`) is allowed —
+            // we let MinIO resolve the upper bound via Content-Range echo and
+            // cap the chunk we actually serve.
+            constexpr size_t MAX_CHUNK = 4 * 1024 * 1024;
+            size_t start = 0;
+            std::optional<size_t> client_end_opt;
+            {
+                std::regex range_regex("bytes=(\\d+)-(\\d*)");
+                std::smatch match;
+                if (std::regex_search(range_header, match, range_regex)) {
+                    start = std::stoull(match[1].str());
+                    if (match[2].length() > 0) client_end_opt = std::stoull(match[2].str());
+                }
+            }
+            // The fetch length is bounded by MAX_CHUNK regardless of what the
+            // client requested — we do not want a single Range request to pull
+            // a multi-GB clip into RAM.
+            size_t want_len = MAX_CHUNK;
+            if (client_end_opt && *client_end_opt >= start) {
+                want_len = std::min<size_t>(*client_end_opt - start + 1, MAX_CHUNK);
+            }
+
+            auto fetched = storage.getObjectRange(object_key, start, want_len);
+            if (fetched.http_code == 416) {
+                crow::response resp(416);
+                if (fetched.total_size > 0) {
+                    resp.set_header("Content-Range", "bytes */" + std::to_string(fetched.total_size));
+                }
+                return resp;
+            }
+            if (fetched.data.empty() || (fetched.http_code != 200 && fetched.http_code != 206)) {
+                return ApiUtils::createErrorResponse("Recording data source missing", 404, origin);
+            }
+
+            const size_t content_length = fetched.data.size();
+            const long long total_size = (fetched.total_size > 0) ? fetched.total_size
+                                          : static_cast<long long>(start + content_length);
+            const size_t end = start + content_length - 1;
+
+            crow::response res(206);
+            res.body.assign(fetched.data.data(), content_length);
             res.set_header("Content-Type", content_type);
-            res.set_header("Content-Length", std::to_string(video_data.size()));
+            res.set_header("Content-Length", std::to_string(content_length));
+            res.set_header("Content-Range",
+                "bytes " + std::to_string(start) + "-" + std::to_string(end) +
+                "/" + std::to_string(total_size));
             res.set_header("Accept-Ranges", "bytes");
-            res.body = std::string(video_data.begin(), video_data.end());
-            
             std::string allowed = origin.empty() ? "*" : origin;
             res.set_header("Access-Control-Allow-Origin", allowed);
             return res;
@@ -412,14 +472,14 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
                 return resp;
             }
 
-            // Full content
-            std::string content((std::istreambuf_iterator<char>(file)),
-                                 std::istreambuf_iterator<char>());
-
-            crow::response resp(200);
-            resp.body = std::move(content);
+            // FIX F-06: avoid pulling the entire file into RAM for every
+            // unranged GET. set_static_file_info streams from disk via
+            // sendfile/mmap depending on platform. The earlier ifstream is
+            // opened but unused on this branch — its destructor closes the
+            // handle before Crow serves the file.
+            crow::response resp;
+            resp.set_static_file_info(file_path.string());
             resp.set_header("Content-Type", "video/mp4");
-            resp.set_header("Content-Length", std::to_string(file_size));
             resp.set_header("Accept-Ranges", "bytes");
             if (!origin.empty()) {
                 resp.set_header("Access-Control-Allow-Origin", origin);

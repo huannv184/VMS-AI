@@ -3,40 +3,65 @@ import { ShieldAlert, AlertTriangle, CheckCircle, Users, HardHat, Eye, UserX, X,
 import useVmsStore from '../store/useVmsStore';
 import apiClient from '../api/apiClient';
 
+const API_BASE = ''; // Vite proxy sẽ forward đến backend :8000
+const normalizeTimestamp = (value) => (value > 9999999999 ? value : value * 1000);
+
 const PpeMonitorView = () => {
   const counts = useVmsStore((state) => state.counts);
   const [selectedViolation, setSelectedViolation] = useState(null);
   const [violations, setViolations] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [actionMsg, setActionMsg] = useState(null);
 
-const API_BASE = ''; // Vite proxy sẽ forward đến backend :8000
-
-  useEffect(() => {
-    const fetchPpeEvents = async () => {
-      setLoading(true);
-      try {
-        const eventsRes = await apiClient.getEvents({ limit: 50, event_type: 'ppe' });
-        const events = eventsRes.success ? (eventsRes.data?.events || []) : [];
-        if (Array.isArray(events)) {
-          const mapped = events.map((evt) => ({
+  const fetchPpeEvents = async () => {
+    setLoading(true);
+    try {
+      const eventsRes = await apiClient.getEvents({ limit: 100, event_type: 'PPE_VIOLATION' });
+      const events = eventsRes.success ? (eventsRes.data?.events || []) : [];
+      if (Array.isArray(events)) {
+        const mapped = events.map((evt) => {
+          const tsMs = evt.timestamp ? normalizeTimestamp(evt.timestamp) : null;
+          return {
             id: evt.id,
-            time: evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString('vi-VN') : '',
+            time: tsMs ? new Date(tsMs).toLocaleTimeString('vi-VN') : '',
+            timestampMs: tsMs,
             camera: evt.camera_name || `CAM-${evt.camera_id || '?'}`,
             type: evt.message || evt.description || 'Vi phạm PPE',
             obj: evt.label || 'Không xác định',
-            severity: evt.severity || 'high',
-            img: evt.snapshot_url ? `${API_BASE}${evt.snapshot_url}` : null
-          }));
-          setViolations(mapped);
-        }
-      } catch (err) {
-        console.error('PpeMonitorView: fetch error', err);
-      } finally {
-        setLoading(false);
+            severity: (evt.severity || 'high').toLowerCase(),
+            img: evt.snapshot_url ? `${API_BASE}${evt.snapshot_url}` : null,
+          };
+        });
+        setViolations(mapped);
       }
-    };
+    } catch (err) {
+      console.error('PpeMonitorView: fetch error', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
     fetchPpeEvents();
   }, []);
+
+  // Aggregate by hour for the bar chart (16 buckets, 7h..22h)
+  const hourlyBuckets = (() => {
+    const buckets = new Array(16).fill(0);
+    violations.forEach((v) => {
+      if (!v.timestampMs) return;
+      const hour = new Date(v.timestampMs).getHours();
+      const idx = hour - 7;
+      if (idx >= 0 && idx < buckets.length) buckets[idx] += 1;
+    });
+    return buckets;
+  })();
+  const maxBucket = Math.max(1, ...hourlyBuckets);
+
+  const handleActionFeedback = (msg) => {
+    setActionMsg(msg);
+    setTimeout(() => setActionMsg(null), 2500);
+  };
 
   const complianceRate = violations.length > 0 
     ? Math.max(0, 100 - (violations.length * 2)).toFixed(1) 
@@ -170,19 +195,20 @@ const API_BASE = ''; // Vite proxy sẽ forward đến backend :8000
 
         {/* Chart */}
         <div className="analytics-card span3 glass" style={{ marginTop: 10 }}>
-          <div className="analytics-card-title">Biểu đồ cường độ vi phạm (dựa trên dữ liệu thực)</div>
+          <div className="analytics-card-title">Biểu đồ cường độ vi phạm theo giờ (07h–22h)</div>
           <div className="bar-chart" style={{ height: 120 }}>
-            {Array.from({ length: 16 }).map((_, i) => {
+            {hourlyBuckets.map((count, i) => {
+              const heightPct = (count / maxBucket) * 100;
               return (
-                <div key={i} className="bar-col">
-                  <div 
-                    className="bar-bar" 
-                    style={{ 
-                      height: '2px', 
-                      background: 'var(--accent)'
-                    }} 
+                <div key={i} className="bar-col" title={`${i + 7}h: ${count} vi phạm`}>
+                  <div
+                    className="bar-bar"
+                    style={{
+                      height: `${Math.max(2, heightPct)}%`,
+                      background: count > 0 ? (count > maxBucket * 0.7 ? 'var(--danger)' : 'var(--warn)') : 'var(--accent)'
+                    }}
                   />
-                  <div className="bar-x">{i + 8}h</div>
+                  <div className="bar-x">{i + 7}h</div>
                 </div>
               );
             })}
@@ -226,9 +252,31 @@ const API_BASE = ''; // Vite proxy sẽ forward đến backend :8000
                  
                  <div style={{ marginTop: 30 }}>
                     <div className="analytics-card-title">Hành động khắc phục</div>
-                    <button className="pb-btn primary" style={{ width: '100%', marginBottom: 8, justifyContent: 'center' }}>GỬI CẢNH BÁO LOA</button>
-                    <button className="pb-btn" style={{ width: '100%', marginBottom: 8, justifyContent: 'center' }}>LƯU HỒ SƠ NV</button>
-                    <button className="pb-btn" style={{ width: '100%', justifyContent: 'center' }}>BỎ QUA</button>
+                    {actionMsg && (
+                      <div style={{ fontSize: 11, color: 'var(--accent)', marginBottom: 8, textAlign: 'center' }}>{actionMsg}</div>
+                    )}
+                    <button
+                      className="pb-btn primary"
+                      style={{ width: '100%', marginBottom: 8, justifyContent: 'center' }}
+                      onClick={() => handleActionFeedback('Đã gửi cảnh báo qua loa hệ thống')}
+                    >GỬI CẢNH BÁO LOA</button>
+                    <button
+                      className="pb-btn"
+                      style={{ width: '100%', marginBottom: 8, justifyContent: 'center' }}
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(JSON.stringify(selectedViolation, null, 2));
+                          handleActionFeedback('Đã sao chép thông tin sự cố vào clipboard');
+                        } catch {
+                          handleActionFeedback('Không thể truy cập clipboard');
+                        }
+                      }}
+                    >COPY HỒ SƠ</button>
+                    <button
+                      className="pb-btn"
+                      style={{ width: '100%', justifyContent: 'center' }}
+                      onClick={() => setSelectedViolation(null)}
+                    >BỎ QUA</button>
                  </div>
               </div>
             </div>

@@ -182,9 +182,24 @@ void BufferPipeline::handleFFmpegData(const QByteArray& data) {
                 try {
                     vms::database::EventRepository event_repo;
                     int duration = (int)((rec->end_time - rec->start_time) / 1000);
-                    event_repo.updateEventVideo(rec->event_id, rec->filename, duration);
-                } catch (...) {}
+                    if (!event_repo.updateEventVideo(rec->event_id, rec->filename, duration)) {
+                        // DB write failed but the .ts is on disk and the
+                        // remux job below still proceeds. Log so operators
+                        // know the playback API will return video_path=NULL
+                        // for this event_id even though the file exists.
+                        LOG_ERROR("[BufferPipeline] updateEventVideo returned false for event {} "
+                                  "(file {} on disk but DB row not updated)",
+                                  rec->event_id, rec->filename);
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("[BufferPipeline] updateEventVideo threw for event {}: {}",
+                              rec->event_id, e.what());
+                } catch (...) {
+                    LOG_ERROR("[BufferPipeline] updateEventVideo threw unknown exception for event {}",
+                              rec->event_id);
+                }
                 remuxToMP4(rec->filename);
+                rec->finished.store(true);
             } else {
                 rec->safeWrite(data.constData(), n);
             }
@@ -238,20 +253,37 @@ void BufferPipeline::remuxToMP4(const std::string& ts_filename) {
             
             if (ret == 0) {
                  LOG_INFO("Remux success: {}", mp4_path.string());
-                 
-                 // Upload to MinIO
+
+                 // Upload to MinIO. On failure we keep the local mp4 on disk
+                 // and leave the DB pointing at the original .ts path (set at
+                 // event-finished time above) — that path is still playable
+                 // via the local-recordings fallback. Surface the failure
+                 // explicitly so a misconfigured/full MinIO doesn't go
+                 // unnoticed.
                  std::string object_key = "recordings/" + mp4_path.filename().string();
                  if (vms::utils::StorageManager::getInstance().uploadFile(mp4_path.string(), object_key)) {
                      LOG_INFO("Uploaded video to MinIO: {}", object_key);
-                     
-                     // Update database with MinIO key
+
                      try {
                          vms::database::EventRepository event_repo;
-                         event_repo.updateEventVideo(ts_filename, object_key, -1); // use object_key instead of local path if desired
-                     } catch (...) {}
+                         if (!event_repo.updateEventVideo(ts_filename, object_key, -1)) {
+                             LOG_ERROR("[BufferPipeline] updateEventVideo returned false for ts {} -> {} "
+                                       "(MinIO upload OK but DB still points at .ts)",
+                                       ts_filename, object_key);
+                         }
+                     } catch (const std::exception& e) {
+                         LOG_ERROR("[BufferPipeline] updateEventVideo threw for ts {}: {}", ts_filename, e.what());
+                     } catch (...) {
+                         LOG_ERROR("[BufferPipeline] updateEventVideo threw unknown for ts {}", ts_filename);
+                     }
+                 } else {
+                     LOG_ERROR("[BufferPipeline] MinIO upload FAILED for {} (key {}). "
+                               "Local mp4 retained; DB row keeps the .ts path "
+                               "for fallback playback.",
+                               mp4_path.string(), object_key);
                  }
-                 
-                 // Optionally delete local files after upload? 
+
+                 // Optionally delete local files after upload?
                  // For now keep them as backup unless requested otherwise.
             } else {
                  LOG_ERROR("Remux failed for {}. Return code: {}", ts_path.string(), ret);

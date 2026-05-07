@@ -38,8 +38,26 @@ const TwoFactorSetupModal = ({ onClose, onEnabled }) => {
     setLoading(false);
   };
 
-  // Google Charts QR Generator: https://chart.googleapis.com/chart?cht=qr&chs=200x200&chl=...
-  const qrUrl = setupData ? `https://chart.googleapis.com/chart?cht=qr&chs=200x200&chl=${encodeURIComponent(setupData.otpauth_url)}` : '';
+  // Backend may return a QR image (data URL or path). Fall back to quickchart.io —
+  // chart.googleapis.com QR endpoint was retired in 2024 and returns 404.
+  const backendQr = setupData?.qr_code || setupData?.qr_image || null;
+  const qrUrl = backendQr
+    ? backendQr
+    : (setupData?.otpauth_url
+        ? `https://quickchart.io/qr?text=${encodeURIComponent(setupData.otpauth_url)}&size=200`
+        : '');
+
+  const copySecret = async () => {
+    if (!setupData?.secret) return;
+    try {
+      await navigator.clipboard.writeText(setupData.secret);
+      const orig = error;
+      setError('Đã sao chép Secret Key vào clipboard');
+      setTimeout(() => setError(orig), 1500);
+    } catch {
+      setError('Không thể truy cập clipboard');
+    }
+  };
 
   return (
     <div className="modal-overlay" style={{
@@ -66,15 +84,28 @@ const TwoFactorSetupModal = ({ onClose, onEnabled }) => {
               Sử dụng ứng dụng xác thực (Google Authenticator, Authy...) để quét mã QR bên dưới.
             </div>
 
-            {setupData && (
+            {setupData && qrUrl && (
               <div style={{ background: '#fff', padding: '10px', borderRadius: '8px', display: 'inline-block', marginBottom: '20px' }}>
-                <img src={qrUrl} alt="QR Code" style={{ width: '180px', height: '180px' }} />
+                <img
+                  src={qrUrl}
+                  alt="QR Code"
+                  style={{ width: '180px', height: '180px' }}
+                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                />
               </div>
             )}
 
-            <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginBottom: '20px', fontFamily: "'Share Tech Mono', monospace" }}>
+            <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginBottom: '8px', fontFamily: "'Share Tech Mono', monospace", wordBreak: 'break-all' }}>
               Secret Key: {setupData?.secret}
             </div>
+            {setupData?.secret && (
+              <div
+                onClick={copySecret}
+                style={{ fontSize: '10px', color: 'var(--accent)', cursor: 'pointer', marginBottom: '20px', textDecoration: 'underline' }}
+              >
+                Nhấn để sao chép Secret Key (nhập thủ công nếu QR không quét được)
+              </div>
+            )}
 
             <form onSubmit={handleVerify}>
               <div style={{ marginBottom: '15px' }}>

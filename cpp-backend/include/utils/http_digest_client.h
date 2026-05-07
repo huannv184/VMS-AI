@@ -152,4 +152,15 @@ inline DigestResponse putDigest(const std::string& host,
                          content_type, connect_timeout_seconds, timeout_seconds);
 }
 
+inline DigestResponse deleteDigest(const std::string& host,
+                                   int port,
+                                   const std::string& path,
+                                   const std::string& username,
+                                   const std::string& password,
+                                   long connect_timeout_seconds = 3L,
+                                   long timeout_seconds = 5L) {
+    return requestDigest(host, port, path, "DELETE", username, password, "",
+                         "", connect_timeout_seconds, timeout_seconds);
+}
+
 } // namespace vms::http

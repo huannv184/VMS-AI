@@ -42,6 +42,10 @@ include_directories(
 )
 
 # Source Files
+# NOTE: file(GLOB) does NOT automatically detect new .cpp files — run `cmake .` after
+# adding a source file or CMake will silently skip it at link time.
+# Long-term: replace with explicit per-domain static_library targets (api, core, database,
+# events, streaming, auth) to enable incremental builds and isolated unit testing.
 file(GLOB VMS_SOURCES_ROOT "src/*.cpp")
 file(GLOB VMS_SOURCES_API "src/api/*.cpp")
 file(GLOB VMS_SOURCES_CORE "src/core/*.cpp")
@@ -75,6 +79,10 @@ set(VMS_SOURCES
 
 file(GLOB_RECURSE VMS_HEADERS "include/*.h")
 list(APPEND VMS_HEADERS
+    include/core/camera_runtime_types.h
+    include/core/frame_bus.h
+    include/core/pipeline_state_store.h
+    include/core/health_monitor.h
     include/core/process_manager.h
     include/core/runtime_state.h
 )
@@ -112,12 +120,12 @@ target_link_libraries(vms_backend PRIVATE
 
 # Link LDAP library (Windows only)
 if(WIN32)
-    target_link_libraries(vms_backend PRIVATE Wldap32)
+    target_link_libraries(vms_backend PRIVATE Wldap32 winmm)
 endif()
 
 # Enable Tests
 enable_testing()
-# add_subdirectory(tests) # Uncomment if tests folder has CMakeLists.txt
+add_subdirectory(tests)
 
 # Definition for Windows lean and mean/nominmax if needed globally
 if(MSVC)
@@ -131,3 +139,23 @@ add_subdirectory(src/ai_worker)
 
 # Reuse shared AI inference implementation in backend runtime.
 target_link_libraries(vms_backend PRIVATE inference)
+
+# ─── Runtime DLL deployment (Windows) ─────────────────────────────────────
+# Without this, a fresh build of vms_backend.exe inside Release/ exits
+# immediately with STATUS_DLL_NOT_FOUND (0xC0000135) because vcpkg DLLs
+# (opencv_*4.dll, spdlog.dll, libcurl.dll, libcrypto-3-x64.dll, etc.) are
+# only copied for some targets, not transitive deps.  CMake 3.21's
+# $<TARGET_RUNTIME_DLLS> resolves the full closure including indirect
+# imports (libwebpdemux, abseil_dll, opencv_calib3d4, …) so we can't miss
+# one by accident.  No-op on non-Windows.
+if(WIN32)
+    add_custom_command(TARGET vms_backend POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:vms_backend>
+            $<TARGET_FILE_DIR:vms_backend>
+        COMMAND_EXPAND_LISTS
+        VERBATIM
+        COMMENT "vms_backend: deploying runtime DLLs to $<TARGET_FILE_DIR:vms_backend>")
+endif()
+
+# Trigger CMake reconfigure

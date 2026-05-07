@@ -1,9 +1,12 @@
 #include "core/brands/dahua_core.hpp"
 #include "core/brands/DahuaAdapter.hpp"
+#include "utils/logger.h"
 #include <map>
 #include <vector>
 #include <string>
 #include <sstream>
+#include <chrono>
+#include <thread>
 
 namespace vms {
 namespace core {
@@ -176,36 +179,19 @@ bool DahuaCore::ptzControl(const CameraDiscovery::DiscoveryConfig& cfg, const st
     return adapter.ptzControl(cmd);
 }
 
+// BUG-EVENTS-01 (2026-05-07): pre-fix this called a no-op
+// `DahuaAdapter::startEventSubscription` and then spun a keepalive loop.
+// Real Dahua EventManager subscription (HTTP multipart on
+// /cgi-bin/eventManager.cgi?action=attach) was never wired. See ONVIFCore
+// for the full lesson.
 void DahuaCore::pullEvents(const CameraDiscovery::DiscoveryConfig& cfg, std::function<bool(const std::string&)> onEvent) {
-    vms::CameraConfig vcfg;
-    vcfg.ip = cfg.host;
-    vcfg.username = cfg.username;
-    vcfg.password = cfg.password;
-    vcfg.httpPort = cfg.http_port;
-    vms::DahuaAdapter adapter(vcfg);
-    
-    if (!adapter.connect()) return;
-
-    std::atomic<bool> isRunning{true};
-    adapter.startEventSubscription([&](const vms::CameraEvent& ev) {
-        std::string typeMap = "EventNotificationAlert"; 
-        if (ev.typeRaw == "VideoMotion") typeMap = "VMD";
-        else if (ev.typeRaw == "CrossLineDetection") typeMap = "linedetection";
-        else if (ev.typeRaw == "CrossRegionDetection") typeMap = "fielddetection";
-
-        // Size > 50 and EventNotificationAlert required by camera_event_service.cpp
-        std::string fakeXml = std::string(60, ' ') + "<EventNotificationAlert><eventType>" + typeMap + "</eventType></EventNotificationAlert>";
-        if (!onEvent(fakeXml)) {
-            isRunning = false;
-        }
-    }, nullptr);
-
-    while (isRunning) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        if (!onEvent("keepalive")) {
-            isRunning = false;
-        }
-    }
+    LOG_WARN("[DahuaCore] Hardware event subscription is NOT implemented "
+             "for Dahua host {}:{}. Real Dahua events require "
+             "/cgi-bin/eventManager.cgi multipart streaming. Sleeping 60s "
+             "before returning.",
+             cfg.host, cfg.http_port);
+    (void)onEvent;
+    std::this_thread::sleep_for(std::chrono::seconds(60));
 }
 
 } // namespace brands

@@ -1,16 +1,32 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Download } from 'lucide-react';
 import useVmsStore from '../store/useVmsStore';
 import apiClient from '../api/apiClient';
 
 const API_BASE = ''; // Vite proxy forward đến :8000
+const normalizeTimestamp = (v) => (v > 9999999999 ? v : v * 1000);
+
+const EVENT_TYPES = [
+  { value: 'all', label: 'Tất cả loại' },
+  { value: 'PERSON_DETECTED', label: 'Phát hiện người' },
+  { value: 'FACE_RECOGNIZED', label: 'Nhận diện khuôn mặt' },
+  { value: 'INTRUSION', label: 'Xâm nhập' },
+  { value: 'LINE_CROSSING', label: 'Vượt ranh giới' },
+  { value: 'LOITERING', label: 'Lảng vảng' },
+  { value: 'CROWD_DETECTED', label: 'Đám đông' },
+  { value: 'PPE_VIOLATION', label: 'Vi phạm PPE' },
+  { value: 'FIRE_DETECTED', label: 'Phát hiện lửa' },
+];
 
 const AlarmsView = () => {
   const alarms = useVmsStore((state) => state.alarms);
   const setAlarms = useVmsStore((state) => state.setAlarms);
-  
+  const cameras = useVmsStore((state) => state.cameras);
+
   // Filters
   const [filterType, setFilterType] = useState('all');
+  const [filterCamera, setFilterCamera] = useState('all');
+  const [filterEventType, setFilterEventType] = useState('all');
   const [dateFilter, setDateFilter] = useState('');
   
   // UI State
@@ -18,32 +34,43 @@ const AlarmsView = () => {
   const [selectedAlarm, setSelectedAlarm] = useState(null);
 
   // Fetch initial data or when filter logic is applied
-  const fetchAlarms = async () => {
+  const fetchAlarms = useCallback(async () => {
     setIsLoading(true);
     try {
-      const params = { limit: 100 };
+      const params = { limit: 200 };
       if (dateFilter) {
         const d = new Date(dateFilter);
         params.start_time = Math.floor(d.getTime() / 1000);
-        params.end_time = params.start_time + 86400; // start + 1 day
+        params.end_time = params.start_time + 86400;
       }
-      
+      if (filterCamera !== 'all') params.camera_id = filterCamera;
+      if (filterEventType !== 'all') params.event_type = filterEventType;
+
       const res = await apiClient.getEvents(params);
       if (res.success) {
-        const mapped = (res.data?.events || []).map((evt) => ({
-          id: evt.id,
-          time: evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString('vi-VN') : '',
-          rawTimestamp: evt.timestamp,
-          type: evt.label || evt.event_type || 'AI EVENT',
-          desc: evt.message || evt.description || '',
-          camera: evt.camera_name || `CAM-${evt.camera_id || '?'}`,
-          severity: evt.severity ? evt.severity.toLowerCase() : 'low',
-          status: evt.status || 'new',
-          img: evt.snapshot_url ? `${API_BASE}${evt.snapshot_url}` : null
-        }));
-        
+        const mapped = (res.data?.events || []).map((evt) => {
+          let meta = {};
+          try { meta = JSON.parse(evt.metadata_json || '{}'); } catch (_) {}
+          const tsMs = evt.timestamp ? normalizeTimestamp(evt.timestamp) : null;
+          return {
+            id: evt.id,
+            time: tsMs ? new Date(tsMs).toLocaleTimeString('vi-VN') : '',
+            date: tsMs ? new Date(tsMs).toLocaleDateString('vi-VN') : '',
+            rawTimestamp: evt.timestamp,
+            type: evt.label || evt.event_type || 'AI EVENT',
+            desc: evt.message || evt.description || '',
+            camera: evt.camera_name || `CAM-${evt.camera_id || '?'}`,
+            camera_id: evt.camera_id,
+            severity: evt.severity ? evt.severity.toLowerCase() : 'low',
+            status: evt.status || 'new',
+            img: evt.snapshot_url ? `${API_BASE}${evt.snapshot_url}` : null,
+            rule_name: meta.rule_name || null,
+            confidence: meta.confidence != null ? Math.round(meta.confidence * 100) : null,
+          };
+        });
+
         // Sort newest first
-        mapped.sort((a,b) => (b.rawTimestamp || 0) - (a.rawTimestamp || 0));
+        mapped.sort((a, b) => (b.rawTimestamp || 0) - (a.rawTimestamp || 0));
         setAlarms(mapped);
       }
     } catch (err) {
@@ -51,11 +78,11 @@ const AlarmsView = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [dateFilter, filterCamera, filterEventType, setAlarms]);
 
   useEffect(() => {
     fetchAlarms();
-  }, [dateFilter]);
+  }, [fetchAlarms]);
 
   const handleDelete = async (id) => {
     if (!window.confirm("Bạn có chắc chắn muốn xóa sự kiện cảnh báo này?")) return;
@@ -78,9 +105,9 @@ const AlarmsView = () => {
     }
   };
 
-  // Filter application
+  // Filter application (local severity filter on top of server-side filters)
   const filteredAlarms = useMemo(() => {
-    return alarms.filter(a => filterType === 'all' || a.severity === filterType || a.type === filterType);
+    return alarms.filter(a => filterType === 'all' || a.severity === filterType);
   }, [alarms, filterType]);
 
   const severityColor = (sev) => {
@@ -118,14 +145,43 @@ const AlarmsView = () => {
         </div>
         
         <div className="toolbar-sep"></div>
-        
-        <input 
-          type="date" 
-          value={dateFilter} 
+
+        {/* Camera filter */}
+        <select
+          value={filterCamera}
+          onChange={e => setFilterCamera(e.target.value)}
+          style={{background:'var(--bg)', border:'1px solid var(--border)', color:'var(--text)', padding:'4px 8px', borderRadius:'3px', fontFamily:"'Share Tech Mono', monospace", fontSize:'11px', outline:'none'}}
+        >
+          <option value="all">Tất cả camera</option>
+          {cameras.map(c => (
+            <option key={c.id} value={c.id}>{c.name || `CAM-${c.id}`}</option>
+          ))}
+        </select>
+
+        {/* Event type filter */}
+        <select
+          value={filterEventType}
+          onChange={e => setFilterEventType(e.target.value)}
+          style={{background:'var(--bg)', border:'1px solid var(--border)', color:'var(--text)', padding:'4px 8px', borderRadius:'3px', fontFamily:"'Share Tech Mono', monospace", fontSize:'11px', outline:'none'}}
+        >
+          {EVENT_TYPES.map(t => (
+            <option key={t.value} value={t.value}>{t.label}</option>
+          ))}
+        </select>
+
+        <div className="toolbar-sep"></div>
+
+        <input
+          type="date"
+          value={dateFilter}
           onChange={(e) => setDateFilter(e.target.value)}
           style={{background:'var(--bg)', border:'1px solid var(--border)', color:'var(--text)', padding:'4px 8px', borderRadius:'3px', fontFamily:"'Share Tech Mono', monospace", fontSize:'11px', outline:'none'}}
         />
-        {dateFilter && <div className="grid-btn" onClick={() => setDateFilter('')}>Xóa Lọc</div>}
+        {(dateFilter || filterCamera !== 'all' || filterEventType !== 'all') && (
+          <div className="grid-btn" onClick={() => { setDateFilter(''); setFilterCamera('all'); setFilterEventType('all'); }}>
+            Xóa Lọc
+          </div>
+        )}
         
         <div className="toolbar-sep"></div>
         <div className="grid-btn" onClick={fetchAlarms} style={{pointerEvents: isLoading ? 'none' : 'auto', opacity: isLoading ? 0.5 : 1}}>
@@ -142,10 +198,10 @@ const AlarmsView = () => {
         {filteredAlarms.length > 0 ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '10px' }}>
             {filteredAlarms.map((alarm, index) => (
-              <div 
-                key={alarm.id || index} 
-                className={`alert-item ${alarm.severity || 'low'}`} 
-                style={{ cursor: 'pointer', margin: 0, hover: {background: 'var(--bg-hover)'} }}
+              <div
+                key={alarm.id || index}
+                className={`alert-item ${alarm.severity || 'low'}`}
+                style={{ cursor: 'pointer', margin: 0 }}
                 onClick={() => setSelectedAlarm(alarm)}
               >
                 {alarm.img ? (
@@ -162,6 +218,16 @@ const AlarmsView = () => {
                   <div className="alert-title" style={{ whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis', fontSize:'14px' }}>{alarm.desc || alarm.type}</div>
                   <div className="alert-meta" style={{ marginTop: '5px' }}>{alarm.camera}</div>
                   <div className="alert-meta" style={{color: severityColor(alarm.severity)}}>{alarm.type}</div>
+                  {alarm.rule_name && (
+                    <div style={{fontSize:'9px', color:'var(--accent)', fontFamily:"'Share Tech Mono',monospace", marginTop:'2px', opacity:0.8}}>
+                      RULE: {alarm.rule_name}
+                    </div>
+                  )}
+                  {alarm.confidence != null && (
+                    <div style={{fontSize:'9px', color:'var(--text-dim)', fontFamily:"'Share Tech Mono',monospace"}}>
+                      CONF: {alarm.confidence}%
+                    </div>
+                  )}
                 </div>
                 
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'space-between', padding: '2px 0' }}>
@@ -250,9 +316,23 @@ const AlarmsView = () => {
                    </div>
                    <div>
                      <div style={{fontSize:'10px', color:'var(--text-dim)', letterSpacing:'1px', marginBottom:'4px'}}>THỜI GIAN</div>
-                     <div style={{fontSize:'12px', color:'var(--accent)', fontFamily:"'Share Tech Mono',monospace"}}>{selectedAlarm.time}</div>
+                     <div style={{fontSize:'12px', color:'var(--accent)', fontFamily:"'Share Tech Mono',monospace"}}>{selectedAlarm.date} {selectedAlarm.time}</div>
                    </div>
                  </div>
+
+                 {selectedAlarm.rule_name && (
+                   <div>
+                     <div style={{fontSize:'10px', color:'var(--text-dim)', letterSpacing:'1px', marginBottom:'4px'}}>QUY TẮC KÍCH HOẠT</div>
+                     <div style={{fontSize:'12px', color:'var(--accent)', fontFamily:"'Share Tech Mono',monospace"}}>{selectedAlarm.rule_name}</div>
+                   </div>
+                 )}
+
+                 {selectedAlarm.confidence != null && (
+                   <div>
+                     <div style={{fontSize:'10px', color:'var(--text-dim)', letterSpacing:'1px', marginBottom:'4px'}}>ĐỘ TIN CẬY</div>
+                     <div style={{fontSize:'12px', color:'var(--accent3)', fontFamily:"'Share Tech Mono',monospace"}}>{selectedAlarm.confidence}%</div>
+                   </div>
+                 )}
                  
                  <div style={{flex:1}}></div>
                  

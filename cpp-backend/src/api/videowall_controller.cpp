@@ -5,7 +5,10 @@
 
 #include "api/videowall_controller.h"
 #include "database/db_manager.h"
+#include "middleware/auth_middleware.h"
+#include "server/vms_app.h"
 #include "utils/api_utils.h"
+#include "utils/config.h"
 #include "utils/logger.h"
 #include <nlohmann/json.hpp>
 #include <QSqlQuery>
@@ -14,6 +17,33 @@
 #include <ctime>
 
 using json = nlohmann::json;
+
+namespace {
+// BUG-26 / RBAC tightening: previously this helper only verified the request
+// was authenticated, which meant a viewer could overwrite shared layouts.
+// Now it also enforces the requested module permission so writes go through
+// the same RBAC gate as every other mutate API.
+std::optional<crow::response> requireVideoWallPerm(
+        vms::server::VmsApp& app,
+        const crow::request& req,
+        vms::api::Permission perm,
+        const std::string& origin) {
+    if (!vms::Config::getInstance().getAuthConfig().enabled) {
+        return std::nullopt;
+    }
+    auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+    return vms::api::ApiUtils::requirePermission(ctx, perm, origin);
+}
+
+std::string callerUsername(vms::server::VmsApp& app, const crow::request& req) {
+    if (!vms::Config::getInstance().getAuthConfig().enabled) return "admin";
+    try {
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (ctx.user.has_value()) return ctx.user->username;
+    } catch (...) {}
+    return "unknown";
+}
+} // namespace
 
 #ifdef DELETE
 #undef DELETE
@@ -25,13 +55,15 @@ namespace api {
 void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
     LOG_INFO("Registering Video Wall routes...");
 
-    // GET /api/videowall/layouts — List all saved layouts
+    // GET /api/videowall/layouts — List all saved layouts (VIDEOWALL_READ)
     CROW_ROUTE(app, "/api/videowall/layouts")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
+
+        if (auto err = requireVideoWallPerm(app, req, Permission::VIDEOWALL_READ, origin)) return std::move(*err);
 
         try {
             auto& db = database::DbManager::getInstance();
@@ -70,10 +102,11 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
     // POST /api/videowall/layouts — Create a new layout
     CROW_ROUTE(app, "/api/videowall/layouts")
     .methods(crow::HTTPMethod::Post)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options)
             return ApiUtils::createResponse(json::object(), 204, origin);
+        if (auto err = requireVideoWallPerm(app, req, Permission::VIDEOWALL_WRITE, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);
@@ -81,30 +114,40 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
             int cols = body.value("grid_cols", 4);
             int rows = body.value("grid_rows", 4);
             std::string cells = body.value("cells", json::array()).dump();
-            std::string created_by = body.value("created_by", "admin");
+            // Audit attribution must come from the auth context, not the request
+            // body — clients used to be able to forge created_by="root" to hide
+            // who actually made the change.
+            std::string created_by = callerUsername(app, req);
 
             if (cols < 1 || cols > 8 || rows < 1 || rows > 8) {
                 return ApiUtils::createErrorResponse("grid_cols and grid_rows must be 1-8", 400, origin);
             }
 
             auto& db = database::DbManager::getInstance();
-            std::string sql = "INSERT INTO videowall_layouts (name, grid_cols, grid_rows, cells_json, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))";
-            bool ok = db.executeParameterized(sql, {
-                name,
-                std::to_string(cols),
-                std::to_string(rows),
-                cells,
-                created_by
-            });
+            const std::string now = db.sqlNowEpoch();
 
-            if (!ok) return ApiUtils::createErrorResponse("Failed to create layout", 500, origin);
-
-            int new_id;
-            {
-                QSqlQuery query(db.getThreadConnection());
-                query.exec("SELECT last_insert_rowid()");
-                query.next();
-                new_id = query.value(0).toInt();
+            int new_id = -1;
+            if (db.isPostgres()) {
+                // PostgreSQL: use RETURNING to get new id atomically
+                QSqlQuery q(db.getThreadConnection());
+                std::string sql = "INSERT INTO videowall_layouts (name, grid_cols, grid_rows, cells_json, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, " + now + ", " + now + ") RETURNING id";
+                q.prepare(QString::fromStdString(sql));
+                q.addBindValue(QString::fromStdString(name));
+                q.addBindValue(cols);
+                q.addBindValue(rows);
+                q.addBindValue(QString::fromStdString(cells));
+                q.addBindValue(QString::fromStdString(created_by));
+                if (!q.exec() || !q.next())
+                    return ApiUtils::createErrorResponse("Failed to create layout", 500, origin);
+                new_id = q.value(0).toInt();
+            } else {
+                std::string sql = "INSERT INTO videowall_layouts (name, grid_cols, grid_rows, cells_json, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, " + now + ", " + now + ")";
+                bool ok = db.executeParameterized(sql, {name, std::to_string(cols), std::to_string(rows), cells, created_by});
+                if (!ok) return ApiUtils::createErrorResponse("Failed to create layout", 500, origin);
+                QSqlQuery q(db.getThreadConnection());
+                q.exec("SELECT last_insert_rowid()");
+                q.next();
+                new_id = q.value(0).toInt();
             }
 
             return ApiUtils::createResponse({
@@ -121,10 +164,11 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
     // PUT /api/videowall/layouts/<int> — Update
     CROW_ROUTE(app, "/api/videowall/layouts/<int>")
     .methods(crow::HTTPMethod::Put, crow::HTTPMethod::Options)
-    ([](const crow::request& req, int layout_id) {
+    ([&app](const crow::request& req, int layout_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options)
             return ApiUtils::createResponse(json::object(), 204, origin);
+        if (auto err = requireVideoWallPerm(app, req, Permission::VIDEOWALL_WRITE, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);
@@ -153,7 +197,8 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createErrorResponse("No fields to update", 400, origin);
             }
 
-            sets.push_back("updated_at = strftime('%s','now')");
+            auto& db = database::DbManager::getInstance();
+            sets.push_back("updated_at = " + db.sqlNowEpoch());
             params.push_back(std::to_string(layout_id));
 
             std::string sql = "UPDATE videowall_layouts SET ";
@@ -163,7 +208,6 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
             }
             sql += " WHERE id = ?";
 
-            auto& db = database::DbManager::getInstance();
             bool ok = db.executeParameterized(sql, params);
 
             if (!ok) return ApiUtils::createErrorResponse("Update failed", 500, origin);
@@ -176,10 +220,11 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
     // DELETE /api/videowall/layouts/<int>
     CROW_ROUTE(app, "/api/videowall/layouts/<int>")
     .methods(crow::HTTPMethod::Delete)
-    ([](const crow::request& req, int layout_id) {
+    ([&app](const crow::request& req, int layout_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options)
             return ApiUtils::createResponse(json::object(), 204, origin);
+        if (auto err = requireVideoWallPerm(app, req, Permission::VIDEOWALL_WRITE, origin)) return std::move(*err);
 
         auto& db = database::DbManager::getInstance();
         bool ok = db.executeParameterized("DELETE FROM videowall_layouts WHERE id = ?",

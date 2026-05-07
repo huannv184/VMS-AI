@@ -69,10 +69,13 @@ function App() {
         const systemStats = systemStatsRes.success ? systemStatsRes.data : null;
         const cameras = camerasRes.success ? (camerasRes.data?.cameras || []) : [];
 
+        // Backend returns Unix timestamps in seconds; normalise so accidental ms values still render.
+        const normalizeTs = (v) => (v > 9999999999 ? v : v * 1000);
+
         if (Array.isArray(events)) {
           const alarms = events.map((evt) => ({
             id: evt.id,
-            time: evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString('vi-VN') : '',
+            time: evt.timestamp ? new Date(normalizeTs(evt.timestamp)).toLocaleTimeString('vi-VN') : '',
             type: evt.label || evt.event_type || 'AI',
             desc: evt.message || evt.description || '',
             camera: evt.camera_name || `CAM-${evt.camera_id || '?'}`,
@@ -89,7 +92,7 @@ function App() {
             name: p.name,
             type: p.description || 'Nhân viên',
             confidence: p.has_embedding ? 95 : 0,
-            time: p.updated_at ? new Date(p.updated_at * 1000).toLocaleTimeString('vi-VN') : '',
+            time: p.updated_at ? new Date(normalizeTs(p.updated_at)).toLocaleTimeString('vi-VN') : '',
             avatar: p.face_image_path ? p.face_image_path : null
           }));
           setFaces(faces);
@@ -166,6 +169,16 @@ function App() {
     };
     document.addEventListener('vms:openModal', handleOpenModal);
     return () => document.removeEventListener('vms:openModal', handleOpenModal);
+  }, []);
+
+  // Listen for cross-component tab switch requests (e.g. SidebarRight "Xem tất cả →")
+  React.useEffect(() => {
+    const handleSetTab = (e) => {
+      const tab = e?.detail?.tab;
+      if (typeof tab === 'string') setActiveTab(tab);
+    };
+    window.addEventListener('vms:setActiveTab', handleSetTab);
+    return () => window.removeEventListener('vms:setActiveTab', handleSetTab);
   }, []);
 
   const handleLoginSuccess = () => {

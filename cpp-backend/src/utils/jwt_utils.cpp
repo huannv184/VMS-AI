@@ -186,6 +186,25 @@ bool verifyTwoFactorTempTokenJwt(const std::string& token, int& user_id_out) {
     });
 }
 
+std::string createPasswordChangeTempTokenJwt(const vms::core::User& user) {
+    return signUserToken(
+        user,
+        std::chrono::minutes(5),
+        "password_change_pending",
+        [](auto& token) {
+            using jwt_traits = jwt::traits::nlohmann_json;
+            token.set_payload_claim("requires_password_change",
+                                    jwt::basic_claim<jwt_traits>(true));
+        }
+    );
+}
+
+bool verifyPasswordChangeTempTokenJwt(const std::string& token, int& user_id_out) {
+    return verifyJwtForUse(token, user_id_out, [](const std::string& token_use) {
+        return token_use == "password_change_pending";
+    });
+}
+
 std::string createWsTicketJwt(const vms::core::User& user, const std::string& client_ip) {
     return signUserToken(
         user,

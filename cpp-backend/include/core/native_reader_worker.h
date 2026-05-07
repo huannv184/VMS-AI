@@ -6,6 +6,8 @@
 #include <QFuture>
 #include <QThreadPool>
 #include <atomic>
+#include <mutex>
+#include <thread>
 #include <opencv2/opencv.hpp>
 #include "core/native_stream_reader.h"
 #include "inference/tracking.h"
@@ -46,10 +48,11 @@ public:
 Q_SIGNALS:
     // Emitted when a new frame is decoded
     void frameReady(const cv::Mat& frame);
-    // Emitted when a frame is processed (resized, encoded, AI metadata attached)
+    // Emitted when a frame is processed (resized, AI metadata attached)
     // This allows the main thread to remain lean.
     void frameProcessed(int camera_id, 
-                        const std::vector<uchar>& jpeg_data, 
+                        const cv::Mat& frame,
+                        const std::vector<uchar>& jpeg_data,
                         const std::vector<inference::TrackedObject>& objects,
                         const nlohmann::json& meta,
                         uint64_t timestamp);
@@ -76,9 +79,16 @@ private:
     ::ipc::SharedMemoryManager* shm_manager_{nullptr};
     uint64_t frame_count_{0};
     QFuture<void> processing_future_;
-    // Per-camera pool (1 thread): isolates processing from other cameras'
+    // Per-camera pool (2 threads, see .cpp): isolates processing from other cameras'
     // tasks in the global pool, preventing cross-camera starvation.
     QThreadPool processing_pool_;
+    // Last wall-clock ms we emitted a *full* (non-empty) Mat via frameProcessed.
+    // Used by processAndEmit() to throttle the 1.5MB Mat clone to ~2 fps —
+    // matches AiEventProcessor's 500ms processMetadata gate, eliminating wasted
+    // memcpy on every WebSocket frame.
+    std::atomic<uint64_t> last_emit_full_frame_ms_{0};
+
+    void processAndEmit(cv::Mat small_frame, uint64_t fid);
 };
 
 } // namespace core

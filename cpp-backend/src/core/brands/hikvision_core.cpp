@@ -1,6 +1,6 @@
 #include "core/brands/hikvision_core.hpp"
 #include "core/brands/HikvisionAdapter.hpp"
-#include <pugixml.hpp>  // TODO: Enable after vcpkg setup
+#include <pugixml.hpp>
 #include <vector>
 #include <string>
 

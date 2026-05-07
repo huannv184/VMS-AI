@@ -2,6 +2,7 @@
 #include "utils/api_utils.h"
 #include "utils/config.h"
 #include "utils/logger.h"
+#include "utils/session_cookie.h"
 #include "utils/sha256.h"
 #include "utils/jwt_utils.h"
 #include "middleware/ldap_connector.h"
@@ -13,6 +14,7 @@
 #include "utils/validator.h"
 #include "utils/rate_limiter.h"
 #include "utils/password_hash.h"
+#include "database/user_repository.h"
 #include <chrono>
 #include <iomanip>
 #include <random>
@@ -34,27 +36,54 @@ static std::string generateSaltHex(size_t bytes = 16) {
     return oss.str();
 }
 
-// H6: New passwords use argon2id (VMS_HAS_ARGON2 compile flag required).
-// Legacy SHA256 hashes are still accepted on login for backward compatibility
-// and automatically re-hashed on successful login.
-// 
-// ALWAYS use this for new password creation/changes.
-static std::string hashPasswordNew(const std::string& password) {
-#ifdef VMS_HAS_ARGON2
-    const std::string salt = vms::utils::generateArgon2Salt();
-    return vms::utils::hashPasswordArgon2(password, salt);
-#else
-    // Fallback: SHA256+salt until argon2 is added to the build
-    // NOTE: This fallback format matches the migration logic in login.
-    const std::string salt = generateSaltHex();
-    return vms::utils::SHA256::hash(password + salt) + ":" + salt;
-#endif
-}
-
 // Legacy SHA256 verifier — used ONLY during migration on login.
 // DO NOT use this for creating new hashes.
 static std::string hashPasswordV2(const std::string& password, const std::string& username, const std::string& salt) {
     return vms::utils::SHA256::hash(password + username + salt);
+}
+
+// H6 + BUG-C1 FIX: hashing returns BOTH the stored hash and the salt column
+// value, so create/change/reset all share one consistent format that login
+// and the change-password verifier both recognise. Previously the fallback
+// produced "<sha256>:<salt>" while the login verifier looked for
+// hashPasswordV2(pwd, username, salt) — those two formulas never matched, so
+// any user created without argon2 could not log in.
+struct HashedPassword {
+    std::string hash;
+    std::string salt; // For argon2 we use literal "argon2" — salt is embedded in the hash string
+};
+
+static HashedPassword hashPasswordWithSalt(const std::string& password, const std::string& username) {
+#ifdef VMS_HAS_ARGON2
+    const std::string salt = vms::utils::generateArgon2Salt();
+    return { vms::utils::hashPasswordArgon2(password, salt), "argon2" };
+#else
+    const std::string salt = generateSaltHex();
+    // Use the same formula login verifies against (hashPasswordV2) so newly
+    // created users round-trip cleanly through the legacy code path until
+    // argon2 is wired in.
+    return { hashPasswordV2(password, username, salt), salt };
+#endif
+}
+
+// BUG-H1 FIX: unified verifier handles every accepted password format.
+// Previously change-password only checked legacy v2 / global-salt — argon2
+// users (or even default-admin users post-migration) could never change their
+// own password despite being able to log in.
+static bool verifyUserPassword(const std::string& password, const vms::core::User& user) {
+    if (user.password_hash.empty()) return false;
+    if (vms::utils::isArgon2Hash(user.password_hash)) {
+        return vms::utils::verifyPasswordArgon2(password, user.password_hash);
+    }
+    // Per-user salted SHA256 (current legacy + new fallback).
+    // Treat the literal markers "argon2"/"sha256" as "no actual salt stored" —
+    // those are migration markers, not real salts.
+    if (!user.salt.empty() && user.salt != "argon2" && user.salt != "sha256") {
+        if (hashPasswordV2(password, user.username, user.salt) == user.password_hash) return true;
+    }
+    if (vms::utils::SHA256::hash(password + user.username + "VMS_GLOBAL_SALT") == user.password_hash) return true;
+    if (vms::utils::SHA256::hash(password) == user.password_hash) return true;
+    return false;
 }
 
 static bool shouldUseSecureCookie(const crow::request& req) {
@@ -65,6 +94,16 @@ static bool shouldUseSecureCookie(const crow::request& req) {
 
     const std::string origin = req.get_header_value("Origin");
     return origin.rfind("https://", 0) == 0;
+}
+
+// Build a consistent HttpOnly session cookie for all login flows.
+// Pure formatting lives in `vms::utils::formatSessionCookie` (header-only,
+// testable without crow). This wrapper only resolves the runtime TTL and
+// the Secure flag from the request.
+static std::string buildSessionCookie(const std::string& token,
+                                      const crow::request& req) {
+    const int ttl_sec = vms::Config::getInstance().getAuthConfig().token_expire_minutes * 60;
+    return vms::utils::formatSessionCookie(token, ttl_sec, shouldUseSecureCookie(req));
 }
 
 static json buildAuthResponse(bool requires_2fa,
@@ -129,47 +168,24 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
             bool local_auth_success = false;
 
             if (user_opt) {
-                // H6: Verify password. Check argon2id first (new format), then legacy SHA256.
                 bool argon2_match = vms::utils::isArgon2Hash(user_opt->password_hash) &&
                                     vms::utils::verifyPasswordArgon2(password, user_opt->password_hash);
-
-                bool legacy_match = false;
-                if (!argon2_match && !vms::utils::isArgon2Hash(user_opt->password_hash)) {
-                    // Legacy formats: per-user salt, global salt, unsalted
-                    std::string v2_hash = (!user_opt->salt.empty())
-                        ? hashPasswordV2(password, user_opt->username, user_opt->salt)
-                        : std::string{};
-                    std::string global_salt_hash = vms::utils::SHA256::hash(
-                        password + user_opt->username + "VMS_GLOBAL_SALT");
-                    std::string bare_hash = vms::utils::SHA256::hash(password);
-
-                    legacy_match = (!v2_hash.empty() && v2_hash == user_opt->password_hash) ||
-                                   global_salt_hash == user_opt->password_hash ||
-                                   bare_hash == user_opt->password_hash;
-                }
+                bool legacy_match = !argon2_match && verifyUserPassword(password, *user_opt);
 
                 if (argon2_match || legacy_match) {
                     local_auth_success = true;
 
-                    // H6: Auto-migrate legacy SHA256 hashes to argon2id on successful login.
+                    // Auto-rehash legacy formats up to whichever new format we support.
                     if (legacy_match) {
-#ifdef VMS_HAS_ARGON2
                         try {
-                            const std::string new_hash = hashPasswordNew(password);
-                            repo.updatePasswordWithSalt(user_opt->id, new_hash, "argon2");
-                            user_opt->password_hash = new_hash;
-                            LOG_INFO("[Auth] Migrated password for user '{}' to argon2id", user_opt->username);
+                            auto fresh = hashPasswordWithSalt(password, user_opt->username);
+                            repo.updatePasswordWithSalt(user_opt->id, fresh.hash, fresh.salt);
+                            user_opt->password_hash = fresh.hash;
+                            user_opt->salt = fresh.salt;
+                            LOG_INFO("[Auth] Re-hashed password for '{}'", user_opt->username);
                         } catch (const std::exception& e) {
-                            LOG_WARN("[Auth] Failed to migrate password hash for '{}': {}", user_opt->username, e.what());
+                            LOG_WARN("[Auth] Re-hash failed for '{}': {}", user_opt->username, e.what());
                         }
-#else
-                        // Without argon2, still upgrade from bare/global-salt to per-user SHA256
-                        const std::string new_salt = generateSaltHex();
-                        const std::string new_hash = hashPasswordV2(password, user_opt->username, new_salt);
-                        repo.updatePasswordWithSalt(user_opt->id, new_hash, new_salt);
-                        user_opt->salt = new_salt;
-                        user_opt->password_hash = new_hash;
-#endif
                     }
                 }
             }
@@ -199,27 +215,40 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
                     );
                 }
 
+                // SEC-001: when admin is still on the factory-default password
+                // we MUST NOT issue an access token or session cookie. Doing so
+                // would let any HTTP client that knew "admin/admin" use the API
+                // freely until they happen to navigate to a UI that surfaces the
+                // password_change_required flag — which the previous frontend
+                // never did. Instead emit a short-lived password_change_pending
+                // JWT that only the change-password-on-login endpoint accepts.
+                if (must_change_password) {
+                    database::AuditRepository audit;
+                    audit.insertLog(user_opt->id, "LOGIN_DEFAULT_PWD",
+                                    "Login blocked: default password change required");
+                    return ApiUtils::createResponse(
+                        buildAuthResponse(
+                            false,
+                            user_opt,
+                            "",
+                            vms::utils::createPasswordChangeTempTokenJwt(*user_opt),
+                            true
+                        ),
+                        200,
+                        origin
+                    );
+                }
+
                 repo.updateLastLogin(user_opt->id);
                 std::string token = vms::utils::createAccessTokenJwt(*user_opt);
 
                 database::AuditRepository audit;
                 audit.insertLog(user_opt->id, "LOGIN", "Local login successful");
 
-                // H5: Set HttpOnly Secure SameSite=Strict cookie so browsers never
-                // expose the token to JavaScript (mitigates XSS token theft).
-                // The JSON response still includes the token for native/mobile clients
-                // that cannot use cookies.
-                const int ttl_sec = vms::Config::getInstance().getAuthConfig().token_expire_minutes * 60;
-                std::string cookie_val = "vms_session=" + token +
-                    "; HttpOnly; SameSite=Strict; Path=/api; Max-Age=" + std::to_string(ttl_sec);
-                if (shouldUseSecureCookie(req)) {
-                    cookie_val += "; Secure";
-                }
-
                 auto resp = ApiUtils::createResponse(
                     buildAuthResponse(false, user_opt, token, "", must_change_password),
                     200, origin);
-                resp.set_header("Set-Cookie", cookie_val);
+                resp.set_header("Set-Cookie", buildSessionCookie(token, req));
                 return resp;
             }
 
@@ -238,8 +267,19 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
                     }
                     if (user_opt) {
                         repo.updateLastLogin(user_opt->id);
+                        // BUG-21 FIX: clear rate-limit window and audit-log this login.
+                        // Local login does both; LDAP path used to skip both, leaving
+                        // failed-attempt counters live and creating an audit gap that
+                        // hid LDAP-user activity.
+                        vms::utils::RateLimiter::getInstance().recordLoginSuccess(client_ip, username);
+                        try {
+                            database::AuditRepository audit;
+                            audit.insertLog(user_opt->id, "LOGIN", "LDAP login successful");
+                        } catch (...) {}
                         std::string token = vms::utils::createAccessTokenJwt(*user_opt);
-                        return ApiUtils::createResponse(buildAuthResponse(false, user_opt, token), 200, origin);
+                        auto resp = ApiUtils::createResponse(buildAuthResponse(false, user_opt, token), 200, origin);
+                        resp.set_header("Set-Cookie", buildSessionCookie(token, req));
+                        return resp;
                     }
                 }
             }
@@ -302,7 +342,37 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
     .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
     ([](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
-        return ApiUtils::createResponse(json::object(), 200, origin);
+        if (req.method == crow::HTTPMethod::Options)
+            return ApiUtils::createResponse(json::object(), 204, origin);
+
+        // Bump token_version so the current JWT is rejected by auth middleware on next use.
+        // This invalidates all bearer tokens for this user immediately,
+        // regardless of whether the client discards them.
+        vms::core::User caller;
+        const std::string auth_header = req.get_header_value("Authorization");
+        std::string bearer;
+        if (auth_header.rfind("Bearer ", 0) == 0) bearer = auth_header.substr(7);
+        if (bearer.empty()) {
+            // Also try cookie
+            const std::string cookie_hdr = req.get_header_value("Cookie");
+            const std::string key = "vms_session=";
+            auto pos = cookie_hdr.find(key);
+            if (pos != std::string::npos) {
+                auto end = cookie_hdr.find(';', pos + key.size());
+                bearer = cookie_hdr.substr(pos + key.size(),
+                    end == std::string::npos ? std::string::npos : end - pos - key.size());
+            }
+        }
+        if (!bearer.empty() && vms::utils::decodeAccessTokenJwtUser(bearer, caller) && caller.id > 0) {
+            database::UserRepository repo;
+            repo.bumpTokenVersion(caller.id);
+        }
+
+        // Expire the session cookie so the browser drops it immediately.
+        auto resp = ApiUtils::createResponse(json::object(), 200, origin);
+        resp.set_header("Set-Cookie",
+            "vms_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0");
+        return resp;
     });
 
     // /api/users
@@ -310,13 +380,10 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Post, crow::HTTPMethod::Options)
     ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
-
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) {
-            return ApiUtils::createErrorResponse("Admin privileges required", 403, origin);
-        }
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         database::UserRepository repo;
         if (req.method == crow::HTTPMethod::Get) {
@@ -334,12 +401,11 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
                 std::string raw_pass = body.value("password", "");
                 if (user.username.empty() || raw_pass.empty()) return ApiUtils::createErrorResponse("Username and password required", 400, origin);
                 
-                user.password_hash = hashPasswordNew(raw_pass);
-#ifdef VMS_HAS_ARGON2
-                user.salt = "argon2";
-#else
-                user.salt = "sha256";
-#endif
+                {
+                    auto fresh = hashPasswordWithSalt(raw_pass, user.username);
+                    user.password_hash = fresh.hash;
+                    user.salt = fresh.salt;
+                }
                 user.role_id = body.value("role_id", 2);
                 user.full_name = body.value("full_name", "");
                 user.is_active = body.value("is_active", true);
@@ -360,11 +426,10 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Put, crow::HTTPMethod::Delete, crow::HTTPMethod::Options)
     ([&app](const crow::request& req, int id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
-
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) return ApiUtils::createErrorResponse("Admin privileges required", 403, origin);
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         database::UserRepository repo;
         if (req.method == crow::HTTPMethod::Get) {
@@ -423,24 +488,20 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
             auto user = repo.getUserById(ctx.user->id);
             if (!user.has_value()) return ApiUtils::createErrorResponse("User not found", 404, origin);
 
-            std::string expected_old = "";
-            if (!user->salt.empty()) {
-                expected_old = hashPasswordV2(old_pass, user->username, user->salt);
-            } else {
-                expected_old = vms::utils::SHA256::hash(old_pass + user->username + "VMS_GLOBAL_SALT");
+            // BUG-H1 FIX: use the unified verifier so users on argon2 / default-admin
+            // bare-SHA256 / per-user salted SHA256 / global-salt all succeed when the
+            // old password is correct. Previously only legacy v2 / global salt were
+            // checked → argon2-hashed users got "Invalid old password" forever.
+            if (!verifyUserPassword(old_pass, *user)) {
+                return ApiUtils::createErrorResponse("Invalid old password", 401, origin);
             }
-            if (user->password_hash != expected_old) return ApiUtils::createErrorResponse("Invalid old password", 401, origin);
 
-            // H6: Use argon2id for new password
-            std::string new_hash = hashPasswordNew(new_pass);
-            std::string new_salt;
-#ifdef VMS_HAS_ARGON2
-            new_salt = "argon2";
-#else
-            new_salt = "sha256";
-#endif
-            if (repo.updatePasswordWithSalt(user->id, new_hash, new_salt)) {
-                // SEC-001: Clear default-password flag if admin just changed their password
+            auto fresh = hashPasswordWithSalt(new_pass, user->username);
+            if (repo.updatePasswordWithSalt(user->id, fresh.hash, fresh.salt)) {
+                // BUG-H3 FIX: invalidate any existing JWTs for this user. Before this
+                // bump, an attacker who had captured the user's token kept full access
+                // even after the user reacted by changing the password.
+                repo.bumpTokenVersion(user->id);
                 if (user->username == "admin" &&
                     vms::database::default_password_active.load(std::memory_order_acquire)) {
                     vms::database::default_password_active.store(false, std::memory_order_release);
@@ -463,7 +524,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) return ApiUtils::createErrorResponse("Admin required", 403, origin);
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);
@@ -474,15 +535,11 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
             auto u = repo.getUserById(id);
             if (!u.has_value()) return ApiUtils::createErrorResponse("User not found", 404, origin);
             
-            std::string h = hashPasswordNew(new_pass);
-            std::string new_salt;
-#ifdef VMS_HAS_ARGON2
-            new_salt = "argon2";
-#else
-            new_salt = "sha256";
-#endif
-            if (repo.updatePasswordWithSalt(id, h, new_salt)) {
-                // SEC-001: Clear default-password flag when admin account is reset
+            auto fresh = hashPasswordWithSalt(new_pass, u->username);
+            if (repo.updatePasswordWithSalt(id, fresh.hash, fresh.salt)) {
+                // BUG-H3 FIX: bump token_version on admin reset too, so the target
+                // user's existing sessions are dropped.
+                repo.bumpTokenVersion(id);
                 if (u->username == "admin" &&
                     vms::database::default_password_active.load(std::memory_order_acquire)) {
                     vms::database::default_password_active.store(false, std::memory_order_release);
@@ -508,7 +565,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || ctx.user->role_id != 1) return ApiUtils::createErrorResponse("Admin required", 403, origin);
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
 
         if (req.method == crow::HTTPMethod::Get) {
             auto p = database::PermissionRepository::getPermissions(id);
@@ -637,17 +694,124 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
 
             if (user_opt && user_opt->two_factor_enabled) {
                 if (vms::utils::TOTP::verifyCode(user_opt->two_factor_secret, code)) {
+                    // SEC-001: same default-password block applies after 2FA.
+                    // 2FA proves possession but not that the password has been
+                    // rotated; admin/admin + correct TOTP must still go through
+                    // the change-password gate.
+                    const bool must_change_password =
+                        user_opt->username == "admin" &&
+                        vms::database::default_password_active.load(std::memory_order_acquire);
+
+                    if (must_change_password) {
+                        database::AuditRepository audit;
+                        audit.insertLog(user_opt->id, "LOGIN_2FA_DEFAULT_PWD",
+                                        "2FA OK but default password change required");
+                        return ApiUtils::createResponse(
+                            buildAuthResponse(
+                                false,
+                                user_opt,
+                                "",
+                                vms::utils::createPasswordChangeTempTokenJwt(*user_opt),
+                                true
+                            ),
+                            200,
+                            origin
+                        );
+                    }
+
                     repo.updateLastLogin(user_opt->id);
                     std::string token = vms::utils::createAccessTokenJwt(*user_opt);
-                    
+
                     database::AuditRepository audit;
                     audit.insertLog(user_opt->id, "LOGIN_2FA", "2FA verification successful");
 
-                    return ApiUtils::createResponse(buildAuthResponse(false, user_opt, token), 200, origin);
+                    auto resp = ApiUtils::createResponse(buildAuthResponse(false, user_opt, token), 200, origin);
+                    resp.set_header("Set-Cookie", buildSessionCookie(token, req));
+                    return resp;
                 }
             }
         } catch (...) {}
         return ApiUtils::createErrorResponse("Invalid 2FA code", 401, origin);
+    });
+
+    // SEC-001: POST /api/auth/change-password-on-login
+    // Completes the default-password change gate. Accepts a
+    // password_change_pending JWT (issued by /login or /2fa/verify when
+    // default_password_active was set) plus the new password. On success
+    // updates the password, clears the global flag, bumps token_version
+    // (so any leaked access token from before the rotation is dead), and
+    // issues the real access token + session cookie.
+    CROW_ROUTE(app, "/api/auth/change-password-on-login")
+    .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
+    ([](const crow::request& req) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        if (req.method == crow::HTTPMethod::Options)
+            return ApiUtils::createResponse(json::object(), 204, origin);
+
+        try {
+            auto body = json::parse(req.body);
+            std::string temp_token = body.value("temp_token", "");
+            std::string new_pass   = body.value("new_password", "");
+
+            if (temp_token.empty()) {
+                return ApiUtils::createErrorResponse("temp_token is required", 400, origin);
+            }
+            if (new_pass.size() < 8 || new_pass.size() > 256) {
+                return ApiUtils::createErrorResponse("new_password must be 8-256 characters", 400, origin);
+            }
+
+            int user_id = 0;
+            if (!vms::utils::verifyPasswordChangeTempTokenJwt(temp_token, user_id)) {
+                return ApiUtils::createErrorResponse("Invalid or expired temp_token", 401, origin);
+            }
+
+            database::UserRepository repo;
+            auto user = repo.getUserById(user_id);
+            if (!user.has_value()) {
+                return ApiUtils::createErrorResponse("User not found", 404, origin);
+            }
+
+            // Reject reusing the factory-default password.
+            if (verifyUserPassword(new_pass, *user)) {
+                return ApiUtils::createErrorResponse(
+                    "New password must differ from the current one", 400, origin);
+            }
+
+            auto fresh = hashPasswordWithSalt(new_pass, user->username);
+            if (!repo.updatePasswordWithSalt(user->id, fresh.hash, fresh.salt)) {
+                return ApiUtils::createErrorResponse("Failed to update password", 500, origin);
+            }
+
+            // Invalidate any stale tokens issued before this rotation.
+            repo.bumpTokenVersion(user->id);
+            // Reflect the bump in the in-memory user we are about to sign a
+            // fresh access token for — otherwise the new token's `ver` claim
+            // would still match the pre-bump version.
+            ++user->token_version;
+            user->password_hash = fresh.hash;
+            user->salt = fresh.salt;
+
+            if (user->username == "admin" &&
+                vms::database::default_password_active.load(std::memory_order_acquire)) {
+                vms::database::default_password_active.store(false, std::memory_order_release);
+                LOG_INFO("SEC-001: Admin default password cleared via change-on-login");
+            }
+
+            database::AuditRepository audit;
+            audit.insertLog(user->id, "CHANGE_PASSWORD_ON_LOGIN",
+                            "Default password rotated during login");
+
+            repo.updateLastLogin(user->id);
+            std::string token = vms::utils::createAccessTokenJwt(*user);
+
+            auto resp = ApiUtils::createResponse(
+                buildAuthResponse(false, user, token, "", false),
+                200, origin);
+            resp.set_header("Set-Cookie", buildSessionCookie(token, req));
+            return resp;
+        } catch (const std::exception& e) {
+            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+        }
     });
 }
 

@@ -61,6 +61,9 @@ class ZoneManager {
 public:
     static ZoneManager& getInstance();
     
+    // Persistence
+    void loadFromDb();
+
     // Zone CRUD
     bool addZone(const Zone& zone);
     bool removeZone(int zone_id);

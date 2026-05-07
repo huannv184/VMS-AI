@@ -25,6 +25,8 @@ public:
     void stop();
 
     bool isRunning() const { return running_.load(); }
+    uint64_t getMessagesReceived() const { return messages_received_.load(std::memory_order_relaxed); }
+    uint64_t getMessagesDropped() const { return messages_dropped_.load(std::memory_order_relaxed); }
 
 Q_SIGNALS:
     // Emitted when an event arrives (for future Phase C consumers)
@@ -52,6 +54,9 @@ private:
     QThread* thread_{nullptr};
     std::atomic<bool> running_{ false };
     std::atomic<bool> stop_requested_{ false };
+    
+    std::atomic<uint64_t> messages_received_{0};
+    std::atomic<uint64_t> messages_dropped_{0};
 
     std::unique_ptr<zmq::context_t> context_;
     std::unique_ptr<zmq::socket_t>  socket_;

@@ -5,9 +5,20 @@ const SidebarLeft = ({ isVisible = true }) => {
   const cameras = useVmsStore((state) => state.cameras);
   const systemStats = useVmsStore((state) => state.systemStats);
   const [activeCam, setActiveCam] = useState(null);
+  const [search, setSearch] = useState('');
   const [expandedSections, setExpandedSections] = useState({
     system: true,
   });
+
+  const filteredCameras = React.useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return cameras;
+    return cameras.filter((c) =>
+      (c.name || '').toLowerCase().includes(q) ||
+      String(c.id).includes(q) ||
+      (c.description || '').toLowerCase().includes(q)
+    );
+  }, [cameras, search]);
 
   const toggleSection = (sec) => {
     setExpandedSections(prev => ({ ...prev, [sec]: !prev[sec] }));
@@ -25,10 +36,27 @@ const SidebarLeft = ({ isVisible = true }) => {
     <div className="sidebar-left" id="sidebarLeft" style={{ display: isVisible ? 'flex' : 'none' }}>
       <div style={{padding:'12px', borderBottom:'1px solid var(--border)'}}>
         <div style={{position:'relative'}}>
-          <input className="search-input" type="text" placeholder="Tìm camera..." style={{width:'100%'}} />
-          <svg style={{position:'absolute', right:'10px', top:'7px', color:'var(--text-dim)', width:'12px', height:'12px'}} viewBox="0 0 14 14" fill="currentColor">
-            <path d="M12.7 11.3L9.8 8.4A5 5 0 108.4 9.8l2.9 2.9a1 1 0 001.4-1.4zM5 8a3 3 0 110-6 3 3 0 010 6z"/>
-          </svg>
+          <input
+            className="search-input"
+            type="text"
+            placeholder="Tìm camera..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{width:'100%', paddingRight:'24px'}}
+          />
+          {search ? (
+            <svg
+              onClick={() => setSearch('')}
+              style={{position:'absolute', right:'10px', top:'7px', color:'var(--text-dim)', width:'12px', height:'12px', cursor:'pointer'}}
+              viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5"
+            >
+              <path d="M3 3l8 8M11 3l-8 8" />
+            </svg>
+          ) : (
+            <svg style={{position:'absolute', right:'10px', top:'7px', color:'var(--text-dim)', width:'12px', height:'12px'}} viewBox="0 0 14 14" fill="currentColor">
+              <path d="M12.7 11.3L9.8 8.4A5 5 0 108.4 9.8l2.9 2.9a1 1 0 001.4-1.4zM5 8a3 3 0 110-6 3 3 0 010 6z"/>
+            </svg>
+          )}
         </div>
       </div>
 
@@ -37,14 +65,14 @@ const SidebarLeft = ({ isVisible = true }) => {
         <div className="sidebar-section">
           <div className="sidebar-section-title" onClick={() => toggleSection('system')}>
             <span>📹 Hệ thống Camera</span>
-            <span className="section-count">{cameras.length}</span>
+            <span className="section-count">{search ? `${filteredCameras.length}/${cameras.length}` : cameras.length}</span>
           </div>
           {expandedSections.system && (
             <>
-              {cameras.map(cam => (
-                <div 
+              {filteredCameras.map(cam => (
+                <div
                   key={cam.id}
-                  className={`tree-item sub ${activeCam === cam.id ? 'active' : ''}`} 
+                  className={`tree-item sub ${activeCam === cam.id ? 'active' : ''}`}
                   onClick={() => setActiveCam(cam.id)}
                 >
                   <svg className="cam-icon" viewBox="0 0 14 14" fill="currentColor">
@@ -59,6 +87,11 @@ const SidebarLeft = ({ isVisible = true }) => {
               {cameras.length === 0 && (
                 <div style={{padding:'10px 20px', fontSize:'11px', color:'var(--text-dim)', textAlign:'center'}}>
                    Chưa có camera nào được cấu hình
+                </div>
+              )}
+              {cameras.length > 0 && filteredCameras.length === 0 && (
+                <div style={{padding:'10px 20px', fontSize:'11px', color:'var(--text-dim)', textAlign:'center'}}>
+                   Không tìm thấy camera khớp "{search}"
                 </div>
               )}
             </>

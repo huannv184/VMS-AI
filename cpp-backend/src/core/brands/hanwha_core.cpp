@@ -3,6 +3,8 @@
 #include "utils/logger.h"
 #include <vector>
 #include <string>
+#include <chrono>
+#include <thread>
 
 namespace vms {
 namespace core {
@@ -108,35 +110,16 @@ bool HanwhaCore::ptzControl(const CameraDiscovery::DiscoveryConfig& cfg, const s
     return adapter.ptzControl(cmd);
 }
 
+// BUG-EVENTS-01 (2026-05-07): pre-fix called a no-op
+// `HanwhaAdapter::startEventSubscription` and spun a keepalive loop. Real
+// Hanwha SUNAPI event subscription was never wired.
 void HanwhaCore::pullEvents(const CameraDiscovery::DiscoveryConfig& cfg, std::function<bool(const std::string&)> onEvent) {
-    vms::CameraConfig vcfg;
-    vcfg.ip = cfg.host;
-    vcfg.username = cfg.username;
-    vcfg.password = cfg.password;
-    vcfg.httpPort = cfg.http_port;
-    vms::HanwhaAdapter adapter(vcfg);
-    
-    if (!adapter.connect()) return;
-
-    std::atomic<bool> isRunning{true};
-    adapter.startEventSubscription([&](const vms::CameraEvent& ev) {
-        std::string typeMap = "EventNotificationAlert"; 
-        if (ev.type == vms::CameraEvent::Type::Motion) typeMap = "VMD";
-        else if (ev.type == vms::CameraEvent::Type::LineCrossing) typeMap = "linedetection";
-        else if (ev.type == vms::CameraEvent::Type::Intrusion) typeMap = "fielddetection";
-
-        std::string fakeXml = std::string(60, ' ') + "<EventNotificationAlert><eventType>" + typeMap + "</eventType></EventNotificationAlert>";
-        if (!onEvent(fakeXml)) {
-            isRunning = false;
-        }
-    }, nullptr);
-
-    while (isRunning) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        if (!onEvent("keepalive")) {
-            isRunning = false;
-        }
-    }
+    LOG_WARN("[HanwhaCore] Hardware event subscription is NOT implemented "
+             "for Hanwha host {}:{}. Real Hanwha events require SUNAPI "
+             "event stream wiring. Sleeping 60s before returning.",
+             cfg.host, cfg.http_port);
+    (void)onEvent;
+    std::this_thread::sleep_for(std::chrono::seconds(60));
 }
 
 } // namespace brands

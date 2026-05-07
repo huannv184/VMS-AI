@@ -245,11 +245,11 @@ void CameraPipeline::processingLoop() {
             tracked_objects.push_back(to);
         }
 
-        // 4. Shared Memory Write - DISABLED (In-Process Optimization)
-        // if (shm_manager_) {
-        //     shm_manager_->writeMetadata(result, tracked_objects, config_.camera_id, 
-        //                               frame.image.cols, frame.image.rows);
-        // }
+        // 4. Shared Memory Write — required for main backend to receive AI results
+        if (shm_manager_) {
+            shm_manager_->writeMetadata(result, tracked_objects, config_.camera_id,
+                                        frame.image.cols, frame.image.rows);
+        }
 
         // 5. Callback (Zero-Copy Broadcast)
         {

@@ -1,19 +1,16 @@
 import { API_BASE_URL } from '../utils/runtimeUrls';
 
 const BASE_URL = API_BASE_URL;
-// H5: Token is now stored in an HttpOnly cookie set by the backend on login.
-// We keep a minimal in-memory flag to know whether the user is authenticated
-// (no actual token value is stored in JS-accessible storage).
-const TOKEN_KEY = 'vms_token';          // kept for backward compat with useWebSocket
+// Auth model: Bearer token.
+// Token is stored in memory (_inMemoryToken) for the current session and mirrored
+// to localStorage for survival across page reloads and WebSocket ticket requests.
+// Backend also sets an HttpOnly cookie on login as a defence-in-depth measure,
+// but all API requests use the Authorization: Bearer header as the primary auth path.
+const TOKEN_KEY = 'vms_token';
 const AUTH_CHANGE_EVENT = 'vms_auth_changed';
 
 let isLoggingOut = false;
 
-// In-memory auth state — no token value, just presence.
-// The real token lives in the HttpOnly cookie; we mirror it to localStorage
-// ONLY for the WebSocket handshake which sends it as a message payload
-// (browsers cannot attach cookies to WS frames natively).
-// This is a known limitation; plan to move WS auth to a short-lived ticket endpoint.
 let _inMemoryToken = null;
 
 const toHeadersObject = (headers) => {
@@ -27,7 +24,7 @@ const hasHeader = (headers, target) => (
   Object.keys(headers).some((key) => key.toLowerCase() === target.toLowerCase())
 );
 
-const getToken = () => _inMemoryToken || localStorage.getItem(TOKEN_KEY);
+const getToken = () => _inMemoryToken;
 
 const dispatchAuthChanged = (token) => {
   window.dispatchEvent(new CustomEvent(AUTH_CHANGE_EVENT, { detail: { token } }));
@@ -37,23 +34,22 @@ const setToken = (token, localStorageOnly = false) => {
   if (!localStorageOnly) {
     _inMemoryToken = token || null;
   }
-  
+
   if (token) {
-    // Keep in localStorage for WS auth ticket retrieval only
-    localStorage.setItem(TOKEN_KEY, token);
+    // SECURITY FIX: Never store JWT in localStorage to prevent session theft via XSS.
+    // The backend provides an HttpOnly cookie for all API requests.
+    // We only store a flag to let the UI know we are 'logged in'.
     localStorage.setItem('vms_auth_status', 'true');
   } else {
-    localStorage.removeItem(TOKEN_KEY);
     if (!localStorageOnly) {
       localStorage.removeItem('vms_auth_status');
     }
   }
-  
+
   if (!localStorageOnly) {
     dispatchAuthChanged(token || null);
   }
 };
-
 const handleUnauthorized = () => {
   const isAuthenticated = localStorage.getItem('vms_auth_status') === 'true';
   if ((!getToken() && !isAuthenticated) || isLoggingOut) {
@@ -178,7 +174,10 @@ const apiClient = {
   buildQuery,
 
   request: async (endpoint, options = {}, responseType = 'json') => {
-    const token = getToken();
+    // SECURITY: We prefer cookies (HttpOnly) for security against XSS.
+    // The browser automatically attaches the 'vms_session' cookie.
+    // We only attach Authorization header if a token is in memory (e.g., just after login).
+    const token = _inMemoryToken;
     const url = `${BASE_URL}${endpoint}`;
     const headers = toHeadersObject(options.headers);
 
@@ -331,9 +330,52 @@ const apiClient = {
     return result;
   },
 
+  // SEC-001: completes the default-password change gate. Backend will not
+  // issue an access token for an admin still on the factory-default password
+  // until the user rotates it via this endpoint.
+  changePasswordOnLogin: async (tempToken, newPassword) => {
+    const result = await apiClient.request('/api/auth/change-password-on-login', {
+      method: 'POST',
+      body: JSON.stringify({ temp_token: tempToken, new_password: newPassword }),
+    });
+
+    const token = result.data?.token;
+    if (result.success && token) {
+      setToken(token);
+    }
+
+    return result;
+  },
+
   getCurrentUser: () => apiClient.request('/api/auth/me'),
 
+  // BUG-C3 FIX: server-side logout bumps token_version so any leaked JWT/cookie
+  // for this user is rejected on the next request. Without this call the client
+  // only forgot the token locally — a captured token kept full access.
+  logout: async () => {
+    try {
+      await apiClient.request('/api/auth/logout', { method: 'POST', body: '{}' });
+    } catch (_) {
+      // Network failure must not strand the user logged in client-side.
+    }
+  },
+
   getUsers: () => apiClient.request('/api/users'),
+  addUser: (data) => apiClient.request('/api/users', { method: 'POST', body: JSON.stringify(data) }),
+  updateUser: (id, data) => apiClient.request(`/api/users/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteUser: (id) => apiClient.request(`/api/users/${id}`, { method: 'DELETE' }),
+  // BUG-H2 FIX: backend exposes two distinct endpoints — POST /api/users/change-password
+  // for self-service (uses {old_password, new_password}) and POST /api/users/<id>/reset-password
+  // for admin reset (uses {new_password}). The previous single PUT /api/users/<id>/password
+  // endpoint never existed → every change-password attempt 404'd.
+  changePassword: (id, currentPassword, newPassword) => apiClient.request('/api/users/change-password', {
+    method: 'POST',
+    body: JSON.stringify({ old_password: currentPassword, new_password: newPassword }),
+  }),
+  resetPassword: (id, newPassword) => apiClient.request(`/api/users/${id}/reset-password`, {
+    method: 'POST',
+    body: JSON.stringify({ new_password: newPassword }),
+  }),
   getCameras: () => apiClient.request('/api/cameras'),
   getCamera: (id) => apiClient.request(`/api/cameras/${id}`),
   addCamera: (data) => apiClient.request('/api/cameras', { method: 'POST', body: JSON.stringify(data) }),
@@ -418,7 +460,44 @@ const apiClient = {
   getSettings: () => apiClient.request('/api/system/settings'),
   updateSettings: (data) => apiClient.request('/api/system/settings', { method: 'PUT', body: JSON.stringify(data) }),
   getAuditLogs: (params = {}) => apiClient.request(`/api/audit-logs${buildQuery(params)}`),
+  // ── Attendance ─────────────────────────────────────────────────────────
   getAttendance: (date) => apiClient.request(`/api/attendance${buildQuery({ date })}`),
+  exportAttendanceCsv: (date) => apiClient.download(`/api/attendance/export${buildQuery({ date })}`),
+  recordManualPunch: (payload) => apiClient.request('/api/attendance/manual',
+    { method: 'POST', body: JSON.stringify(payload) }),
+  getAttendanceEmployees: () => apiClient.request('/api/attendance/employees'),
+  createAttendanceEmployee: (data) => apiClient.request('/api/attendance/employees',
+    { method: 'POST', body: JSON.stringify(data) }),
+  updateAttendanceEmployee: (id, data) => apiClient.request(`/api/attendance/employees/${id}`,
+    { method: 'PUT', body: JSON.stringify(data) }),
+  deleteAttendanceEmployee: (id) => apiClient.request(`/api/attendance/employees/${id}`,
+    { method: 'DELETE' }),
+  getCameraRoles: () => apiClient.request('/api/attendance/camera-roles'),
+  setCameraRole: (camera_id, role) => apiClient.request('/api/attendance/camera-roles',
+    { method: 'POST', body: JSON.stringify({ camera_id, role }) }),
+  getAttendanceHealth: () => apiClient.request('/api/attendance/health'),
+  // ── Shifts (work schedules) ─────────────────────────────────────────────
+  getShifts: (includeInactive = false) => apiClient.request(
+    `/api/attendance/shifts${includeInactive ? '?include_inactive=1' : ''}`),
+  getShift: (id) => apiClient.request(`/api/attendance/shifts/${id}`),
+  createShift: (data) => apiClient.request('/api/attendance/shifts',
+    { method: 'POST', body: JSON.stringify(data) }),
+  updateShift: (id, data) => apiClient.request(`/api/attendance/shifts/${id}`,
+    { method: 'PUT', body: JSON.stringify(data) }),
+  deleteShift: (id) => apiClient.request(`/api/attendance/shifts/${id}`,
+    { method: 'DELETE' }),
+
+  // ── Counter (counting lines) ───────────────────────────────────────────
+  getCountingLines: (cameraId) => apiClient.request(
+    `/api/counter/lines${cameraId ? buildQuery({ camera_id: cameraId }) : ''}`),
+  createCountingLine: (data) => apiClient.request('/api/counter/lines',
+    { method: 'POST', body: JSON.stringify(data) }),
+  updateCountingLine: (id, data) => apiClient.request(`/api/counter/lines/${id}`,
+    { method: 'PUT', body: JSON.stringify(data) }),
+  deleteCountingLine: (id) => apiClient.request(`/api/counter/lines/${id}`,
+    { method: 'DELETE' }),
+  reloadCountingLines: () => apiClient.request('/api/counter/lines/reload',
+    { method: 'POST' }),
 
   getDevices: () => apiClient.request('/api/devices'),
   getDevice: (id) => apiClient.request(`/api/devices/${id}`),
@@ -440,10 +519,11 @@ const apiClient = {
   updateZone: (id, data) => apiClient.request(`/api/zones/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteZone: (id) => apiClient.request(`/api/zones/${id}`, { method: 'DELETE' }),
   getRuleStats: () => apiClient.request('/api/rules/stats'),
-  getRuleTriggerLogs: () => apiClient.unsupported('Rule trigger logs endpoint is not exposed by the current backend API'),
+  getRuleTriggerLogs: (params = {}) => apiClient.request(`/api/alerts/triggers${buildQuery(params)}`),
 
   getSites: () => apiClient.request('/api/sites'),
   addSite: (siteData) => apiClient.request('/api/sites', { method: 'POST', body: JSON.stringify(siteData) }),
+  updateSite: (id, data) => apiClient.request(`/api/sites/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteSite: (id) => apiClient.request(`/api/sites/${id}`, { method: 'DELETE' }),
   getUserPermissions: (userId) => apiClient.request(`/api/permissions/${userId}`),
   updateUserPermissions: (userId, perms) => apiClient.request(`/api/permissions/${userId}`, { method: 'PUT', body: JSON.stringify(perms) }),

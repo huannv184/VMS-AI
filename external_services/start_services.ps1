@@ -35,8 +35,12 @@ if ($minioProc) {
     Write-Host "MinIO is already running." -ForegroundColor Gray
 } else {
     Write-Host "Starting MinIO..." -ForegroundColor Green
-    $env:MINIO_ROOT_USER = "minioadmin"
-    $env:MINIO_ROOT_PASSWORD = "minioadmin"
+    # Read credentials from environment; abort if not set to prevent insecure defaults.
+    if (-not $env:MINIO_ROOT_USER -or -not $env:MINIO_ROOT_PASSWORD) {
+        Write-Host "ERROR: MINIO_ROOT_USER and MINIO_ROOT_PASSWORD must be set in the environment." -ForegroundColor Red
+        Write-Host "  Example:  `$env:MINIO_ROOT_USER='admin'; `$env:MINIO_ROOT_PASSWORD='changeme123'" -ForegroundColor Yellow
+        exit 1
+    }
     Start-Process -FilePath $minioExe -ArgumentList "server `"$minioData`" --console-address :9001" -NoNewWindow
 }
 
@@ -53,7 +57,7 @@ if ($mtxProc) {
 
 Write-Host "---------------------------" -ForegroundColor Cyan
 Write-Host "MinIO API: http://localhost:9000"
-Write-Host "MinIO Console: http://localhost:9001 (minioadmin / minioadmin)"
+Write-Host "MinIO Console: http://localhost:9001 (credentials from MINIO_ROOT_USER/MINIO_ROOT_PASSWORD env)"
 Write-Host "PostgreSQL Port: 5432 (User: postgres, DB: vms_ai)"
 Write-Host "MediaMTX RTSP: rtsp://localhost:8554"
 Write-Host "---------------------------"

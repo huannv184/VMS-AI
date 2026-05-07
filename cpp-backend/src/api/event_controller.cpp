@@ -44,9 +44,15 @@ long long normalizeQueryTimestamp(long long timestamp) {
 }
 
 void bindNormalizedEventType(QSqlQuery& query, int& bind_idx, const std::string& normalized_type) {
+    // BUG-22: ZMQ event handlers were normalised to UPPERCASE on 2026-04-27 to
+    // match frontend filter expectations. The list filter here was still binding
+    // only lowercase variants → freshly inserted INTRUSION/LOITERING/FIRE/SMOKE/
+    // PPE_VIOLATION events would never appear in the filtered list. Bind both
+    // cases everywhere we used to bind one.
     if (normalized_type == "ppe") {
         query.bindValue(bind_idx++, QStringLiteral("ppe"));
         query.bindValue(bind_idx++, QStringLiteral("ppe_violation"));
+        query.bindValue(bind_idx++, QStringLiteral("PPE_VIOLATION"));
     } else if (normalized_type == "face") {
         query.bindValue(bind_idx++, QStringLiteral("face"));
         query.bindValue(bind_idx++, QStringLiteral("face_recognition"));
@@ -54,6 +60,7 @@ void bindNormalizedEventType(QSqlQuery& query, int& bind_idx, const std::string&
     } else if (normalized_type == "detection") {
         query.bindValue(bind_idx++, QStringLiteral("detection"));
         query.bindValue(bind_idx++, QStringLiteral("%_detected"));
+        query.bindValue(bind_idx++, QStringLiteral("%_DETECTED"));
     } else if (!normalized_type.empty()) {
         query.bindValue(bind_idx++, QString::fromStdString(normalized_type));
     }
@@ -77,11 +84,12 @@ int getFilteredEventCount(int camera_id,
     }
     if (!normalized_type.empty()) {
         if (normalized_type == "ppe") {
-            where_clauses.emplace_back("(event_type = ? OR event_type = ?)");
+            // BUG-22: 3rd placeholder for UPPERCASE PPE_VIOLATION introduced 2026-04-27
+            where_clauses.emplace_back("(event_type = ? OR event_type = ? OR event_type = ?)");
         } else if (normalized_type == "face") {
             where_clauses.emplace_back("(event_type = ? OR event_type = ? OR event_type = ?)");
         } else if (normalized_type == "detection") {
-            where_clauses.emplace_back("(event_type = ? OR event_type LIKE ?)");
+            where_clauses.emplace_back("(event_type = ? OR event_type LIKE ? OR event_type LIKE ?)");
         } else {
             where_clauses.emplace_back("event_type = ?");
         }
@@ -153,7 +161,7 @@ static json enrichEvent(const Event& evt) {
     const std::string normalized_type = normalizeEventType(evt.event_type);
 
     // 1. Fix Timestamp (seconds -> milliseconds for JS)
-    j["timestamp"] = (uint64_t)evt.timestamp * 1000;
+    j["timestamp"] = (uint64_t)evt.timestamp;
     j["event_type"] = normalized_type;
     j["raw_event_type"] = evt.event_type;
 
@@ -216,6 +224,44 @@ static json enrichEvent(const Event& evt) {
 }
 
 void EventController::registerRoutes(vms::server::VmsApp& app) {
+
+    // =========================================================================
+    // DEBUG: POST /api/events/fire-test
+    // Tạo event thật + broadcast WS để kiểm tra pipeline end-to-end
+    // Body: {"camera_id": 1, "event_type": "INTRUSION", "description": "Test"}
+    // =========================================================================
+    CROW_ROUTE(app, "/api/events/fire-test")
+    .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
+    ([](const crow::request& req) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        if (req.method == crow::HTTPMethod::Options) {
+            return ApiUtils::createResponse(json::object(), 204, origin);
+        }
+        try {
+            json body = json::object();
+            if (!req.body.empty()) {
+                try { body = json::parse(req.body); } catch (...) {}
+            }
+
+            vms::Event evt;
+            evt.id = vms::core::EventManager::getInstance().generateEventId();
+            evt.camera_id   = body.value("camera_id", 1);
+            evt.event_type  = body.value("event_type", std::string("INTRUSION"));
+            evt.description = body.value("description", std::string("Test event từ API"));
+            evt.severity    = body.value("severity", std::string("MEDIUM"));
+            evt.timestamp   = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            evt.metadata_json = json{{"source", "fire-test"}, {"confidence", 0.95}}.dump();
+
+            bool ok = vms::core::EventManager::getInstance().createEvent(evt);
+            return ApiUtils::createResponse(
+                json{{"fired", ok}, {"event_id", evt.id}, {"event_type", evt.event_type}},
+                ok ? 200 : 500, origin);
+        } catch (const std::exception& e) {
+            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+        }
+    });
+
     // GET events with filters
     CROW_ROUTE(app, "/api/events")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
@@ -389,91 +435,11 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
         }
     });
 
-    // GET attendance
-    CROW_ROUTE(app, "/api/attendance")
-    .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
-        std::string origin = ApiUtils::resolveCorsOrigin(req);
-        if (req.method == crow::HTTPMethod::Options) {
-            return ApiUtils::createResponse(json::object(), 204, origin);
-        }
-
-        try {
-            std::string date_str = "";
-            if (req.url_params.get("date")) {
-                date_str = req.url_params.get("date");
-            }
-            if (date_str.empty()) {
-                // Default to today YYYY-MM-DD
-                auto t = std::time(nullptr);
-                auto tm = *std::localtime(&t);
-                char buf[32];
-                std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
-                date_str = buf;
-            }
-
-            auto& db = vms::database::DbManager::getInstance();
-            QSqlDatabase conn = db.getThreadConnection();
-
-            // Extract the name from metadata_json, group by name, and find min/max timestamp for the specific date.
-            std::string sql;
-            if (vms::Config::getInstance().getDatabaseConfig().driver == "postgresql") {
-                sql = R"(
-                    SELECT
-                        metadata_json->>'name' as person_name,
-                        MIN(timestamp) as check_in,
-                        MAX(timestamp) as check_out
-                    FROM events
-                    WHERE (event_type = 'face' OR event_type = 'face_recognition')
-                      AND metadata_json->>'name' IS NOT NULL
-                      AND metadata_json->>'name' != 'unknown'
-                      AND metadata_json->>'name' != 'Unknown'
-                      AND to_char(to_timestamp(timestamp), 'YYYY-MM-DD') = ?
-                    GROUP BY person_name
-                )";
-            } else {
-                sql = R"(
-                    SELECT
-                        json_extract(metadata_json, '$.name') as person_name,
-                        MIN(timestamp) as check_in,
-                        MAX(timestamp) as check_out
-                    FROM events
-                    WHERE (event_type = 'face' OR event_type = 'face_recognition')
-                      AND json_extract(metadata_json, '$.name') IS NOT NULL
-                      AND json_extract(metadata_json, '$.name') != 'unknown'
-                      AND json_extract(metadata_json, '$.name') != 'Unknown'
-                      AND date(timestamp, 'unixepoch', 'localtime') = ?
-                    GROUP BY person_name
-                )";
-            }
-
-            json result = json::array();
-            QSqlQuery query(conn);
-            query.prepare(QString::fromStdString(sql));
-            query.bindValue(0, QString::fromStdString(date_str));
-
-            if (query.exec()) {
-                while (query.next()) {
-                    std::string name = query.value(0).isNull() ? "Người Lạ" : query.value(0).toString().toStdString();
-                    uint64_t check_in = query.value(1).toLongLong() * 1000; // to ms
-                    uint64_t check_out = query.value(2).toLongLong() * 1000;
-
-                    result.push_back({
-                        {"person_name", name},
-                        {"check_in", check_in},
-                        {"check_out", check_out},
-                        {"date", date_str}
-                    });
-                }
-            } else {
-                return ApiUtils::createErrorResponse("Database query failed", 500, origin);
-            }
-
-            return ApiUtils::createResponse({{"attendance", result}}, 200, origin);
-        } catch (const std::exception& e) {
-             return ApiUtils::createErrorResponse(e.what(), 500, origin);
-        }
-    });
+    // /api/attendance moved to AttendanceController. The new endpoint reads
+    // from attendance_events (populated by AttendanceTracker) with a fallback
+    // to the legacy events-table query when the day has no rows yet, so the
+    // UI keeps working during migration. Re-registering it here would trigger
+    // BUG-HTTP-01 (Crow throws "handler already exists" → port 8000 silent).
 
     // GET event video clip
     CROW_ROUTE(app, "/api/events/<string>/video")
@@ -494,17 +460,18 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
 
             auto evt = event_opt.value();
 
-            // Extract video_path from metadata JSON
-            std::string video_path;
-            try {
-                if (!evt.metadata_json.empty()) {
-                    json meta = json::parse(evt.metadata_json);
-                    if (meta.contains("video_path")) {
-                        video_path = meta["video_path"].get<std::string>();
+            // Prefer the DB video_path column (set by BufferPipeline after recording).
+            // Fall back to metadata_json["video_path"] for legacy/external events.
+            std::string video_path = evt.video_path;
+            if (video_path.empty()) {
+                try {
+                    if (!evt.metadata_json.empty()) {
+                        json meta = json::parse(evt.metadata_json);
+                        if (meta.contains("video_path")) {
+                            video_path = meta["video_path"].get<std::string>();
+                        }
                     }
-                }
-            } catch (...) {
-                // Ignore JSON parse errors
+                } catch (...) {}
             }
 
             if (video_path.empty() || !std::filesystem::exists(video_path)) {

@@ -5,9 +5,18 @@ const SidebarRight = ({ isVisible = true }) => {
   const [activePanel, setActivePanel] = useState('alerts');
   const counts = useVmsStore((state) => state.counts);
   const alarms = useVmsStore((state) => state.alarms);
+  const setAlarms = useVmsStore((state) => state.setAlarms);
   const cameras = useVmsStore((state) => state.cameras);
 
   const onlineCams = cameras.filter(c => c.status === 'online').length;
+
+  const goToAlarmsTab = () => {
+    window.dispatchEvent(new CustomEvent('vms:setActiveTab', { detail: { tab: 'alarms' } }));
+  };
+
+  const ackAlarm = (alarmId) => {
+    setAlarms(alarms.map((a) => (a.id === alarmId ? { ...a, status: 'ack' } : a)));
+  };
 
   return (
     <div className="sidebar-right" style={{ display: isVisible ? 'flex' : 'none' }}>
@@ -25,10 +34,13 @@ const SidebarRight = ({ isVisible = true }) => {
           <div className="stat-card"><div className="stat-val green">{onlineCams}</div><div className="stat-label">Cam live</div></div>
         </div>
 
-        <div className="panel-section-title">Cảnh báo gần đây <span style={{color: 'var(--accent)', cursor: 'pointer'}}>Xem tất cả →</span></div>
+        <div className="panel-section-title">
+          Cảnh báo gần đây
+          <span style={{color: 'var(--accent)', cursor: 'pointer'}} onClick={goToAlarmsTab}>Xem tất cả →</span>
+        </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto' }}>
-          {alarms?.map(alarm => (
+          {alarms?.filter(a => a.status !== 'ack').map(alarm => (
             <div key={alarm.id} className={`alert-item ${alarm.severity}`}>
               <div className="alert-icon">
                 {alarm.type === 'FACE' || alarm.type === 'face' ? '👤' : alarm.type === 'PPE' || alarm.type === 'ppe' ? '🛡' : alarm.type === 'VEHICLE' || alarm.type === 'vehicle' ? '🚗' : '⚠'}
@@ -38,7 +50,7 @@ const SidebarRight = ({ isVisible = true }) => {
                 <div className="alert-meta">{alarm.camera} · {alarm.type}</div>
                 <div className="alert-time">{alarm.time}</div>
               </div>
-              <div className="alert-ack" title="Xác nhận">✓</div>
+              <div className="alert-ack" title="Xác nhận" style={{ cursor: 'pointer' }} onClick={() => ackAlarm(alarm.id)}>✓</div>
             </div>
           ))}
           {(!alarms || alarms.length === 0) && (

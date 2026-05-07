@@ -15,7 +15,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include <crtdbg.h>  // For _CrtSetReportMode
+#include <timeapi.h>  // timeBeginPeriod / timeEndPeriod
+#include <crtdbg.h>   // For _CrtSetReportMode
 #endif
 
 #include <QCoreApplication>
@@ -36,7 +37,11 @@
 #include "core/runtime_state.h"
 #include "core/roi_manager.h"
 #include "core/event_manager.h"
+#include "core/attendance_tracker.h"
+#include "core/counter_bucket_aggregator.h"
 #include "events/alert_router.h"
+#include "events/rule_engine.h"
+#include "events/zone_manager.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include "ipc/zmq_event_bridge.h"
 #include <curl/curl.h>
@@ -146,6 +151,12 @@ int main(int argc, char* argv[]) {
     _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
 #endif
     
+    // Reduce Windows timer resolution from 15.6ms → 1ms.
+    // Without this: QThread::msleep(1) actually sleeps 15ms, causing ±15ms frame pacing jitter.
+#ifdef _WIN32
+    timeBeginPeriod(1);
+#endif
+
     // Create QCoreApplication BEFORE any QObject/QTimer/QThread usage
     QCoreApplication app(argc, argv);
     QCoreApplication::setApplicationName("VMS AI Backend");
@@ -251,19 +262,44 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Initializing HTTP server...");
         vms::server::HttpServer http_server(host, port, threads);
         g_http_server = &http_server;
-        
+
         LOG_INFO("Starting HTTP server on {}:{} with {} threads (hardware_concurrency override from config={})",
                  host, port, threads, serverConfig.threads);
 
-        std::thread server_thread([&http_server]() {
-            try {
-                http_server.run();
-            } catch (const std::exception& e) {
-                LOG_ERROR("Exception in HTTP server: {}", e.what());
-            }
-        });
+        // BUG-HTTP-01 followup: previously we spawned std::thread([&]{ http_server.run(); })
+        // and slept 100ms. If Crow's run() threw (duplicate CROW_ROUTE, bind failure,
+        // etc.) the thread died silently, the LOG_ERROR landed buried in logs, and the
+        // main thread proceeded to log "Backend started successfully!" with no listener
+        // on port 8000. Frontend then got ECONNREFUSED on every /api/* call.
+        //
+        // Fix: drive Crow with run_async() so we hold a future, then wait for the
+        // server-started condvar AND poll the future. If the future is ready before
+        // wait_for_server_start unblocks, run() exited (= died); calling .get() on
+        // that future re-throws the original exception so we fail-fast at startup
+        // instead of pretending we're up.
+        auto server_future = http_server.runAsync();
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const bool server_listening = http_server.waitForStart(std::chrono::seconds(5));
+        if (!server_listening) {
+            // Either still starting (unlikely past 5s) or died. Distinguish by
+            // checking the future — if it's ready, run() returned/threw.
+            if (server_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                try {
+                    server_future.get();  // re-throws any exception from run()
+                } catch (const std::exception& e) {
+                    LOG_ERROR("HTTP server failed to start: {}", e.what());
+                    throw;
+                }
+                // run() returned without throwing but server isn't listening —
+                // still a fatal startup failure (Crow shouldn't return cleanly
+                // before stop() was called).
+                throw std::runtime_error("HTTP server exited before bind completed");
+            }
+            // Future not ready and server not signalling start within 5s. Treat
+            // as fatal — no point bringing up the rest of the stack if the API
+            // surface is unreachable.
+            throw std::runtime_error("HTTP server did not start within 5 seconds");
+        }
 
         LOG_INFO("Initializing storage manager...");
         try {
@@ -311,7 +347,42 @@ int main(int argc, char* argv[]) {
             LOG_WARN("EventManager init exception: {}. Continuing.", e.what());
         }
 
+        // Load persisted zones from DB into ZoneManager (must be after DB init)
+        try {
+            vms::events::ZoneManager::getInstance().loadFromDb();
+        } catch (const std::exception& e) {
+            LOG_WARN("ZoneManager loadFromDb exception: {}", e.what());
+        }
+
+        // Load persisted rules from DB into RuleEngine. Without this, rules
+        // created via the REST API survive a single process lifetime only —
+        // restarting the backend wipes operator-configured detection rules.
+        try {
+            vms::events::RuleEngine::getInstance().loadFromDatabase();
+        } catch (const std::exception& e) {
+            LOG_WARN("RuleEngine loadFromDatabase exception: {}", e.what());
+        }
+
         LOG_INFO("All managers initialized successfully");
+
+        // ── Start AttendanceTracker (depends on DB ready) ────────────────────
+        // Reads employees + camera_roles into in-memory cache; spawns BulkWriter
+        // thread that flushes attendance_events. Must start AFTER DB init and
+        // BEFORE ZmqEventBridge so face events have a sink.
+        try {
+            vms::core::AttendanceTracker::getInstance().start();
+        } catch (const std::exception& e) {
+            LOG_WARN("AttendanceTracker start exception: {}", e.what());
+        }
+
+        // ── Start CounterBucketAggregator (rolls LINE_CROSSING_* → counter_buckets_1m) ──
+        // Pure consumer of events table — does not need a sink. Worker thread
+        // ticks every 60s and re-aggregates the last 5 min (UPSERT, idempotent).
+        try {
+            vms::core::CounterBucketAggregator::getInstance().start();
+        } catch (const std::exception& e) {
+            LOG_WARN("CounterBucketAggregator start exception: {}", e.what());
+        }
 
         // ── Phase 1: Start ZeroMQ AI Event Bridge ────────────────────────────
         // Subscribes to AI Worker PUB on tcp://127.0.0.1:5555 (configurable via settings)
@@ -329,7 +400,22 @@ int main(int argc, char* argv[]) {
         // Wire ZmqEventBridge -> CameraStreamManager (AI Events to WebSocket)
         QObject::connect(&vms::ipc::ZmqEventBridge::getInstance(), &vms::ipc::ZmqEventBridge::eventReceived,
                          &vms::streaming::CameraStreamManager::getInstance(), &vms::streaming::CameraStreamManager::handleAiEvent);
-        
+
+        // Final liveness check — covers the (rare) window where the HTTP server
+        // signalled "started" but a subsequent throw inside a deferred init
+        // path on its thread (e.g. ssl handshake on first accept) tore it down
+        // while the rest of the bring-up was running. If the future is ready,
+        // the server already exited.
+        if (server_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            try {
+                server_future.get();
+            } catch (const std::exception& e) {
+                LOG_ERROR("HTTP server exited during startup: {}", e.what());
+                throw;
+            }
+            throw std::runtime_error("HTTP server exited during startup before announce");
+        }
+
         LOG_INFO("============================================");
         LOG_INFO("Backend started successfully!");
         LOG_INFO("API endpoints:");
@@ -352,6 +438,23 @@ int main(int argc, char* argv[]) {
         if (config.getAIServerConfig().enabled) {
             LOG_INFO("Stopping ZeroMQ Event Bridge...");
             vms::ipc::ZmqEventBridge::getInstance().stop();
+        }
+
+        // Stop AttendanceTracker AFTER ZmqEventBridge so no new face events
+        // race with BulkWriter shutdown drain (drain runs on this thread and
+        // requires DB still open — DbManager::close() happens later).
+        try {
+            vms::core::AttendanceTracker::getInstance().stop();
+        } catch (const std::exception& e) {
+            LOG_WARN("AttendanceTracker stop exception: {}", e.what());
+        }
+
+        // Stop CounterBucketAggregator BEFORE DbManager.close() — its worker
+        // thread may be mid-sweep against the events table.
+        try {
+            vms::core::CounterBucketAggregator::getInstance().stop();
+        } catch (const std::exception& e) {
+            LOG_WARN("CounterBucketAggregator stop exception: {}", e.what());
         }
 
         LOG_INFO("Stopping camera pipelines...");
@@ -381,12 +484,18 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Stopping background storage initialization...");
         vms::utils::StorageManager::getInstance().shutdown();
 
-        if (server_thread.joinable()) {
-            server_thread.join();
+        // Drain Crow's run() future. http_server.stop() above told the event
+        // loop to exit; .get() blocks until the async thread returns and
+        // re-throws if run() ended with an exception (which we'd have caught
+        // earlier — but logging here is cheap insurance).
+        try {
+            if (server_future.valid()) {
+                server_future.get();
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("HTTP server future reported exception during shutdown: {}", e.what());
         }
 
-
-        
         LOG_INFO("Closing database...");
         db_manager.close();
 
@@ -407,7 +516,11 @@ int main(int argc, char* argv[]) {
         g_http_server = nullptr;
         g_qt_app = nullptr;
         vms::Logger::shutdown();
-        
+
+#ifdef _WIN32
+        timeEndPeriod(1);
+#endif
+
         return result;
         
     } catch (const std::exception& e) {

@@ -24,6 +24,7 @@ const CameraConfigModal = ({ onClose, initialData }) => {
   
   const [discoveredDevices, setDiscoveredDevices] = useState([]);
   const discoveredCountRef = useRef(0);
+  const deepScanIntervalRef = useRef(null);
   const [networkRange, setNetworkRange] = useState('192.168.1.0/24');
   const [sites, setSites] = useState([]);
   
@@ -84,7 +85,9 @@ const CameraConfigModal = ({ onClose, initialData }) => {
       try {
         const res = await apiClient.getSites();
         if (res.success) setSites(res.data?.sites || []);
-      } catch (err) {}
+      } catch (err) {
+        console.warn('Failed to fetch sites:', err);
+      }
     };
     fetchSites();
 
@@ -92,11 +95,11 @@ const CameraConfigModal = ({ onClose, initialData }) => {
       scanNetworkDeep();
       window.__vms_auto_scan = false;
     }
-    
+
     return () => {
-      if (window.__deep_scan_interval) {
-        clearInterval(window.__deep_scan_interval);
-        window.__deep_scan_interval = null;
+      if (deepScanIntervalRef.current) {
+        clearInterval(deepScanIntervalRef.current);
+        deepScanIntervalRef.current = null;
       }
     };
   }, []);
@@ -158,8 +161,20 @@ const CameraConfigModal = ({ onClose, initialData }) => {
       if (res.success && res.data?.scan_id) {
         const sid = res.data.scan_id;
         setScanId(sid);
-        
-        window.__deep_scan_interval = setInterval(async () => {
+
+        // Hard timeout (5 minutes) so a hung scan doesn't poll forever
+        const startedAt = Date.now();
+        const MAX_SCAN_MS = 5 * 60 * 1000;
+
+        deepScanIntervalRef.current = setInterval(async () => {
+           if (Date.now() - startedAt > MAX_SCAN_MS) {
+             clearInterval(deepScanIntervalRef.current);
+             deepScanIntervalRef.current = null;
+             setDeepScanning(false);
+             setScanPhase('timeout');
+             alert('Quá trình quét bị treo quá 5 phút – đã dừng để tránh poll vô hạn.');
+             return;
+           }
            const st = await apiClient.getNetworkScanStatus(sid);
            if (st.success) {
               const scanState = st.data || {};
@@ -185,8 +200,8 @@ const CameraConfigModal = ({ onClose, initialData }) => {
                  discoveredCountRef.current = mapped.length;
               }
               if (scanState.status === 'completed' || scanState.status === 'stopped') {
-                 clearInterval(window.__deep_scan_interval);
-                 window.__deep_scan_interval = null;
+                 clearInterval(deepScanIntervalRef.current);
+                 deepScanIntervalRef.current = null;
                  setDeepScanning(false);
                  setScanProgress(100);
                  setScanPhase('done');
@@ -199,14 +214,17 @@ const CameraConfigModal = ({ onClose, initialData }) => {
       }
     } catch(e) {
       setDeepScanning(false);
+      alert("Lỗi kết nối khi quét mạng: " + (e.message || e));
     }
   };
 
   const stopDeepScan = async () => {
      if (scanId && deepScanning) {
         await apiClient.stopNetworkScan(scanId);
-        clearInterval(window.__deep_scan_interval);
-        window.__deep_scan_interval = null;
+        if (deepScanIntervalRef.current) {
+          clearInterval(deepScanIntervalRef.current);
+          deepScanIntervalRef.current = null;
+        }
         setDeepScanning(false);
      }
   };

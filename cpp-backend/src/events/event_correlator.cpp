@@ -412,92 +412,102 @@ CorrelatedEvent EventCorrelator::mergeEvents(const std::vector<RawEvent>& cluste
 // ============================================================================
 
 void EventCorrelator::processBuffer() {
-    std::lock_guard<std::mutex> lock(mutex_);
-        
-    // Cleanup old correlations (>5 minutes old)
-    auto cleanup_cutoff = std::chrono::system_clock::now() - std::chrono::minutes(5);
-    active_correlations_.erase(
-        std::remove_if(active_correlations_.begin(), active_correlations_.end(),
-            [cleanup_cutoff](const CorrelatedEvent& c) {
-                return c.last_seen < cleanup_cutoff;
-            }),
-        active_correlations_.end()
-    );
-     
-    if (event_buffer_.empty()) {
-        stats_.active_correlations = active_correlations_.size();
-        return;
-    }
-    
-    auto start_time = std::chrono::steady_clock::now();
-    
-    // Get recent events for clustering
-    std::vector<RawEvent> recent_events;
-    auto cutoff = std::chrono::system_clock::now() - temporal_window_;
-    
-    for (const auto& event : event_buffer_) {
-        if (event.timestamp >= cutoff) {
-            recent_events.push_back(event);
-        }
-    }
-    
-    // Cluster events
-    auto clusters = clusterEvents(recent_events);
-    
-    // Merge each cluster
-    for (const auto& cluster : clusters) {
-        if (cluster.size() < 1) continue;
-        
-        auto correlated = mergeEvents(cluster);
-        
-        // Check if this updates an existing correlation
-        bool found = false;
-        for (auto& existing : active_correlations_) {
-            // Check if any source events match
-            for (uint64_t src_id : correlated.source_event_ids) {
-                if (std::find(existing.source_event_ids.begin(),
-                             existing.source_event_ids.end(),
-                             src_id) != existing.source_event_ids.end()) {
-                    // Update existing
-                    existing.last_seen = correlated.last_seen;
-                    existing.event_count = correlated.event_count;
-                    found = true;
-                    break;
-                }
-            }
-            if (found) break;
-        }
-        
-        if (!found) {
-            // New correlation
-            active_correlations_.push_back(correlated);
-            stats_.total_correlated_events++;
+    // We will collect new correlations and callbacks to invoke outside the lock
+    std::vector<CorrelatedEvent> new_correlations;
+    std::vector<CorrelationCallback> local_callbacks;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        local_callbacks = callbacks_;
             
-            // Trigger callbacks
-            for (auto& callback : callbacks_) {
-                try {
-                    callback(correlated);
-                } catch (const std::exception& e) {
-                    LOG_ERROR("[EventCorrelator] Callback error: {}", e.what());
-                }
+        // Cleanup old correlations (>5 minutes old)
+        auto cleanup_cutoff = std::chrono::system_clock::now() - std::chrono::minutes(5);
+        active_correlations_.erase(
+            std::remove_if(active_correlations_.begin(), active_correlations_.end(),
+                [cleanup_cutoff](const CorrelatedEvent& c) {
+                    return c.last_seen < cleanup_cutoff;
+                }),
+            active_correlations_.end()
+        );
+         
+        if (event_buffer_.empty()) {
+            stats_.active_correlations = active_correlations_.size();
+            return;
+        }
+        
+        auto start_time = std::chrono::steady_clock::now();
+        
+        // Get recent events for clustering
+        std::vector<RawEvent> recent_events;
+        auto cutoff = std::chrono::system_clock::now() - temporal_window_;
+        
+        for (const auto& event : event_buffer_) {
+            if (event.timestamp >= cutoff) {
+                recent_events.push_back(event);
             }
         }
-    }
-    
-    stats_.active_correlations = active_correlations_.size();
-    
-    // Calculate latency
-    auto end_time = std::chrono::steady_clock::now();
-    auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(
-        end_time - start_time
-    ).count();
-    
-    stats_.avg_correlation_latency_ms = latency;
-    
-    // Calculate reduction percentage
-    if (stats_.total_raw_events > 0) {
-        stats_.reduction_percentage = 
-            (1.0f - float(stats_.total_correlated_events) / stats_.total_raw_events) * 100.0f;
+        
+        // Cluster events
+        auto clusters = clusterEvents(recent_events);
+        
+        // Merge each cluster
+        for (const auto& cluster : clusters) {
+            if (cluster.size() < 1) continue;
+            
+            auto correlated = mergeEvents(cluster);
+            
+            // Check if this updates an existing correlation
+            bool found = false;
+            for (auto& existing : active_correlations_) {
+                // Check if any source events match
+                for (uint64_t src_id : correlated.source_event_ids) {
+                    if (std::find(existing.source_event_ids.begin(),
+                                 existing.source_event_ids.end(),
+                                 src_id) != existing.source_event_ids.end()) {
+                        // Update existing
+                        existing.last_seen = correlated.last_seen;
+                        existing.event_count = correlated.event_count;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+            
+            if (!found) {
+                // New correlation
+                active_correlations_.push_back(correlated);
+                stats_.total_correlated_events++;
+                new_correlations.push_back(correlated);
+            }
+        }
+        
+        stats_.active_correlations = active_correlations_.size();
+        
+        // Calculate latency
+        auto end_time = std::chrono::steady_clock::now();
+        auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+            end_time - start_time
+        ).count();
+        
+        stats_.avg_correlation_latency_ms = latency;
+        
+        // Calculate reduction percentage
+        if (stats_.total_raw_events > 0) {
+            stats_.reduction_percentage = 
+                (1.0f - float(stats_.total_correlated_events) / stats_.total_raw_events) * 100.0f;
+        }
+    } // release lock
+
+    // Trigger callbacks outside lock to prevent deadlocks
+    for (const auto& correlated : new_correlations) {
+        for (auto& callback : local_callbacks) {
+            try {
+                callback(correlated);
+            } catch (const std::exception& e) {
+                LOG_ERROR("[EventCorrelator] Callback error: {}", e.what());
+            }
+        }
     }
 }
 

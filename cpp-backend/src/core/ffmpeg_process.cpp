@@ -1,4 +1,5 @@
 #include "core/ffmpeg_process.h"
+#include <QThread>
 #include "core/process_manager.h"
 #include "utils/logger.h"
 #include <filesystem>
@@ -104,6 +105,14 @@ FFmpegProcess::~FFmpegProcess() {
 }
 
 bool FFmpegProcess::start(const std::string& command) {
+    if (QThread::currentThread() != this->thread()) {
+        bool success = false;
+        QMetaObject::invokeMethod(this, [this, command, &success]() {
+            success = this->start(command);
+        }, Qt::BlockingQueuedConnection);
+        return success;
+    }
+
     stop();
 
     std::string modified_cmd = command;

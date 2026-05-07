@@ -1,4 +1,5 @@
 #include "recording/buffer_manager.h"
+#include "utils/logger.h"
 
 namespace vms {
 namespace recording {
@@ -17,35 +18,40 @@ void BufferManager::push(const std::vector<char>& data, long long timestamp) {
     VideoPacket packet;
     packet.data = data;
     packet.timestamp = timestamp;
-    // packet.is_keyframe = ... (Need deeper parsing for this, optional for now if using TS)
     
     buffer_.push_back(packet);
+    total_bytes_ += data.size();
 
-    // Prune old packets
     if (buffer_.empty()) return;
 
-    // Simple pruning based on count or timestamp?
-    // Timestamp is better but requires reliable input.
-    // If timestamp is 0, we might strictly rely on size limit or estimate.
-    // Let's assume timestamp is valid system time for now.
-    
     long long newest = buffer_.back().timestamp;
     
+    // Prune by time
     while (!buffer_.empty()) {
         long long oldest = buffer_.front().timestamp;
         if (newest - oldest > static_cast<long long>(max_duration_ms_)) {
+            total_bytes_ -= buffer_.front().data.size();
             buffer_.pop_front();
         } else {
             break;
         }
     }
     
-    // Safety cap: Max 50MB to prevent OOM if timestamps are broken
-    size_t total_size = 0; // This is slow to calc every time. 
-    // Optimization: we could track total_size in a member variable.
-    // implementing checking logic only if buffer is very large
-    if (buffer_.size() > 5000) { // Approx 5000 chunks
+    // Safety cap: Max 50MB (52428800 bytes) to prevent OOM.
+    // If a single packet exceeds the cap we end up popping it back out, which
+    // is silent data loss — log so operators notice mis-configured cameras
+    // pushing huge keyframes (4K HEVC GOP can spike >> typical packet size).
+    constexpr size_t kSafetyCapBytes = 52428800;
+    bool dropped_under_cap = false;
+    while (!buffer_.empty() && total_bytes_ > kSafetyCapBytes) {
+        total_bytes_ -= buffer_.front().data.size();
         buffer_.pop_front();
+        dropped_under_cap = true;
+    }
+    if (dropped_under_cap) {
+        LOG_THROTTLED_WARN(10000,
+            "[BufferManager] 50MB safety cap exceeded — dropped older packets. "
+            "Single packet size={} bytes (likely keyframe).", data.size());
     }
 }
 
@@ -57,6 +63,7 @@ std::deque<VideoPacket> BufferManager::getSnapshot() {
 void BufferManager::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     buffer_.clear();
+    total_bytes_ = 0;
 }
 
 void BufferManager::setMaxDuration(size_t ms) {

@@ -1,9 +1,11 @@
 #include "core/brands/onvif_core.hpp"
 #include "core/brands/http_client.h"
+#include "utils/logger.h"
 
 using json = nlohmann::json;
-#include "core/brands/http_client.h"
-#include <pugixml.hpp>  // TODO: Enable after vcpkg setup
+#include <pugixml.hpp>
+#include <chrono>
+#include <thread>
 
 namespace vms {
 namespace core {
@@ -205,21 +207,27 @@ bool ONVIFCore::ptzControl(const CameraDiscovery::DiscoveryConfig& cfg, const st
     return resp.ok();
 }
 
+// BUG-EVENTS-01 (2026-05-07): the previous body sent a single
+// `GetSystemDateAndTime` SOAP probe and then spun a 1-second
+// `onEvent("keepalive")` loop forever. It NEVER subscribed to real ONVIF
+// events (no `CreatePullPointSubscription` / `PullMessages` flow) — operators
+// configuring an ONVIF camera saw "polling events for cam X" in logs but no
+// motion / line-crossing / intrusion alerts ever arrived. Same operational
+// lie as `AdvancedInfer` face stubs and the legacy `AlertManager::sendEmail`
+// MOCK we already fixed this session.
+//
+// Until a real ONVIF event subscription is implemented (see punt list in
+// `.claude/memory/stub_audit_2026_05_07.md`), surface the limitation
+// explicitly: log a WARN once per call, sleep 60s so the caller's outer
+// reconnect loop doesn't burn CPU re-entering this stub, and return.
 void ONVIFCore::pullEvents(const CameraDiscovery::DiscoveryConfig& cfg, std::function<bool(const std::string&)> onEvent) {
-    CameraDiscovery::HttpClient http(cfg);
-    auto resp = http.post("/onvif/device_service",
-        buildSoap("GetSystemDateAndTime", "http://www.onvif.org/ver10/device/wsdl", cfg.username, cfg.password),
-        false, "application/soap+xml");
-
-    if (!resp.ok()) return;
-
-    bool isRunning = true;
-    while (isRunning) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        if (!onEvent("keepalive")) {
-            isRunning = false;
-        }
-    }
+    LOG_WARN("[ONVIFCore] Hardware event subscription is NOT implemented "
+             "for ONVIF host {}:{}. Real ONVIF events require "
+             "CreatePullPointSubscription + PullMessages flow. Sleeping 60s "
+             "before returning so the worker loop doesn't spin.",
+             cfg.host, cfg.http_port);
+    (void)onEvent;
+    std::this_thread::sleep_for(std::chrono::seconds(60));
 }
 
 } // namespace brands

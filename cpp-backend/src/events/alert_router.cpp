@@ -7,12 +7,15 @@
 #include "core/runtime_state.h"
 #include "events/zone_manager.h"
 #include "utils/background_job_runner.h"
+#include "utils/email_sender.h"
 #include "utils/logger.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include "database/db_manager.h"
 #include <algorithm>
 #include <ctime>
 #include <thread>
+#include <sstream>
+#include <iomanip>
 #include <curl/curl.h>
 
 namespace vms::events {
@@ -22,6 +25,14 @@ namespace {
 vms::utils::BackgroundJobRunner& webhookRunner() {
     static vms::utils::BackgroundJobRunner runner("alert-webhooks", 2, 128);
     return runner;
+}
+
+// SMS payload still needs CR/LF stripping for the body and recipient
+// fields. Email goes through vms::utils::sendEmailAsync, which calls
+// sanitizeMailHeader internally; SMS keeps a thin local alias to avoid
+// touching the Twilio call site for this refactor.
+inline std::string sanitizeHeader(const std::string& s, std::size_t max_len = 256) {
+    return vms::utils::sanitizeMailHeader(s, max_len);
 }
 
 }
@@ -185,27 +196,33 @@ void AlertRouter::routeEvent(const CorrelatedEvent& event) {
 
 void AlertRouter::processQueue() {
     if (stop_worker_) return;
-    
-    CorrelatedEvent event;
+
+    // Drain a batch (up to kDrainBatch) per tick instead of one event per signal.
+    // The previous one-event-per-signal pattern paid a Qt::QueuedConnection hop
+    // (event-loop wakeup + slot dispatch) per event — at ~50µs/hop this caps
+    // throughput around 20k events/s and starves the event loop under burst.
+    constexpr size_t kDrainBatch = 16;
+    std::vector<CorrelatedEvent> batch;
+    batch.reserve(kDrainBatch);
+
+    bool more_pending = false;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (!event_queue_.empty()) {
-            event = event_queue_.front();
+        size_t take = std::min(kDrainBatch, event_queue_.size());
+        for (size_t i = 0; i < take; ++i) {
+            batch.push_back(std::move(event_queue_.front()));
             event_queue_.erase(event_queue_.begin());
-        } else {
-            return;
         }
+        more_pending = !event_queue_.empty();
     }
-    
-    // Process outside queue lock
-    processEvent(event);
-    
-    // If more items in queue, emit signal again to keep processing
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (!event_queue_.empty() && !stop_worker_) {
-            Q_EMIT eventQueued();
-        }
+
+    for (auto& e : batch) {
+        if (stop_worker_) break;
+        processEvent(e);
+    }
+
+    if (more_pending && !stop_worker_) {
+        Q_EMIT eventQueued();
     }
 }
 
@@ -440,23 +457,29 @@ bool AlertRouter::isWithinTimeWindow(const AlertRule& rule) {
     auto now = std::chrono::system_clock::now();
     auto time_t = std::chrono::system_clock::to_time_t(now);
     auto tm = std::localtime(&time_t);
-    
+
     int hour = tm->tm_hour;
     int day = tm->tm_wday;
-    
-    // Check hour
-    if (hour < rule.start_hour || hour > rule.end_hour) {
-        return false;
+
+    // BUG-7 FIX: Hỗ trợ overnight range (e.g. start=22, end=06)
+    // Rule engine đã xử lý đúng nhưng AlertRouter thì không
+    bool in_range;
+    if (rule.start_hour <= rule.end_hour) {
+        in_range = (hour >= rule.start_hour && hour <= rule.end_hour);
+    } else {
+        // overnight: e.g. 22:00 → 06:00
+        in_range = (hour >= rule.start_hour || hour <= rule.end_hour);
     }
-    
+    if (!in_range) return false;
+
     // Check day of week
     if (!rule.days_of_week.empty()) {
-        if (std::find(rule.days_of_week.begin(), rule.days_of_week.end(), 
+        if (std::find(rule.days_of_week.begin(), rule.days_of_week.end(),
                      day) == rule.days_of_week.end()) {
             return false;
         }
     }
-    
+
     return true;
 }
 
@@ -544,32 +567,124 @@ void AlertRouter::sendToChannel(AlertChannel channel, const CorrelatedEvent& eve
 
 void AlertRouter::sendUINotification(const CorrelatedEvent& event, const AlertRule& rule) {
     auto j = event.toJSON();
+    // FIX: đặt type SAU toJSON() để không bị field "type" của event_type overwrite
     j["type"] = "alert";
+    j["event_type"] = eventTypeToString(event.type);  // giữ event_type riêng
     j["rule_name"] = rule.name;
     j["message"] = "Quy tắc AI '" + rule.name + "' đã phát hiện: " + eventTypeToString(event.type);
-    
-    // Broadcast to global WS channel via CameraStreamManager
-    vms::streaming::CameraStreamManager::getInstance().broadcastEvent(0, j);
-    LOG_INFO("[AlertRouter] UI notification broadcasted for event ID: {}", event.correlation_id);
+
+    // FIX LỖI 1: broadcast đến ĐÚNG camera_id của event
+    // (broadcastEvent(0, j) chỉ gửi đến clients subscribe camera_id=0 — không có client nào)
+    // Bây giờ gửi đến camera cụ thể VÀ global (camera_id=0) để đảm bảo frontend nhận được
+    int cam_id = event.best_camera_id > 0 ? event.best_camera_id
+                  : (!event.camera_ids.empty() ? event.camera_ids[0] : 0);
+    auto& ws = vms::streaming::CameraStreamManager::getInstance();
+    if (cam_id > 0) {
+        ws.broadcastEvent(cam_id, j);  // đến clients đang xem camera này
+    }
+    ws.broadcastEvent(0, j);           // đến clients subscribe global channel
+    LOG_INFO("[AlertRouter] UI notification broadcasted for event ID: {} camera: {}", event.correlation_id, cam_id);
 }
 
+// Subject + body composition stays here (rule-aware); SMTP transport is in
+// vms::utils::sendEmailAsync (see utils/email_sender.h). Both the legacy
+// AlertManager path and this RuleEngine path share the helper so SMTP
+// settings, header sanitisation, queueing and STARTTLS are maintained in
+// exactly one place.
 void AlertRouter::sendEmail(const CorrelatedEvent& event, const AlertRule& rule) {
-    // TODO: SMTP integration
-    LOG_INFO("[AlertRouter] Email to {} recipients: {}", 
-            rule.email_addresses.size(), eventTypeToString(event.type));
-    
-    for (const auto& email : rule.email_addresses) {
-        LOG_INFO("[AlertRouter]   → {}", email);
+    if (rule.email_addresses.empty()) return;
+
+    const std::string subject =
+        "[VMS] " + std::string(eventSeverityToString(event.severity)) +
+        " — " + std::string(eventTypeToString(event.type)) +
+        (rule.name.empty() ? "" : (" (" + rule.name + ")"));
+
+    // Body: keep it plain text + bounded. event.toJSON() can be large
+    // (snapshots etc.) — the helper caps the body at 8 KB internally, but
+    // we also dump-and-trim here so the rule preface stays on top.
+    std::string body_json = event.toJSON().dump(2);
+    if (body_json.size() > 6144) body_json.resize(6144);
+    std::string body =
+        "VMS AI Alert\r\n\r\n"
+        "Rule: " + vms::utils::sanitizeMailHeader(rule.name, 200) + "\r\n"
+        "Type: " + std::string(eventTypeToString(event.type)) + "\r\n"
+        "Severity: " + std::string(eventSeverityToString(event.severity)) + "\r\n"
+        "Camera: " + std::to_string(event.best_camera_id) + "\r\n\r\n"
+        "Event payload:\r\n" + body_json + "\r\n";
+
+    if (vms::utils::sendEmailAsync(subject, body, rule.email_addresses, "alert_router")) {
+        LOG_INFO("[AlertRouter] Email queued for {} recipient(s): {}",
+                 rule.email_addresses.size(), eventTypeToString(event.type));
     }
 }
 
+// SMS via Twilio HTTPS API. Settings:
+//   twilio_account_sid, twilio_auth_token, twilio_from_number
+// If any is missing we WARN and skip (feature-disabled).
 void AlertRouter::sendSMS(const CorrelatedEvent& event, const AlertRule& rule) {
-    // TODO: SMS gateway integration (Twilio, etc.)
-    LOG_INFO("[AlertRouter] SMS to {} recipients: {}",
-            rule.phone_numbers.size(), eventTypeToString(event.type));
-    
-    for (const auto& phone : rule.phone_numbers) {
-        LOG_INFO("[AlertRouter]   → {}", phone);
+    if (rule.phone_numbers.empty()) return;
+
+    auto& db = vms::database::DbManager::getInstance();
+    const std::string sid   = db.getSetting("twilio_account_sid", "");
+    const std::string token = db.getSetting("twilio_auth_token", "");
+    const std::string from  = db.getSetting("twilio_from_number", "");
+    if (sid.empty() || token.empty() || from.empty()) {
+        LOG_WARN("[AlertRouter] Twilio not configured. {} SMS skipped.", rule.phone_numbers.size());
+        return;
+    }
+
+    // Twilio caps body at 1600 chars; we keep it short so it stays in 1-2 segments.
+    std::string body = "[VMS] " + std::string(eventSeverityToString(event.severity)) + " " +
+                       std::string(eventTypeToString(event.type)) +
+                       " cam=" + std::to_string(event.best_camera_id) +
+                       " rule=" + sanitizeHeader(rule.name, 64);
+    if (body.size() > 320) body.resize(320);
+
+    const std::string url = "https://api.twilio.com/2010-04-01/Accounts/" + sid + "/Messages.json";
+
+    LOG_INFO("[AlertRouter] SMS queued for {} recipient(s): {}",
+             rule.phone_numbers.size(), eventTypeToString(event.type));
+
+    for (const auto& raw_to : rule.phone_numbers) {
+        const std::string to = sanitizeHeader(raw_to, 32);
+        if (to.empty()) continue;
+
+        if (!webhookRunner().submit([url, sid, token, from, to, body]() {
+            if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
+            CURL* curl = curl_easy_init();
+            if (!curl) return;
+
+            char* enc_to   = curl_easy_escape(curl, to.c_str(), 0);
+            char* enc_from = curl_easy_escape(curl, from.c_str(), 0);
+            char* enc_body = curl_easy_escape(curl, body.c_str(), 0);
+            std::string form = "To=" + std::string(enc_to ? enc_to : "") +
+                               "&From=" + std::string(enc_from ? enc_from : "") +
+                               "&Body=" + std::string(enc_body ? enc_body : "");
+            curl_free(enc_to); curl_free(enc_from); curl_free(enc_body);
+
+            const std::string userpass = sid + ":" + token;
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+            curl_easy_setopt(curl, CURLOPT_USERPWD, userpass.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, form.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)form.size());
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+            CURLcode res = curl_easy_perform(curl);
+            long http_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+            if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+                LOG_ERROR("[AlertRouter] Twilio SMS to {} failed: curl={} http={}",
+                          to, curl_easy_strerror(res), http_code);
+            } else {
+                LOG_INFO("[AlertRouter] SMS delivered to {} (http={})", to, http_code);
+            }
+            curl_easy_cleanup(curl);
+        })) {
+            LOG_THROTTLED_WARN(5000, "[AlertRouter] SMS queue full, dropping send");
+        }
     }
 }
 
@@ -615,6 +730,18 @@ void AlertRouter::sendWebhook(const CorrelatedEvent& event, const AlertRule& rul
         LOG_ERROR("[AlertRouter] Webhook rejected: URL must start with http:// or https://. Got: {}", url);
         return;
     }
+
+    // [MUST-FIX] SSRF Protection: Blacklist private IP ranges
+    // This is a simplified check. In production, resolve the hostname and check the IP.
+    if (url.find("://localhost") != std::string::npos ||
+        url.find("://127.0.0.1") != std::string::npos ||
+        url.find("://192.168.") != std::string::npos ||
+        url.find("://10.") != std::string::npos ||
+        url.find("://172.16.") != std::string::npos ||
+        url.find("://169.254.169.254") != std::string::npos) {
+        LOG_ERROR("[AlertRouter] Webhook rejected: Internal/Private IP access denied (SSRF Protection): {}", url);
+        return;
+    }
     
     LOG_INFO("[AlertRouter] Webhook to {}: {}", rule.webhook_url, eventTypeToString(event.type));
     executeAsyncPost(rule.webhook_url, event.toJSON().dump());
@@ -648,9 +775,40 @@ void AlertRouter::sendMobilePush(const CorrelatedEvent& event, const AlertRule& 
     executeAsyncPost(url, payload.dump());
 }
 
+// Most production deployments use a network-callable relay (HTTP/HTTPS) rather
+// than local GPIO — local GPIO requires a Pi-class deployment and per-board
+// hardware code. We support both: if `alarm_output_url` is configured, POST a
+// JSON payload to it via the existing async webhook runner. SSRF restrictions
+// from sendWebhook do NOT apply here: the alarm relay typically lives on the
+// same LAN as the VMS box, so private-IP destinations are EXPECTED.
 void AlertRouter::triggerAlarmOutput(const CorrelatedEvent& event, const AlertRule& rule) {
-    // TODO: GPIO/relay control
-    LOG_INFO("[AlertRouter] Alarm output triggered for event {}", event.correlation_id);
+    auto& db = vms::database::DbManager::getInstance();
+    const std::string url = db.getSetting("alarm_output_url", "");
+    if (url.empty()) {
+        LOG_WARN("[AlertRouter] alarm_output_url not configured; alarm trigger logged only "
+                 "(event {})", event.correlation_id);
+        return;
+    }
+
+    bool is_http  = url.rfind("http://", 0)  == 0;
+    bool is_https = url.rfind("https://", 0) == 0;
+    if (!is_http && !is_https) {
+        LOG_ERROR("[AlertRouter] alarm_output_url must be http(s)://. Got: {}", url);
+        return;
+    }
+
+    nlohmann::json payload = {
+        {"action", "alarm_trigger"},
+        {"event_id", event.correlation_id},
+        {"event_type", eventTypeToString(event.type)},
+        {"severity", eventSeverityToString(event.severity)},
+        {"camera_id", event.best_camera_id},
+        {"rule_id", rule.rule_id},
+        {"rule_name", rule.name}
+    };
+
+    LOG_INFO("[AlertRouter] Alarm output triggered for event {} → {}", event.correlation_id, url);
+    executeAsyncPost(url, payload.dump());
 }
 
 void AlertRouter::shutdown() {

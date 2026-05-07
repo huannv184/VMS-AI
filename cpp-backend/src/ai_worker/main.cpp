@@ -344,11 +344,23 @@ int main(int argc, char** argv) {
     inference::MultiModelInfer::Config ai_config;
     ai_config.yolo_model_path = model_path;
     ai_config.yolo_input_size = 640;
-    ai_config.yolo_conf_threshold = 0.30f;
+    // Confidence threshold. 2026-04-26: lowered default to 0.10 because our
+    // current TRT engine emits post-sigmoid scores that peak at 0.6-0.9 for
+    // confident objects but only 0.2-0.4 for partial/distant objects. With the
+    // old 0.25 default, surveillance scenes (cameras on lobby/gate) detected
+    // nothing. Set VMS_YOLO_CONF_THRESHOLD if a different engine needs tuning.
+    {
+        const char* env = std::getenv("VMS_YOLO_CONF_THRESHOLD");
+        ai_config.yolo_conf_threshold = (env && *env) ? std::strtof(env, nullptr) : 0.10f;
+    }
     ai_config.yolo_nms_threshold = 0.45f;
     
     ai_config.enable_face_detection = true; // SCRFD
     ai_config.enable_face_recognition = true; // ArcFace
+    {
+        const char* env = std::getenv("VMS_SCRFD_CONF");
+        if (env && *env) ai_config.scrfd_conf_threshold = std::strtof(env, nullptr);
+    }
     
     std::string exe_path = argv[0];
     ai_config.scrfd_model_path = resolveModelPath("scrfd_2.5g_bnkps.trt", exe_path);
@@ -438,8 +450,19 @@ int main(int argc, char** argv) {
     
     auto loop_start = std::chrono::steady_clock::now();
     
-    // Instantiate Face Tracker for smoothing and ID persistence
-    inference::FaceTracker faceTracker(0.3f, 30, 2); 
+    // Face tracker: smoothing + ID persistence across frames
+    inference::FaceTracker faceTracker(0.3f, 30, 2);
+    // Object tracker: gives persons/vehicles stable track_ids instead of -1,
+    // preventing cooldown key collisions in AiEventProcessor::processIntrusion.
+    //
+    // BBOX-LATENCY FIX: default min_hits=3 means a detection had to appear in 3
+    // IoU-matched consecutive frames before bbox shows up — at 5–10 fps that's
+    // 300–600ms invisible, plus any IoU jitter resets the count. Drop to 1 so
+    // bbox shows on first detection (track still gets stable ID for cooldown).
+    inference::TrackerConfig tracker_cfg;
+    tracker_cfg.min_hits = 1;
+    tracker_cfg.iou_threshold = 0.2f;  // looser → easier to maintain track on shaky bbox
+    inference::ObjectTracker objectTracker(tracker_cfg);
     
     
     while (g_running) {
@@ -459,11 +482,31 @@ int main(int argc, char** argv) {
                 }
                 
                 last_frame_id = current_frame_id;
-                
+
                 if (frame.empty() || frame.cols == 0 || frame.rows == 0) {
                     continue;
                 }
-                
+
+                // DIAG: dump every 200th frame to disk so operator can verify the
+                // SHM image is actually a valid camera frame (not all-black or noise).
+                // Enable with VMS_AI_DUMP_FRAMES=1.
+                {
+                    static const bool dump_frames = []() {
+                        const char* e = std::getenv("VMS_AI_DUMP_FRAMES");
+                        return e && *e && std::atoi(e) != 0;
+                    }();
+                    if (dump_frames && (frames_processed % 200 == 0)) {
+                        cv::Scalar mean = cv::mean(frame);
+                        std::cerr << "[AI-Worker-" << camera_id << "] frame mean BGR=("
+                                  << mean[0] << "," << mean[1] << "," << mean[2]
+                                  << ") size=" << frame.cols << "x" << frame.rows
+                                  << " type=" << frame.type() << std::endl;
+                        std::string fname = "diag_cam" + std::to_string(camera_id)
+                                          + "_frame" + std::to_string(frames_processed) + ".jpg";
+                        cv::imwrite(fname, frame);
+                    }
+                }
+
                 // Run Inference (locked to prevent race with ZMQ embedImage)
                 std::unique_lock<std::mutex> lock(infer_mutex);
                 auto result = inferer->infer(frame, static_cast<uint32_t>(current_frame_id));
@@ -476,47 +519,221 @@ int main(int argc, char** argv) {
 
                 std::vector<inference::TrackedObject> tracked_objects;
                 tracked_objects.reserve(result.objects.size());
-                
-                // Objects
-                for (const auto& obj : result.objects) {
-                    // ✅ OPTIMIZATION: Filter to only person, car, motorcycle, bicycle
-                    // class_id (COCO): 0=person, 1=bicycle, 2=car, 3=motorcycle
-                    if (obj.class_id != 0 && obj.class_id != 1 && obj.class_id != 2 && obj.class_id != 3) {
-                        continue;  // Skip all other classes
+
+                // Objects — collect filtered detections then track in one pass.
+                //
+                // BBOX-VISIBILITY FIX: previous filter only kept person/bicycle/car/motorcycle
+                // (COCO 0/1/2/3). For surveillance cameras pointed at a desk, parking lot,
+                // shop floor, etc., YOLO11 detects backpack/cup/laptop/chair/etc. → ALL of
+                // them got dropped → no bbox at all even when AI was running fine.
+                //
+                // We now allow ALL COCO classes by default. Set VMS_AI_CLASS_FILTER to a
+                // comma-separated list (e.g. "0,1,2,3,5,7") to restrict to specific classes.
+                {
+                    // Default: chỉ detect người + phương tiện (COCO 0/1/2/3/5/7).
+                    // Set VMS_AI_CLASS_FILTER="" để cho phép tất cả 80 COCO classes,
+                    // hoặc danh sách "0,2,5" để giới hạn cụ thể hơn.
+                    static const std::vector<int> class_filter = []() {
+                        std::vector<int> filter;
+                        const char* env = std::getenv("VMS_AI_CLASS_FILTER");
+                        if (env) {
+                            // Env present (kể cả rỗng) → user override hoàn toàn
+                            std::string s(env);
+                            size_t pos = 0;
+                            while (pos < s.size()) {
+                                size_t comma = s.find(',', pos);
+                                std::string tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                                try { filter.push_back(std::stoi(tok)); } catch (...) {}
+                                if (comma == std::string::npos) break;
+                                pos = comma + 1;
+                            }
+                        } else {
+                            // Default: person, bicycle, car, motorcycle, bus, truck
+                            filter = {0, 1, 2, 3, 5, 7};
+                        }
+                        return filter;
+                    }();
+                    // Default ON: ObjectTracker has been observed to silently crash
+                    // ai_worker_v2 on the first frame containing detections (likely an
+                    // unhandled OpenCV/Kalman exception). Until that's root-caused,
+                    // bypass keeps bbox flowing. Set VMS_AI_BYPASS_TRACKER=0 to opt
+                    // in to the tracker (cooldown keys will collide as track_id=-1).
+                    static const bool bypass_tracker = []() {
+                        const char* e = std::getenv("VMS_AI_BYPASS_TRACKER");
+                        if (!e || !*e) return true;
+                        return std::atoi(e) != 0;
+                    }();
+
+                    std::vector<inference::BBox> det_bboxes;
+                    for (const auto& obj : result.objects) {
+                        if (!class_filter.empty()) {
+                            bool allowed = false;
+                            for (int c : class_filter) if (obj.class_id == c) { allowed = true; break; }
+                            if (!allowed) continue;
+                        }
+                        det_bboxes.push_back(obj);
                     }
-                    
-                    inference::TrackedObject to;
-                    to.bbox = obj;
-                    to.confidence = obj.score;
-                    to.label = getClassName(obj.class_id);
-                    to.track_id = -1; 
-                    tracked_objects.push_back(to);
-                    
-                    // JSON
-                    j_out["objects"].push_back({
-                        {"label", to.label},
-                        {"confidence", to.confidence},
-                        {"track_id", to.track_id},
-                        {"box", {to.bbox.x1, to.bbox.y1, to.bbox.x2, to.bbox.y2}}
-                    });
+
+                    auto bypass_fill = [&](std::vector<inference::TrackedObject>& out) {
+                        out.reserve(det_bboxes.size());
+                        for (const auto& bb : det_bboxes) {
+                            inference::TrackedObject t;
+                            t.bbox = bb;
+                            t.confidence = bb.score;
+                            t.track_id = -1;
+                            t.label = bb.label.empty() ? getClassName(bb.class_id) : bb.label;
+                            t.class_id = bb.class_id;
+                            out.push_back(t);
+                        }
+                    };
+
+                    std::vector<inference::TrackedObject> tracked;
+                    if (bypass_tracker) {
+                        bypass_fill(tracked);
+                    } else {
+                        try {
+                            tracked = objectTracker.update(det_bboxes);
+                        } catch (const std::exception& e) {
+                            std::cerr << "[AI-Worker-" << camera_id
+                                      << "] ObjectTracker.update EXCEPTION: " << e.what()
+                                      << " — falling back to bypass for this frame" << std::endl;
+                            tracked.clear();
+                            bypass_fill(tracked);
+                        } catch (...) {
+                            std::cerr << "[AI-Worker-" << camera_id
+                                      << "] ObjectTracker.update UNKNOWN exception"
+                                      << " — falling back to bypass for this frame" << std::endl;
+                            tracked.clear();
+                            bypass_fill(tracked);
+                        }
+                    }
+
+                    // Diagnostic: log every 30 inferences det_bboxes vs tracked
+                    // (was 200 → too rare to debug missing-bbox issues).
+                    {
+                        static thread_local int diag_n = 0;
+                        if ((diag_n++ % 30) == 0) {
+                            std::cerr << "[AI-Worker-" << camera_id
+                                      << "] result.objects=" << result.objects.size()
+                                      << " det_bboxes=" << det_bboxes.size()
+                                      << " tracked=" << tracked.size()
+                                      << " bypass=" << (bypass_tracker ? 1 : 0) << std::endl;
+                        }
+                    }
+
+                    for (auto& to : tracked) {
+                        to.confidence = to.bbox.score;
+                        to.label = getClassName(to.bbox.class_id);
+                        tracked_objects.push_back(to);
+
+                        j_out["objects"].push_back({
+                            {"label", to.label},
+                            {"confidence", to.confidence},
+                            {"track_id", to.track_id},
+                            {"box", {to.bbox.x1, to.bbox.y1, to.bbox.x2, to.bbox.y2}}
+                        });
+                    }
                 }
 
-                // Faces - Process through tracker for smoothing and stabilization
+                // Faces — POST-FILTER: chỉ giữ face nằm trong person bbox.
+                // SCRFD threshold 0.4 vẫn có thể detect nhầm trên texture đường/tường
+                // (logo, cửa sổ, vạch sơn...). Vì face PHẢI thuộc một người, ta chỉ
+                // giữ face nếu center hoặc >50% diện tích face nằm trong vùng
+                // người đã được YOLO confirm. Set VMS_SCRFD_REQUIRE_PERSON=0 nếu
+                // muốn detect face trong scene không có YOLO person (vd snapshot
+                // tài liệu, ảnh thẻ).
+                static const bool require_person_overlap = []() {
+                    const char* e = std::getenv("VMS_SCRFD_REQUIRE_PERSON");
+                    if (!e || !*e) return true;
+                    return std::atoi(e) != 0;
+                }();
+
+                if (require_person_overlap && !result.faces.empty()) {
+                    // Collect person bboxes (class 0) from result.objects (pre-tracker)
+                    std::vector<std::tuple<float,float,float,float>> person_boxes;
+                    for (const auto& obj : result.objects) {
+                        if (obj.class_id != 0) continue; // chỉ lấy "person"
+                        person_boxes.emplace_back(obj.x1, obj.y1, obj.x2, obj.y2);
+                    }
+
+                    auto inside_any_person = [&](const inference::FaceDetectionResult& f) -> bool {
+                        if (person_boxes.empty()) return false;
+                        const float fcx = (f.x1 + f.x2) * 0.5f;
+                        const float fcy = (f.y1 + f.y2) * 0.5f;
+                        const float farea = std::max(1e-3f, (f.x2 - f.x1) * (f.y2 - f.y1));
+                        for (const auto& [px1, py1, px2, py2] : person_boxes) {
+                            // Center test (bắt face đầu nhô lên trên đầu person bbox)
+                            // OR overlap >= 50% diện tích face
+                            const bool center_in = (fcx >= px1 && fcx <= px2 && fcy >= py1 && fcy <= py2);
+                            const float ix1 = std::max(f.x1, px1), iy1 = std::max(f.y1, py1);
+                            const float ix2 = std::min(f.x2, px2), iy2 = std::min(f.y2, py2);
+                            const float inter = std::max(0.0f, ix2 - ix1) * std::max(0.0f, iy2 - iy1);
+                            if (center_in || inter / farea >= 0.5f) return true;
+                        }
+                        return false;
+                    };
+
+                    size_t before = result.faces.size();
+                    result.faces.erase(
+                        std::remove_if(result.faces.begin(), result.faces.end(),
+                                       [&](const inference::FaceDetectionResult& f) {
+                                           return !inside_any_person(f);
+                                       }),
+                        result.faces.end());
+                    size_t after = result.faces.size();
+                    if (before != after) {
+                        static thread_local int diag_drop = 0;
+                        if ((diag_drop++ % 30) == 0) {
+                            std::cerr << "[AI-Worker-" << camera_id
+                                      << "] face post-filter: dropped " << (before - after)
+                                      << "/" << before << " (no person overlap)" << std::endl;
+                        }
+                    }
+                }
+
                 auto tracked_faces = faceTracker.update(result.faces);
-                
+
+                // Back-propagate stable identity into result.faces before SHM write.
+                // Per-frame recognition fluctuates; stable_person_id is accumulated over
+                // multiple frames by FaceTracker and is more reliable than the raw match.
+                for (const auto& tf : tracked_faces) {
+                    if (tf.stable_person_id == -1) continue;
+                    float best_iou = 0.3f; // minimum threshold
+                    int best_idx = -1;
+                    for (int fi = 0; fi < (int)result.faces.size(); fi++) {
+                        const auto& rf = result.faces[fi];
+                        float ix1 = std::max(tf.x1, rf.x1), iy1 = std::max(tf.y1, rf.y1);
+                        float ix2 = std::min(tf.x2, rf.x2), iy2 = std::min(tf.y2, rf.y2);
+                        if (ix2 <= ix1 || iy2 <= iy1) continue;
+                        float inter = (ix2 - ix1) * (iy2 - iy1);
+                        float a = (tf.x2 - tf.x1) * (tf.y2 - tf.y1);
+                        float b = (rf.x2 - rf.x1) * (rf.y2 - rf.y1);
+                        float iou = inter / (a + b - inter);
+                        if (iou > best_iou) { best_iou = iou; best_idx = fi; }
+                    }
+                    if (best_idx >= 0) {
+                        result.faces[best_idx].person_id = tf.stable_person_id;
+                        result.faces[best_idx].name = tf.stable_name;
+                    }
+                }
+
                 for (const auto& face : tracked_faces) {
                     inference::TrackedObject to;
-                    to.bbox.x1 = face.x1; to.bbox.y1 = face.y1; to.bbox.x2 = face.x2; to.bbox.y2 = face.y2;
+                    to.bbox.x1 = face.x1; to.bbox.y1 = face.y1;
+                    to.bbox.x2 = face.x2; to.bbox.y2 = face.y2;
                     to.confidence = face.confidence;
-                    to.bbox.score = face.confidence;    // SHM relies on this
-                    to.bbox.class_id = 100;             // Distinct class ID for Face
-                    to.label = (!face.name.empty() && face.name != "Unknown") ? face.name : "Face";
+                    to.bbox.score = face.confidence;
+                    to.bbox.class_id = 100;
+                    to.label = (!face.stable_name.empty() && face.stable_name != "Face")
+                                   ? face.stable_name
+                                   : ((!face.name.empty() && face.name != "Unknown") ? face.name : "Face");
                     to.track_id = face.track_id;
                     tracked_objects.push_back(to);
-                    
-                    // JSON
+
+                    int pid = (face.stable_person_id != -1) ? face.stable_person_id : face.person_id;
                     j_out["objects"].push_back({
                         {"label", to.label},
+                        {"person_id", pid},
                         {"confidence", to.confidence},
                         {"track_id", to.track_id},
                         {"box", {to.bbox.x1, to.bbox.y1, to.bbox.x2, to.bbox.y2}}

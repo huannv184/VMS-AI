@@ -2,9 +2,24 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import useVmsStore from '../store/useVmsStore';
 import CameraFeed from '../components/CameraFeed';
 import PtzPatrolModal from '../components/PtzPatrolModal';
+import apiClient from '../api/apiClient';
+
+// PERF-OPT: Separate clock component to isolate re-renders every second
+const LiveClock = ({ mode = 'iso' }) => {
+  const [time, setTime] = useState(new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  if (mode === 'iso') {
+    return <span>{time.toISOString().replace('T', ' ').substr(0, 19)}</span>;
+  }
+  return <span>{time.toLocaleTimeString()}</span>;
+};
 
 // PERF-OPT: Memoized cell to prevent re-renders when sibling cameras update status
-const CameraCell = React.memo(({ cam, timestamp, onPatrol }) => (
+const CameraCell = React.memo(({ cam, onPatrol }) => (
   <div className={`cam-cell ${cam.status === 'error' ? 'alert-cam' : ''}`}>
     <CameraFeed cameraId={cam.id} showControls={false} />
     <div className="cam-overlay">
@@ -24,7 +39,7 @@ const CameraCell = React.memo(({ cam, timestamp, onPatrol }) => (
         </div>
       </div>
       <div className="cam-footer">
-        <span className="cam-ts">{timestamp}</span>
+        <span className="cam-ts"><LiveClock mode="iso" /></span>
         <span className="cam-fps">{cam.fps || 0}fps · {cam.resolution || '640x360'}</span>
       </div>
       <div className="ai-tag">AI·ON</div>
@@ -41,18 +56,12 @@ const CameraCell = React.memo(({ cam, timestamp, onPatrol }) => (
 const LiveView = () => {
   const cameras = useVmsStore((state) => state.cameras);
   const [layout, setLayout] = useState(4);
-  const [clockTick, setClockTick] = useState(0);
-  
+
   // Touring State
   const [isTouring, setIsTouring] = useState(false);
   const [tourIndex, setTourIndex] = useState(0);
   const [tourInterval, setTourInterval] = useState(10); // seconds
   const [showPatrolCam, setShowPatrolCam] = useState(null);
-  
-  useEffect(() => {
-    const timer = setInterval(() => setClockTick(t => t + 1), 1000);
-    return () => clearInterval(timer);
-  }, []);
 
   // Touring Engine
   useEffect(() => {
@@ -66,10 +75,6 @@ const LiveView = () => {
     }
     return () => clearInterval(timer);
   }, [isTouring, layout, cameras.length, tourInterval]);
-
-  const timestamp = useMemo(() => {
-    return new Date().toISOString().replace('T', ' ').substr(0, 19);
-  }, [clockTick]);
 
   const visibleCameras = useMemo(() => {
     if (!isTouring) return cameras.slice(0, layout);
@@ -86,6 +91,42 @@ const LiveView = () => {
 
   // PERF-OPT: stable callback ref for patrol button
   const handlePatrol = useCallback((camId) => setShowPatrolCam(camId), []);
+
+  const [actionMsg, setActionMsg] = useState(null);
+
+  const handleSnapshotAll = useCallback(async () => {
+    if (visibleCameras.length === 0) return;
+    setActionMsg('Đang chụp ảnh...');
+    const results = await Promise.allSettled(
+      visibleCameras.map((c) => apiClient.snapshotCamera(c.id))
+    );
+    const ok = results.filter((r) => r.status === 'fulfilled' && r.value?.success).length;
+    setActionMsg(`Đã chụp ${ok}/${visibleCameras.length} camera`);
+    setTimeout(() => setActionMsg(null), 2500);
+  }, [visibleCameras]);
+
+  const handleExportLayout = useCallback(() => {
+    const payload = {
+      exported_at: new Date().toISOString(),
+      layout,
+      is_touring: isTouring,
+      tour_interval_sec: tourInterval,
+      cameras: visibleCameras.map((c) => ({ id: c.id, name: c.name, status: c.status })),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `live_layout_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [layout, isTouring, tourInterval, visibleCameras]);
+
+  const cycleTourInterval = useCallback(() => {
+    const intervals = [5, 10, 20, 30, 60];
+    const idx = intervals.indexOf(tourInterval);
+    setTourInterval(intervals[(idx + 1) % intervals.length] || 10);
+  }, [tourInterval]);
 
   return (
     <div className="view-panel active" id="view-live">
@@ -106,11 +147,11 @@ const LiveView = () => {
           <svg viewBox="0 0 14 14" fill="currentColor"><rect x="1" y="1" width="3" height="3"/><rect x="5.5" y="1" width="3" height="3"/><rect x="10" y="1" width="3" height="3"/><rect x="1" y="5.5" width="3" height="3"/><rect x="5.5" y="5.5" width="3" height="3"/><rect x="10" y="5.5" width="3" height="3"/><rect x="1" y="10" width="3" height="3"/><rect x="5.5" y="10" width="3" height="3"/><rect x="10" y="10" width="3" height="3"/></svg>
           3×3
         </div>
-        
+
         <div className="toolbar-sep2"></div>
-        
+
         {/* TOURING BUTTON */}
-        <div className={`grid-btn ${isTouring ? 'active' : ''}`} 
+        <div className={`grid-btn ${isTouring ? 'active' : ''}`}
              style={{ color: isTouring ? 'var(--accent)' : 'inherit' }}
              onClick={() => setIsTouring(!isTouring)}
              title="Chế độ tuần tra (Auto Cycle)">
@@ -120,16 +161,26 @@ const LiveView = () => {
           </svg>
           {isTouring ? `TUẦN TRA (${tourInterval}s)` : 'TUẦN TRA'}
         </div>
+        {isTouring && (
+          <div className="grid-btn" onClick={cycleTourInterval} title="Đổi chu kỳ tuần tra">
+            ⏱ {tourInterval}s
+          </div>
+        )}
 
         <div className="toolbar-sep2"></div>
-        <div className="grid-btn" title="SNAPSHOT">
+        <div className="grid-btn" title="Chụp ảnh tất cả camera đang hiển thị" onClick={handleSnapshotAll}>
           <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="1" y="3" width="12" height="9" rx="1"/><circle cx="7" cy="7.5" r="2.5"/></svg>
           SNAPSHOT
         </div>
-        <div className="grid-btn">
+        <div className="grid-btn" title="Xuất layout hiện tại (.json)" onClick={handleExportLayout}>
           <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M7 2v7M4.5 7L7 10l2.5-3"/><path d="M2 11h10"/></svg>
           EXPORT
         </div>
+        {actionMsg && (
+          <span style={{ fontSize: 10, color: 'var(--accent)', marginLeft: 8, fontFamily: "'Share Tech Mono',monospace" }}>
+            {actionMsg}
+          </span>
+        )}
         <div className="toolbar-sep"></div>
         <div className="ai-badge">
           <div className="ai-dot-spin"></div>
@@ -142,12 +193,11 @@ const LiveView = () => {
           <CameraCell
             key={cam.id}
             cam={cam}
-            timestamp={timestamp}
             onPatrol={handlePatrol}
           />
         ))}
         {cameras.length === 0 && (
-          <div style={{gridColumn: '1 / -1', height: '400px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-dim)', fontSize: '14px', letterSpacing: '2px'}}>
+          <div style={{gridColumn: '1 / -1', height: '400px', display: 'flex', alignItems: 'center', justifyContent:'center', color: 'var(--text-dim)', fontSize: '14px', letterSpacing: '2px'}}>
              HỆ THỐNG CHƯA CÓ CAMERA - VUI LÒNG THÊM MỚI TRONG PHẦN CÀI ĐẶT
           </div>
         )}
@@ -155,15 +205,24 @@ const LiveView = () => {
 
       <div className="timeline-bar">
         <div className="tl-controls">
-          <div className="tl-btn" title="Play/Pause">
-            <svg viewBox="0 0 12 12" fill="currentColor"><path d="M3 2L9 6 3 10z"/></svg>
+          <div
+            className={`tl-btn ${isTouring ? 'active' : ''}`}
+            title={isTouring ? 'Tạm dừng tuần tra' : 'Bắt đầu tuần tra'}
+            onClick={() => setIsTouring((v) => !v)}
+            style={{ cursor: 'pointer' }}
+          >
+            {isTouring ? (
+              <svg viewBox="0 0 12 12" fill="currentColor"><rect x="2.5" y="2" width="2.5" height="8"/><rect x="7" y="2" width="2.5" height="8"/></svg>
+            ) : (
+              <svg viewBox="0 0 12 12" fill="currentColor"><path d="M3 2L9 6 3 10z"/></svg>
+            )}
           </div>
         </div>
         <div className="timeline-track">
           <div className="tl-segment" style={{ left: '0%', width: '100%', background: 'rgba(0,200,245,0.1)' }}></div>
           <div className="tl-cursor" style={{left: '52%'}}></div>
         </div>
-        <div className="tl-time">{new Date().toLocaleTimeString()}</div>
+        <div className="tl-time"><LiveClock mode="local" /></div>
       </div>
 
       {showPatrolCam && (

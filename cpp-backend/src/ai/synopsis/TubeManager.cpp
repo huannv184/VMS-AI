@@ -18,12 +18,10 @@ void TubeManager::processFrame(long long frameTime,
                                const cv::Mat& frame) {
     if (boxes.empty()) return;
 
-    // TODO: Implement actual tracking (IOU based for simplicity)
-    // For each detection, find if it matches an active tube
-    // If matched, append to tube
-    // If not matched, start new tube
-    
-    // Simple greedy matching
+    // Greedy IoU matching: for each active tube, take the highest-IoU unmatched
+    // box above the threshold; unmatched boxes seed new tubes; tubes that don't
+    // match any box this frame are deactivated immediately (no missing-frame
+    // tolerance — see end-of-function note).
     std::vector<bool> matchedBox(boxes.size(), false);
     std::vector<int> lostTubes;
 

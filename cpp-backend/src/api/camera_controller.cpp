@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <mutex>
 #include <memory>
@@ -40,19 +41,6 @@ using json = nlohmann::json;
 
 namespace vms {
 namespace api {
-
-static bool hasPermission(const vms::core::User& user, const std::string& perm) {
-    if (user.role_id == 1) return true; // admin
-    for (const auto& p : user.permissions) {
-        if (p == "all" || p == perm) return true;
-    }
-    return false;
-}
-
-static bool canManageCameras(const vms::core::User& user) {
-    // Current roles: 1=admin, 2=operator, 3=viewer
-    return user.role_id == 1 || user.role_id == 2;
-}
 
 namespace {
 
@@ -193,8 +181,8 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
         
         // GET all cameras
         if (req.method == crow::HTTPMethod::Get) {
-            if (auth_enabled && !hasPermission(*ctx.user, "camera.view")) {
-                return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+            if (auth_enabled) {
+                if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
             }
 
             const bool can_use_admin_cache = auth_enabled && ctx.user->role_id == 1;
@@ -257,7 +245,16 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                     // Reuse the stats already fetched above so one bad camera does not
                     // fail the entire /api/cameras response.
                     c["bitrate_kbps"] = stats.is_running ? static_cast<int>(stats.fps * 150) : 0;
-                    c["cpu_usage_percent"] = 0; // TODO: Implement real CPU measurement per pipeline
+                    // Per-pipeline CPU% sampled at 1 Hz by globalWatchdogTick
+                    // (FFmpeg child + ai_worker, normalised to host CPU).
+                    // -1 = "not yet sampled" — emit null so frontend can fallback.
+                    if (!stats.is_running) {
+                        c["cpu_usage_percent"] = 0;
+                    } else if (stats.cpu_usage_percent < 0) {
+                        c["cpu_usage_percent"] = nullptr;
+                    } else {
+                        c["cpu_usage_percent"] = std::round(stats.cpu_usage_percent * 10.0) / 10.0;
+                    }
                     c["uptime_seconds"] = stats.is_running ? stats.last_frame_ts : 0;
                     
                     cam_list.push_back(c);
@@ -281,9 +278,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
         
         // POST create camera (requires auth)
         if (req.method == crow::HTTPMethod::Post) {
-            if (!canManageCameras(*ctx.user)) {
-                return ApiUtils::createErrorResponse("Forbidden", 403, origin);
-            }
+            if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
             try {
                 auto body = json::parse(req.body);
 
@@ -373,9 +368,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
 
         // GET camera by ID
         if (req.method == crow::HTTPMethod::Get) {
-            if (!hasPermission(*ctx.user, "camera.view")) {
-                return ApiUtils::createErrorResponse("Forbidden", 403, origin);
-            }
+            if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
             try {
                 auto camera = camera_mgr.getCamera(id);
                 if (camera) {
@@ -403,9 +396,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
         
         // PUT update camera (requires auth)
         if (req.method == crow::HTTPMethod::Put) {
-            if (!canManageCameras(*ctx.user)) {
-                return ApiUtils::createErrorResponse("Forbidden", 403, origin);
-            }
+            if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
             try {
                 auto body = json::parse(req.body);
                 auto camera_opt = camera_mgr.getCamera(id);
@@ -451,9 +442,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
         }
         // DELETE camera (requires auth)
         if (req.method == crow::HTTPMethod::Delete) {
-            if (!canManageCameras(*ctx.user)) {
-                return ApiUtils::createErrorResponse("Forbidden", 403, origin);
-            }
+            if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
             try {
                 LOG_INFO("API: Request to delete camera ID: {}", id);
                 if (camera_mgr.removeCamera(id)) {
@@ -534,7 +523,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
-        if (!hasPermission(*ctx.user, "camera.view")) return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
 
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
@@ -575,7 +564,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
-        if (!hasPermission(*ctx.user, "camera.view")) return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
 
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
@@ -617,7 +606,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
-        if (!canManageCameras(*ctx.user)) return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
         
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
@@ -645,7 +634,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
-        if (!canManageCameras(*ctx.user)) return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
         
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
@@ -673,7 +662,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
 
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
-        if (!hasPermission(*ctx.user, "camera.view")) return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
         
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
@@ -695,7 +684,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
-        if (!canManageCameras(*ctx.user)) return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
         
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
@@ -719,7 +708,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
-        if (!hasPermission(*ctx.user, "camera.view")) return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
             auto camera_opt = camera_mgr.getCamera(id);
@@ -737,7 +726,13 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 
                 // Detailed telemetry — FIX BUG-001: Real estimates instead of random
                 stats_json["bitrate_kbps"] = stats.is_running ? static_cast<int>(stats.fps * 150) : 0;
-                stats_json["cpu_usage_percent"] = 0; // TODO: Implement real CPU measurement
+                if (!stats.is_running) {
+                    stats_json["cpu_usage_percent"] = 0;
+                } else if (stats.cpu_usage_percent < 0) {
+                    stats_json["cpu_usage_percent"] = nullptr;
+                } else {
+                    stats_json["cpu_usage_percent"] = std::round(stats.cpu_usage_percent * 10.0) / 10.0;
+                }
                 stats_json["uptime_seconds"] = stats.is_running ? stats.last_frame_ts : 0;
 
             } catch (...) {
@@ -756,7 +751,8 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
-        if (!ctx.user.has_value() || !canManageCameras(*ctx.user)) return ApiUtils::createErrorResponse("Forbidden", 403, origin);
+        if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
 
         try {
             json cameras_to_import = json::array();

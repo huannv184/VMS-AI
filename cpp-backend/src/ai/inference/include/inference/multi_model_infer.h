@@ -72,7 +72,11 @@ public:
         // SCRFD face detection model
         std::string scrfd_model_path;
         int scrfd_input_size = 640;
-        float scrfd_conf_threshold = 0.5f;
+        // 0.40: cân bằng giữa bắt face xa (≥0.35) và loại false positive trên
+        // texture đường/tường (~0.30-0.35). Kết hợp với post-filter "face phải
+        // nằm trong person bbox" trong ai_worker/main.cpp để loại noise còn lại.
+        // Env override: VMS_SCRFD_CONF.
+        float scrfd_conf_threshold = 0.40f;
         float scrfd_nms_threshold = 0.4f;
         
         // ArcFace recognition model
