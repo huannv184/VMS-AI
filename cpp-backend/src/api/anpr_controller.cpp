@@ -1,6 +1,9 @@
 #include "api/anpr_controller.h"
 #include "database/anpr_repository.h"
+#include "database/audit_repository.h"
+#include "middleware/auth_middleware.h"
 #include "utils/api_utils.h"
+#include "utils/logger.h"
 #include "database/json_serialization.h"
 
 using json = nlohmann::json;
@@ -9,15 +12,34 @@ namespace vms {
 namespace api {
 
 void ANPRController::registerRoutes(vms::server::VmsApp& app) {
-    
+
+    // BUG-ANPR-AUTH-01 (audit 2026-05-08): pre-fix all five route variants
+    // captured `[]` and never read AuthMiddleware context. The plate table
+    // (PII: vehicle plate × camera × timestamp) was readable, writable, and
+    // wipeable by any TCP client that could reach the API port. Same shape as
+    // SEC-003/004 (devices/sites zero RBAC, 2026-05-02) and SEC-008/009/010
+    // (analytics modules unauth GETs, 2026-05-03). Fix: capture `[&app]`,
+    // gate GET on ANALYTICS_READ (matches the rest of analytics surface),
+    // gate POST/DELETE on SYSTEM_ADMIN (mutating the historical plate ledger
+    // is an admin action — the real population path is the AI worker's
+    // detection pipeline, not manual operator entry), audit-log the
+    // mutating ops.
+
     // GET & POST plates
     CROW_ROUTE(app, "/api/anpr/plates")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Post, crow::HTTPMethod::Delete, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
 
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
-        
+
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        Permission needed = Permission::ANALYTICS_READ;
+        if (req.method == crow::HTTPMethod::Post || req.method == crow::HTTPMethod::Delete) {
+            needed = Permission::SYSTEM_ADMIN;
+        }
+        if (auto err = ApiUtils::requirePermission(ctx, needed, origin)) return std::move(*err);
+
         if (req.method == crow::HTTPMethod::Get) {
             try {
                 // FIX: Validate and clamp limit/offset to prevent DoS
@@ -73,17 +95,32 @@ void ANPRController::registerRoutes(vms::server::VmsApp& app) {
                      if(p.color.length() > 30) return ApiUtils::createErrorResponse("Color too long", 400, origin);
                 }
                 if (body.contains("camera_id")) {
-                     if(body["camera_id"].is_number_integer()) p.camera_id = body["camera_id"];
+                    if (body["camera_id"].is_number_integer()) {
+                        int cid = body["camera_id"].get<int>();
+                        // Reject pathological values rather than letting them
+                        // orphan a plate row to a non-existent camera id.
+                        if (cid < 0 || cid > 1000000) {
+                            return ApiUtils::createErrorResponse("camera_id out of range", 400, origin);
+                        }
+                        p.camera_id = cid;
+                    }
                 }
                 if (body.contains("confidence")) {
                      if(body["confidence"].is_number()) p.confidence = body["confidence"];
                      if(p.confidence < 0.0 || p.confidence > 1.0) return ApiUtils::createErrorResponse("Confidence must be 0.0-1.0", 400, origin);
                 }
-                
+
                 p.detected_at = std::time(nullptr);
-                
+
                 database::ANPRRepository repo;
-                if (repo.insertPlate(p)) return ApiUtils::createResponse(json::object(), 201, origin);
+                if (repo.insertPlate(p)) {
+                    if (ctx.user) {
+                        vms::database::AuditRepository audit;
+                        audit.insertLog(ctx.user->id, "CREATE_PLATE",
+                                        "Plate '" + p.plate_number + "' camera=" + std::to_string(p.camera_id));
+                    }
+                    return ApiUtils::createResponse(json::object(), 201, origin);
+                }
                 return ApiUtils::createErrorResponse("Failed to insert plate", 500, origin);
             } catch (const std::exception& e) {
                 return ApiUtils::createErrorResponse(e.what(), 500, origin);
@@ -91,7 +128,18 @@ void ANPRController::registerRoutes(vms::server::VmsApp& app) {
         } else if (req.method == crow::HTTPMethod::Delete) {
             try {
                 database::ANPRRepository repo;
+                int prior_count = 0;
+                try { prior_count = repo.getPlateCount(); } catch (...) { /* best-effort for audit */ }
+
                 if (repo.clearAllPlates()) {
+                    if (ctx.user) {
+                        vms::database::AuditRepository audit;
+                        audit.insertLog(ctx.user->id, "CLEAR_ALL_PLATES",
+                                        "Wiped ANPR plate table (prior count=" +
+                                        std::to_string(prior_count) + ")");
+                    }
+                    LOG_WARN("ANPR: clearAllPlates by user_id={} (prior count={})",
+                             ctx.user ? ctx.user->id : -1, prior_count);
                     return ApiUtils::createResponse(json::object(), 200, origin);
                 }
                 return ApiUtils::createErrorResponse("Failed to delete plates", 500, origin);
@@ -106,11 +154,14 @@ void ANPRController::registerRoutes(vms::server::VmsApp& app) {
     // SEARCH plates
     CROW_ROUTE(app, "/api/anpr/search")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
 
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
-        
+
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
+
         try {
             std::string query = "";
             if (req.url_params.get("q")) query = req.url_params.get("q");

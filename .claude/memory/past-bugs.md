@@ -1,5 +1,71 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-08 BUG-ANPR-AUTH-01 — ANPR controller had ZERO authentication on all five route variants
+
+- **File**: `cpp-backend/src/api/anpr_controller.cpp` (pre-fix)
+- **Bug**: All five route variants on `/api/anpr/plates` (GET, POST, DELETE) and `/api/anpr/search` (GET) used `[]` lambda capture and never read AuthMiddleware context. Anyone reachable on the API port could (a) leak the entire vehicle plate × camera × timestamp PII ledger, (b) poison it with fake records, (c) wipe the entire table with a single DELETE — no confirmation, no audit log. Same shape as SEC-003/004 (devices/sites RBAC, 2026-05-02) and SEC-008/009/010 (analytics unauth GETs, 2026-05-03).
+- **Status**: CRITICAL — PII data leak + integrity / availability against the historical plate ledger. Pure regression of past audit lessons.
+- **Detection**: 2026-05-08 audit pass on the LP/ANPR surface as part of the synopsis audit. Same `[]` capture pattern that the past audits already trained on.
+- **Fix**: `[&app]` capture + `requirePermission` per method. GET → `ANALYTICS_READ` (matches counter/attendance/reid analytics surface). POST/DELETE → `SYSTEM_ADMIN` (manual writes are an admin function — the real population path is the AI worker's LPR detection, not operator entry; bulk delete is destructive). `AuditRepository::insertLog` on POST and DELETE with the prior-count snapshot. `camera_id` POST validation now rejects negatives / pathological values.
+- **Detection lesson** (reinforces SEC-003/004/008): every new controller introduced into the codebase needs to be audited as part of the next nearby pass. The ANPR controller predates the SEC-002+ audit work; nobody went back to backfill it. We need a checklist of "controllers we've audited" and re-grep for the `[]` capture pattern any time a new controller is added.
+
+## 2026-05-08 BUG-SYN-PATH-01 — Synopsis videoPath user-supplied path traversal
+
+- **File**: `cpp-backend/src/api/synopsis_controller.cpp:61` (pre-fix)
+- **Bug**: `POST /api/synopsis/create` accepted `videoPath` directly from the JSON body and passed it to `cv::VideoCapture(...)` inside the engine. The empty-path branch fell through to a DB lookup but any non-empty user value was used verbatim. A logged-in user could probe arbitrary paths on disk via job success/failure timing (different errors for "not found" vs "not a video" vs "permission denied"); with the right combination of args the engine could even render content from a non-recording video file into the publicly served `recordings/<jobId>.mp4` output.
+- **Status**: HIGH (info disclosure / partial data exfiltration), gated by login but accessible to any authenticated user.
+- **Fix**: New `sanitizeVideoPath()` helper — `weakly_canonical()` of both the path and the `recordings/` root, prefix check via `target.rfind(root, 0) == 0`. Empty input passes through (DB-lookup branch handles it). Non-empty inputs that escape the recordings root return 400 + a LOG_WARN.
+- **Detection lesson**: Path-traversal hazard rule: any user-supplied string that hits a `cv::VideoCapture`, `std::ifstream`, `std::filesystem::*`, or anything that opens a path needs the same treatment. Same pattern as BUG-H11 (recording delete weakly_canonical + prefix check) — apply universally, not only on the destructive paths.
+
+## 2026-05-08 BUG-SYN-RBAC-01 — Synopsis create/status gated only on `auth.validate(req)`
+
+- **File**: `cpp-backend/src/api/synopsis_controller.cpp:54,156` (pre-fix)
+- **Bug**: Synopsis is an analytics feature that CPU-saturates a worker for minutes per job and reads recording paths off the DB. Pre-fix any logged-in user (including viewer) could spawn jobs. Same shape as SEC-005 (face/reid/videowall "is logged in" gates).
+- **Status**: HIGH (DoS-prone — viewer can ladder synopsis jobs to fill the queue and read sensitive recording metadata).
+- **Fix**: Switch from `auth.validate(req)` to `app.get_context<AuthMiddleware>(req)` + `requirePermission(ANALYTICS_READ, origin)`. The legacy `auth` parameter on `registerRoutes` is preserved (signature-stable); the body now ignores it (`(void)auth`).
+- **Detection lesson**: `auth.validate(req)` without a permission gate is identical-in-effect to "is this caller authenticated?" and we now always treat that as the SEC-005 anti-pattern. Grep for `auth.validate(` whenever there's an audit pass — any survivor needs justification.
+
+## 2026-05-08 BUG-SYN-RENDER-01 — Crop-vs-rect size mismatch in synopsis rendering threw mid-job
+
+- **Files**: `cpp-backend/src/ai/synopsis/SynopsisEngine.cpp:191-193`, `TubeManager.cpp:71-76` (pre-fix)
+- **Bug**: `TubeManager::processFrame` downscales tube-frame crops whose source `rect.area() > maxCropArea_` (256×256), but stores `tf.rect` at the original full-size box. `SynopsisEngine::renderSynopsis` then did `cv::Mat roi = frame(tf.rect); tf.crop.copyTo(roi);` — `cv::Mat::copyTo` throws `cv::Exception` on every size-mismatched call. ANY synopsis job containing at least one large object crashed mid-render. The exception bubbled through `engine.generate()` to the `BackgroundJobRunner` worker which had NO try/catch — the job stayed "processing" forever, partial `recordings/<jobId>.mp4` output leaked on disk, REST status path showed nothing useful.
+- **Status**: HIGH (functional crash on the typical happy-path input — anyone running synopsis on real CCTV footage hit this).
+- **Detection**: 2026-05-08 audit. The TubeManager file's "MEMORY FIX" comment block on the downscale path was the smoking gun — when one half of a pipeline applies a transformation that the other half doesn't expect, you have a contract violation.
+- **Fix**: Engine: clamp `drawRect = tf.rect & frame_bounds`, `cv::resize(tf.crop, ...)` to match `drawRect.size()` before `copyTo`, skip empty crops. Controller: `try { engine.generate(...) } catch (cv/std::exception)` — failures now mark the job "failed" with the real error string instead of leaving the worker thread stuck.
+- **Detection lesson** (general): "memory-fix" comments that reduce one side of an output pair without updating the consumer are a textbook contract-mismatch hazard. Whenever you see "scale this down to save memory" applied to a value used downstream, audit every consumer. Sometimes the consumer needs the original dimensions; sometimes it needs the scale factor too.
+
+## 2026-05-08 BUG-SYN-DURATION-01 — Synopsis `targetDuration` unbounded → DoS
+
+- **File**: `cpp-backend/src/api/synopsis_controller.cpp:98` (pre-fix)
+- **Bug**: `targetDuration` accepted any int from JSON. The render loop is O(output_frames × tubes × frames_per_tube). 24h × 30 fps × 50 tubes × 150 frames ≈ 20 billion iterations on the single synopsis worker. Combined with BUG-SYN-RBAC-01 above, a viewer could fully saturate the synopsis worker indefinitely.
+- **Fix**: Clamp to `[5, 600]` seconds.
+
+## 2026-05-08 BUG-SYN-LEAK-01 — `g_jobs` map grew without bound
+
+- **File**: `cpp-backend/src/api/synopsis_controller.cpp:28-29,103` (pre-fix)
+- **Bug**: Every accepted `/api/synopsis/create` permanently inserted a `SynopsisJob` entry. No cleanup on success or failure.
+- **Fix**: `kMaxJobs = 200`, `kMaxJobAgeSeconds = 24h`, new `pruneOldJobsLocked()` evicts on insert. Pending/processing jobs are NEVER evicted (worker thread reads `g_jobs[jobId]` to write status). If all 200 slots are pending/processing, returns 429 instead of overwriting.
+- **Detection lesson**: Every long-lived in-memory map indexed by user-controllable keys (jobId, request_id, session_id, etc.) needs an eviction policy on the insert path. "Server runs forever" is the wrong default; "evict the obsolete" is the right one.
+
+## 2026-05-08 BUG-SYN-CAMID-01 — Synopsis `cameraId` no bound check
+
+- **File**: `cpp-backend/src/api/synopsis_controller.cpp:58` (pre-fix)
+- **Bug**: Accepted any int including negatives — DB lookup went out to MIN_INT space, no harm but pollutes logs and makes grep-debug harder.
+- **Fix**: Reject `cameraId < 0 || > 1000000`.
+
+## 2026-05-08 BUG-ANPR-PIPELINE — LPR detects plates but no DB persistence bridge (DEFERRED — documented half-dead pipeline)
+
+- **Files**: `cpp-backend/src/ai_worker/main.cpp:744-759` (LPR producer), `cpp-backend/src/database/anpr_repository.cpp:129` (insertPlate caller search)
+- **Bug**: `enable_lpr` defaults to false. When enabled, AI worker detects license plates and emits them as `TrackedObject{class_id=200, label="LicensePlate"}` into the unified ZMQ metadata stream. There is NO bridge that persists detected plates into the `LicensePlate` DB table — `ANPRRepository::insertPlate` is called only from the manual `POST /api/anpr/plates` REST endpoint. So:
+  - When LPR disabled (default): nothing detects, nothing inserts, REST table empty.
+  - When LPR enabled: detections flow live (frontend WS sees them), but **historical plate queries return empty** — the table is never populated.
+  - Manual POSTs work but the entries are not connected to anything.
+
+  Same shape as BUG-REID-DEAD-PIPELINE (cross-camera ReID gallery never fed) but partial — the producer is alive in the live stream, just not bridged to persistence.
+- **Status**: CRITICAL operational lie if LPR is advertised as a working feature. Less severe than BUG-REID-DEAD-PIPELINE because the live event stream IS populated; it's only the historical query that's dead.
+- **Why deferred**: The wiring is small (~30 LoC) but the dedup semantics need a design decision — same plate detected on consecutive frames should not create N rows. Same kind of question we already answered for `AttendanceTracker::dedup_` and `CounterBucketAggregator`. Choose a key (plate_text + camera_id + minute-of-day window), idempotent UPSERT, retention policy. The bridge wiring is its own session.
+- **Mitigation landed this session**: BUG-ANPR-AUTH-01 fix at least closes the data-leak side — even if the table starts populating, only authorised users can read it.
+
 ## 2026-05-08 BUG-REID-DEAD-PIPELINE — Cross-camera ReID gallery never populated; REST endpoints returned empty arrays as if scene were quiet
 
 - **Files**: `cpp-backend/src/core/reid_engine.cpp`, `cpp-backend/src/api/reid_controller.cpp`, `cpp-backend/include/core/reid_engine.h` (pre-fix)

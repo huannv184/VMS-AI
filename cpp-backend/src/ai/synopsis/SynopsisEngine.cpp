@@ -168,35 +168,40 @@ void SynopsisEngine::renderSynopsis(const std::string& outputPath, const cv::Mat
         for (const auto& tube : tubes) {
             long long relTime = currentTime - tube.scheduledStartTime;
             if (relTime >= 0 && relTime < tube.duration()) {
-                // Find frame in tube corresponding to relTime
-                // Since tube.frames are linear and captured at original FPS approx, 
-                // we can map relTime to original tube time offset
-                
-                // Find closest frame
-                long long originalOffset = relTime; 
-                // We stored absolute timestamp in TubeFrame.
-                // Tube start time = tube.startTime.
-                // TubeFrame time - tube.startTime = offset
-                
-                // Use simple linear search or closest
+                long long originalOffset = relTime;
+
                  for (const auto& tf : tube.frames) {
-                     // Check if this frame is "current" for the tube playback
-                     // Current playback time of tube = relTime
                      long long tfOffset = tf.timestamp - tube.startTime;
                      long long diff = std::abs(tfOffset - originalOffset);
-                     
+
                      if (diff < (1000.0/fps)) { // Match within 1 frame duration
-                         // Draw tf.crop at tf.rect
-                         // Handle boundaries
-                         cv::Mat roi = frame(tf.rect);
-                         // Simple copy, ideally use mask
-                         tf.crop.copyTo(roi);
-                         
-                         // Add bounding box or label if needed
-                         // cv::rectangle(frame, tf.rect, cv::Scalar(0,255,0), 2);
-                         
-                         // Add timestamp text
-                         // std::string timeStr = ...
+                         // BUG-SYN-RENDER-01 (audit 2026-05-08): TubeManager
+                         // downscales crops whose source rect.area() exceeds
+                         // maxCropArea_ (256×256), but stores tf.rect at the
+                         // original full-size box. Pre-fix, copyTo()
+                         // throws cv::Exception on every render frame whose
+                         // tube has a downscaled crop — synopsis jobs with
+                         // any large object crashed mid-render. The exception
+                         // propagated through engine.generate() to the job
+                         // worker which marked the job "failed" with no
+                         // useful error, and the partial recordings/<jobId>.mp4
+                         // file leaked on disk. Now: clamp the draw rect to
+                         // the frame, and resize the crop to match it before
+                         // copyTo. The cost (one resize per tube per frame)
+                         // is small relative to the pixel-blit it precedes.
+                         if (tf.crop.empty()) break;
+                         cv::Rect drawRect = tf.rect & cv::Rect(0, 0, frame.cols, frame.rows);
+                         if (drawRect.width <= 0 || drawRect.height <= 0) break;
+
+                         cv::Mat scaled;
+                         if (tf.crop.size() != cv::Size(drawRect.width, drawRect.height)) {
+                             cv::resize(tf.crop, scaled,
+                                        cv::Size(drawRect.width, drawRect.height),
+                                        0, 0, cv::INTER_LINEAR);
+                         } else {
+                             scaled = tf.crop;
+                         }
+                         scaled.copyTo(frame(drawRect));
                          break; // Draw once per tube per frame
                      }
                  }
