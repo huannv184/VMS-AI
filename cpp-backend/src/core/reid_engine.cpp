@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 namespace vms {
 namespace core {
@@ -217,7 +218,14 @@ std::vector<float> ReIDEngine::extractEmbedding(const cv::Mat& person_crop) {
 
 int ReIDEngine::processDetection(int camera_id, int track_id, const cv::Mat& person_crop) {
     if (!initialized_ || !config_.enabled || person_crop.empty()) return -1;
-    
+
+    // First call observed — flip the wired flag so REST diagnostics and
+    // statistics stop reporting the engine as fronting an empty pipeline.
+    if (!producer_wired_.exchange(true)) {
+        LOG_INFO("ReIDEngine: first processDetection call observed (camera_id={}, track_id={}); cross-camera ReID is now active.",
+                 camera_id, track_id);
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     total_processed_++;
     
@@ -317,17 +325,34 @@ int ReIDEngine::processDetection(int camera_id, int track_id, const cv::Mat& per
 int ReIDEngine::findMatch(const std::vector<float>& embedding, float& best_score) {
     best_score = 0.0f;
     int best_id = -1;
-    
+
+    size_t skipped_dim = 0;
     for (const auto& [gid, entry] : gallery_) {
-        if (entry.embedding.size() != embedding.size()) continue;
-        
+        if (entry.embedding.size() != embedding.size()) {
+            ++skipped_dim;
+            continue;
+        }
+
         float score = cosineSimilarity(embedding, entry.embedding);
         if (score > best_score) {
             best_score = score;
             best_id = gid;
         }
     }
-    
+
+    // If the model dim was changed at runtime, the gallery silently disagrees
+    // with new embeddings → every detection becomes a "new person" forever.
+    // Surface that loudly the first time it happens so ops can clear the
+    // gallery (or restore the old model) instead of accumulating ghost ids.
+    if (skipped_dim > 0) {
+        static std::once_flag warned;
+        std::call_once(warned, [skipped_dim, &embedding]() {
+            LOG_WARN("ReIDEngine: {} gallery entries skipped during match — embedding dim mismatch "
+                     "(query dim={}). Likely a model swap; clearGallery() to recover.",
+                     skipped_dim, embedding.size());
+        });
+    }
+
     return best_id;
 }
 
@@ -424,12 +449,25 @@ ReIDConfig ReIDEngine::getConfig() const {
 void ReIDEngine::setConfig(const ReIDConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
     config_ = config;
-    LOG_INFO("ReID config updated: threshold={:.2f}, ttl={}s, max_gallery={}", 
+    // Clamp pathological values rather than letting them crash the engine
+    // later. gallery_ttl_sec<=0 makes pruning fire every detection;
+    // max_gallery_size<=0 disables matching outright; embedding_dim<=0
+    // would divide-by-zero in the histogram fallback path.
+    if (config_.match_threshold < 0.0f) config_.match_threshold = 0.0f;
+    if (config_.match_threshold > 1.0f) config_.match_threshold = 1.0f;
+    if (config_.gallery_ttl_sec <= 0)   config_.gallery_ttl_sec = 60;
+    if (config_.max_gallery_size <= 0)  config_.max_gallery_size = 50;
+    if (config_.embedding_dim <= 0)     config_.embedding_dim = 512;
+    LOG_INFO("ReID config updated: threshold={:.2f}, ttl={}s, max_gallery={}",
              config_.match_threshold, config_.gallery_ttl_sec, config_.max_gallery_size);
 }
 
 nlohmann::json ReIDEngine::getStatistics() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    // producer_wired surfaces the BUG-REID-DEAD-PIPELINE state: when false,
+    // gallery/trail/search results are empty because no detection producer is
+    // calling processDetection — not because the scene is empty. UI / ops
+    // dashboards must check this flag before interpreting an empty gallery.
     return {
         {"total_processed", total_processed_.load()},
         {"total_matched", total_matched_.load()},
@@ -437,7 +475,8 @@ nlohmann::json ReIDEngine::getStatistics() const {
         {"gallery_size", gallery_.size()},
         {"trails_count", trails_.size()},
         {"model_loaded", !net_.empty()},
-        {"initialized", initialized_.load()}
+        {"initialized", initialized_.load()},
+        {"producer_wired", producer_wired_.load()}
     };
 }
 

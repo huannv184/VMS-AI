@@ -25,24 +25,41 @@ static zmq::context_t& getZmqContext() {
 
 // ===========================================================================
 // Helper: Extract face embedding from AI Worker via ZMQ
-// Tries all active cameras' AI workers until one succeeds
-// Returns true on success, populates out_embedding_json with JSON array string
+// Tries up to MAX_WORKER_ATTEMPTS active cameras' AI workers and returns the
+// first successful embedding. Bounded so an HTTP request thread cannot stall
+// for more than ~MAX_WORKER_ATTEMPTS × (sndtimeo + rcvtimeo) when every
+// reachable worker is dead. Sequential is fine here — the success rate of the
+// first worker is high in normal operation; this code path matters only on
+// the failure side, which we're trimming.
 // ===========================================================================
 static bool extractEmbeddingFromAI(const std::string& image_base64, std::string& out_embedding_json) {
     out_embedding_json = "[]";
+
+    // Pre-fix this loop iterated over EVERY active camera with 5s aggregate
+    // timeout each. With 10 active cameras and all workers down (e.g. inference
+    // service crashed), the calling Crow handler thread blocked for 50+ seconds
+    // on a single /api/faces/persons POST — long enough that other API
+    // requests on the same handler thread time out. Cap at 3 attempts and
+    // tighten per-attempt timeouts so the worst case is ~6s.
+    constexpr int MAX_WORKER_ATTEMPTS = 3;
+    constexpr int RECV_TIMEOUT_MS = 1500;
+    constexpr int SEND_TIMEOUT_MS = 500;
 
     try {
         auto& cam_mgr = vms::core::CameraManager::getInstance();
         auto active = cam_mgr.getAllCameras();
         auto& context = getZmqContext();
 
+        int attempts = 0;
         for (const auto& cam : active) {
             if (!cam.is_active) continue;
+            if (attempts >= MAX_WORKER_ATTEMPTS) break;
+            ++attempts;
 
             int worker_port = 5560 + cam.id;
             zmq::socket_t socket(context, zmq::socket_type::req);
-            socket.set(zmq::sockopt::rcvtimeo, 3000);
-            socket.set(zmq::sockopt::sndtimeo, 2000);
+            socket.set(zmq::sockopt::rcvtimeo, RECV_TIMEOUT_MS);
+            socket.set(zmq::sockopt::sndtimeo, SEND_TIMEOUT_MS);
             socket.set(zmq::sockopt::linger, 0);
 
             try {
@@ -74,11 +91,16 @@ static bool extractEmbeddingFromAI(const std::string& image_base64, std::string&
                 continue;
             }
         }
+
+        if (attempts == 0) {
+            LOG_WARN("No active cameras available; cannot extract face embedding");
+        }
     } catch (const std::exception& e) {
         LOG_ERROR("Error accessing camera manager: {}", e.what());
     }
 
-    LOG_WARN("No active AI Worker could extract embedding");
+    LOG_WARN("No active AI Worker could extract embedding (after up to {} attempts)",
+             MAX_WORKER_ATTEMPTS);
     return false;
 }
 
@@ -414,10 +436,20 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                             }
                         }
 
-                        // Re-extract embedding
+                        // Re-extract embedding. If the image changed but the
+                        // AI worker is unavailable, the OLD embedding must
+                        // not stick around — search against it would be a
+                        // false-identity result against the new face. Clear
+                        // it so search returns "no match" until the operator
+                        // re-uploads (or the worker is brought back).
                         std::string embedding_json;
                         if (extractEmbeddingFromAI(image_base64, embedding_json)) {
                             p.embedding_json = embedding_json;
+                        } else {
+                            LOG_WARN("Person {} image updated but AI worker did not return "
+                                     "embedding; clearing stale embedding to avoid "
+                                     "false-identity match.", p.id);
+                            p.embedding_json = "[]";
                         }
                     } catch (const std::exception& e) {
                         LOG_ERROR("Image update error: {}", e.what());
@@ -451,15 +483,23 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
         // --- DELETE: Remove person + cleanup image file ---
         if (req.method == crow::HTTPMethod::Delete) {
             try {
-                // Get person first to cleanup image
+                // BUG-FACE-DEL-01 (audit 2026-05-08): pre-fix order deleted
+                // the image file BEFORE the DB row. If repo.deletePerson()
+                // failed (DB lock, FK constraint), the image was already gone
+                // but the row stuck around with face_image_path pointing at
+                // a now-missing file — UI shows broken thumbnail. Delete the
+                // DB row first; only on success do we drop the image. If the
+                // image delete itself then fails it logs a warning and we
+                // accept the orphan file (less bad than the inverse).
                 auto p_opt = repo.getPersonById(id);
+
+                if (!repo.deletePerson(id))
+                    return ApiUtils::createErrorResponse("Delete failed", 500, origin);
+
                 if (p_opt) {
                     deleteImageFromDisk(p_opt.value().face_image_path);
                 }
-                
-                if (repo.deletePerson(id))
-                    return ApiUtils::createResponse(json::object(), 200, origin);
-                return ApiUtils::createErrorResponse("Delete failed", 500, origin);
+                return ApiUtils::createResponse(json::object(), 200, origin);
             } catch (const std::exception& e) {
                 return ApiUtils::createErrorResponse(e.what(), 500, origin);
             }

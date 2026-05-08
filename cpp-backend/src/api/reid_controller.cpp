@@ -9,6 +9,8 @@
 #include "server/vms_app.h"
 #include "utils/api_utils.h"
 #include "utils/logger.h"
+#include <mutex>
+#include <unordered_map>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -20,6 +22,22 @@ using json = nlohmann::json;
 
 namespace vms {
 namespace api {
+
+namespace {
+// One-time WARN when REST is hit while the cross-camera ReID detection
+// pipeline has no producer wired in. Without this signal, an operator looking
+// at /api/reid/gallery → 200 [] cannot distinguish "scene currently empty"
+// from "feature dead" — see BUG-REID-DEAD-PIPELINE 2026-05-08.
+void warnIfProducerNotWiredOnce(const vms::core::ReIDEngine& engine) {
+    if (engine.isProducerWired()) return;
+    static std::once_flag warned;
+    std::call_once(warned, []() {
+        LOG_WARN("ReIDEngine: REST query received but no detection producer has called "
+                 "processDetection() this process. Gallery/trail/search will stay empty. "
+                 "Wire processDetection from the inference pipeline to enable cross-camera ReID.");
+    });
+}
+} // namespace
 
 // Base64 decode helper
 static std::vector<unsigned char> base64Decode(const std::string& encoded) {
@@ -56,6 +74,7 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
 
         try {
             auto& engine = vms::core::ReIDEngine::getInstance();
+            warnIfProducerNotWiredOnce(engine);
             auto trail = engine.getPersonTrail(global_id);
             
             json points = json::array();
@@ -104,27 +123,40 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
             }
             
             int top_k = body.value("top_k", 10);
+            // Guard against pathological top_k values from clients that could
+            // request gigantic result vectors. The engine's gallery is bounded
+            // (max_gallery_size, default 500) so anything beyond that is
+            // pointless work — clamp here.
+            if (top_k <= 0) top_k = 10;
+            if (top_k > 1000) top_k = 1000;
             auto& engine = vms::core::ReIDEngine::getInstance();
+            warnIfProducerNotWiredOnce(engine);
             auto results = engine.searchByImage(query, top_k);
-            
-            // Build response with entry details
+
+            // Build response with entry details. The gallery copy is taken
+            // once and indexed by global_id so the join is O(top_k + gallery)
+            // instead of the previous O(top_k × gallery) inner-loop scan —
+            // matters once max_gallery_size grows past the default 500.
             auto gallery = engine.getActiveGallery();
+            std::unordered_map<int, const vms::core::ReIDEntry*> by_gid;
+            by_gid.reserve(gallery.size());
+            for (const auto& entry : gallery) by_gid.emplace(entry.global_id, &entry);
+
             json matches = json::array();
             for (const auto& [gid, score] : results) {
                 json match = {{"global_id", gid}, {"score", score}};
-                for (const auto& entry : gallery) {
-                    if (entry.global_id == gid) {
-                        match["thumbnail_path"] = entry.thumbnail_path;
-                        match["camera_id"] = entry.camera_id;
-                        break;
-                    }
+                auto it = by_gid.find(gid);
+                if (it != by_gid.end()) {
+                    match["thumbnail_path"] = it->second->thumbnail_path;
+                    match["camera_id"] = it->second->camera_id;
                 }
                 matches.push_back(match);
             }
             
             return ApiUtils::createResponse({
                 {"results", matches},
-                {"count", matches.size()}
+                {"count", matches.size()},
+                {"producer_wired", engine.isProducerWired()}
             }, 200, origin);
         } catch (const std::exception& e) {
             return ApiUtils::createErrorResponse(e.what(), 500, origin);
@@ -184,6 +216,7 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
 
         auto& engine = vms::core::ReIDEngine::getInstance();
         if (req.method == crow::HTTPMethod::GET) {
+            warnIfProducerNotWiredOnce(engine);
             auto gallery = engine.getActiveGallery();
 
             json result = json::array();
@@ -194,6 +227,7 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse({
                 {"gallery", result},
                 {"count", result.size()},
+                {"producer_wired", engine.isProducerWired()},
                 {"statistics", engine.getStatistics()}
             }, 200, origin);
         }
@@ -214,6 +248,7 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
         if (auto err = ApiUtils::requirePermission(ctx, Permission::REID_READ, origin)) return std::move(*err);
 
         auto& engine = vms::core::ReIDEngine::getInstance();
+        warnIfProducerNotWiredOnce(engine);
         return ApiUtils::createResponse(engine.getStatistics(), 200, origin);
     });
 

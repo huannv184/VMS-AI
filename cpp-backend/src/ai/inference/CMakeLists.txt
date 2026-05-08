@@ -5,7 +5,6 @@ cmake_minimum_required(VERSION 3.18)
 # Add subdirectories for modules
 add_subdirectory(modules/trt_engine)
 add_subdirectory(modules/yolo_infer)
-add_subdirectory(modules/face_infer)
 add_subdirectory(modules/reid_infer)
 add_subdirectory(modules/custom_model)
 
@@ -29,7 +28,6 @@ target_include_directories(inference PUBLIC
 target_link_libraries(inference PUBLIC
     trt_engine
     yolo_infer
-    face_infer
     reid_infer
     custom_model
     common

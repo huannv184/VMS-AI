@@ -8,6 +8,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <numeric>
 
 namespace inference {
@@ -645,21 +646,48 @@ void MultiModelInfer::extractFaceEmbeddings(const cv::Mat& frame, std::vector<Fa
                 std::memset(face.embedding, 0, sizeof(face.embedding));
                 continue;
             }
-            
-            size_t embedding_size = std::min(output_tensor.size(), size_t(512));
-            std::memcpy(face.embedding, output_tensor.data(), embedding_size * sizeof(float));
-            
+
+            // BUG-FACE-EMB-01 (audit 2026-05-08): the previous code accepted
+            // any output size and clipped/extended via std::min(size, 512)
+            // followed by L2-normalising only the populated prefix. With a
+            // 256-dim model swap, the first 256 floats normalise but the last
+            // 256 stay zero, then matchFaces() still scores the partial
+            // vector against every full 512-dim DB embedding — producing
+            // plausible-looking but mathematically wrong similarity scores
+            // that can spuriously match the wrong person above threshold.
+            // Same operational-lie shape as BUG-INFER-01. Fail loud and zero
+            // the embedding so matchFaces() returns "Unknown" rather than a
+            // garbage identity.
+            if (output_tensor.size() != 512) {
+                static std::once_flag dim_warned;
+                std::call_once(dim_warned, [&output_tensor]() {
+                    std::cerr << "[MultiModelInfer] ArcFace produced unexpected embedding "
+                              << "dim=" << output_tensor.size() << " (expected 512). "
+                              << "Face matching disabled until a 512-dim model is restored."
+                              << std::endl;
+                });
+                std::memset(face.embedding, 0, sizeof(face.embedding));
+                continue;
+            }
+
+            std::memcpy(face.embedding, output_tensor.data(), 512 * sizeof(float));
+
             // L2 normalize
             float norm = 0.0f;
-            for (size_t i = 0; i < embedding_size; i++) {
+            for (size_t i = 0; i < 512; i++) {
                 norm += face.embedding[i] * face.embedding[i];
             }
             norm = std::sqrt(norm);
-            
+
             if (norm > 1e-6f) {
-                for (size_t i = 0; i < embedding_size; i++) {
+                for (size_t i = 0; i < 512; i++) {
                     face.embedding[i] /= norm;
                 }
+            } else {
+                // Engine returned a degenerate (~zero-norm) vector. Treat as
+                // a failed embedding — anything with a sub-microscopic norm
+                // would compare cosine ≈ 0 against everything anyway.
+                std::memset(face.embedding, 0, sizeof(face.embedding));
             }
         } catch (const std::exception& e) {
             std::memset(face.embedding, 0, sizeof(face.embedding));

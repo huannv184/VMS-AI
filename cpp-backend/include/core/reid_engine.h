@@ -75,6 +75,13 @@ public:
     // Initialize with model (call once at startup)
     bool init(const std::string& model_path = "");
     bool isInitialized() const { return initialized_.load(); }
+
+    // True once a real producer has called processDetection at least once.
+    // The cross-camera ReID feature is not currently fed by the inference
+    // pipeline (BUG-REID-DEAD-PIPELINE 2026-05-08); REST endpoints surface
+    // this through getStatistics() so empty gallery/search results aren't
+    // mistaken for "no people seen yet".
+    bool isProducerWired() const { return producer_wired_.load(); }
     
     /**
      * Process a person detection — extract embedding and match
@@ -127,6 +134,9 @@ private:
     // DNN model
     cv::dnn::Net net_;
     std::atomic<bool> initialized_{false};
+    // Set true only on the first call to processDetection. See header doc on
+    // isProducerWired() for context.
+    std::atomic<bool> producer_wired_{false};
     
     // Gallery: global_id -> latest entry
     std::unordered_map<int, ReIDEntry> gallery_;

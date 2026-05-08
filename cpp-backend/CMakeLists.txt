@@ -35,7 +35,6 @@ include_directories(
     src/ai/ipc
     src/ai/core_pipeline
     src/ai/inference/modules/custom_model
-    src/ai/inference/modules/face_infer
     src/ai/inference/modules/reid_infer
     src/ai/inference/modules/trt_engine
     src/ai/inference/modules/yolo_infer
