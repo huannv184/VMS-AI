@@ -105,6 +105,59 @@ static bool extractEmbeddingFromAI(const std::string& image_base64, std::string&
 }
 
 // ===========================================================================
+// Helper: Fan-out RELOAD_FACE_DB to every active AI worker.
+// Called after a successful insertPerson / updatePerson / deletePerson so the
+// in-process face galleries inside each worker get rebuilt — pre-fix the
+// workers loaded the gallery once at boot and never refreshed (BUG-AIW-FACEDB-01:
+// newly registered faces never matched live, deleted faces still matched).
+// Best-effort: short timeouts, no retry per worker, never blocks the request
+// thread for more than RELOAD_TOTAL_BUDGET_MS.
+// ===========================================================================
+static void broadcastFaceDbReload() {
+    constexpr int RELOAD_RECV_TIMEOUT_MS = 800;
+    constexpr int RELOAD_SEND_TIMEOUT_MS = 300;
+
+    try {
+        auto& cam_mgr = vms::core::CameraManager::getInstance();
+        auto active = cam_mgr.getAllCameras();
+        auto& context = getZmqContext();
+
+        int notified = 0, failed = 0;
+        for (const auto& cam : active) {
+            if (!cam.is_active) continue;
+
+            int worker_port = 5560 + cam.id;
+            zmq::socket_t socket(context, zmq::socket_type::req);
+            socket.set(zmq::sockopt::rcvtimeo, RELOAD_RECV_TIMEOUT_MS);
+            socket.set(zmq::sockopt::sndtimeo, RELOAD_SEND_TIMEOUT_MS);
+            socket.set(zmq::sockopt::linger, 0);
+
+            try {
+                socket.connect("tcp://127.0.0.1:" + std::to_string(worker_port));
+                json zmq_req;
+                zmq_req["command"] = "RELOAD_FACE_DB";
+                std::string req_str = zmq_req.dump();
+                socket.send(zmq::message_t(req_str.data(), req_str.size()), zmq::send_flags::none);
+                zmq::message_t reply;
+                if (socket.recv(reply, zmq::recv_flags::none).has_value()) {
+                    ++notified;
+                } else {
+                    ++failed;
+                }
+            } catch (const std::exception& e) {
+                LOG_DEBUG("Face DB reload to camera {}: {}", cam.id, e.what());
+                ++failed;
+            }
+        }
+        if (notified > 0) {
+            LOG_INFO("Face DB reload broadcast: {} workers notified, {} timed out", notified, failed);
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("broadcastFaceDbReload error: {}", e.what());
+    }
+}
+
+// ===========================================================================
 // Helper: Save decoded image to disk
 // Returns web-accessible path on success, empty string on failure
 // ===========================================================================
@@ -326,6 +379,11 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 int new_id = repo.insertPerson(person);
                 if (new_id > 0) {
                     LOG_INFO("Person created successfully: {} (ID: {})", person.name, new_id);
+                    // BUG-AIW-FACEDB-01: tell every active worker to refresh
+                    // its in-process face gallery now that a new person row
+                    // exists — otherwise live recognition won't pick the new
+                    // person up until the worker is restarted.
+                    broadcastFaceDbReload();
 
                     // Return full person object with ID
                     bool has_embedding = (person.embedding_json != "[]" && !person.embedding_json.empty());
@@ -460,6 +518,8 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 p.updated_at = std::time(nullptr);
                 
                 if (repo.updatePerson(p)) {
+                    // Same fan-out as insertPerson: refresh worker gallery.
+                    broadcastFaceDbReload();
                     bool has_embedding = (p.embedding_json != "[]" && !p.embedding_json.empty());
                     json response = {
                         {"person", {
@@ -495,6 +555,11 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
 
                 if (!repo.deletePerson(id))
                     return ApiUtils::createErrorResponse("Delete failed", 500, origin);
+
+                // Workers must drop the deleted person from their in-process
+                // gallery — otherwise the now-deleted face would keep being
+                // recognised live until a worker restart.
+                broadcastFaceDbReload();
 
                 if (p_opt) {
                     deleteImageFromDisk(p_opt.value().face_image_path);

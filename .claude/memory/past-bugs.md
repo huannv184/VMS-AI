@@ -1,5 +1,44 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-08 BUG-AIW-NETBIND-01 — AI worker ZMQ REP socket exposed face-embedding API on every network interface
+
+- **File**: `cpp-backend/src/ai_worker/main.cpp:70` (pre-fix)
+- **Bug**: `socket.bind("tcp://*:" + port)` made the EXTRACT_EMBEDDING ZMQ endpoint reachable on every interface — anyone on the LAN could submit images for face-embedding extraction (computational DoS against the TRT mutex) or pull responses revealing what the model produced for the submitted crop. The legitimate caller (`face_controller::extractEmbeddingFromAI`) already connects to `tcp://127.0.0.1:port`; loopback-only is sufficient.
+- **Status**: CRITICAL — open compute API on the LAN, no auth, no rate limit. Same severity class as the past `MediaMTX tcp_address: :8889` → `127.0.0.1:8889` fix in 2026-05-02 bugfix pass.
+- **Fix**: bind defaults to `127.0.0.1`. `VMS_AI_ZMQ_BIND` env override for explicit multi-host opt-in.
+- **Detection lesson**: every `bind()` to `*` / `0.0.0.0` is a SEC-defaults review item. Grep the codebase for `tcp://\*` and `INADDR_ANY` patterns at every audit pass.
+
+## 2026-05-08 BUG-AIW-INPUT-01 — AI worker EXTRACT_EMBEDDING accepted unbounded image payload
+
+- **File**: `cpp-backend/src/ai_worker/main.cpp:118` (pre-fix)
+- **Bug**: `img_base64 = req_json.value("image", "")` had no size cap. A 100 MB base64 string would happily decode through `base64_decode()` and `cv::imdecode()`, OOMing the worker or stalling the TRT mutex for tens of seconds. `face_controller.cpp:269` already enforced 10 MB but a direct ZMQ client bypassed that.
+- **Status**: HIGH (DoS; reachable post-BUG-AIW-NETBIND-01 fix only from loopback, but on the loopback any process on the box is now a threat surface).
+- **Fix**: `kMaxEmbeddingImageBase64Bytes = 12 MB` (10 MB + base64 inflation headroom). Mirrors the controller cap server-side so the bypass is closed at the trust boundary.
+
+## 2026-05-08 BUG-AIW-FACEDB-01 — Face DB loaded ONCE at boot; live recognition never saw register/update/delete
+
+- **Files**: `cpp-backend/src/ai_worker/main.cpp:209` (loadFaceDatabase), `cpp-backend/src/api/face_controller.cpp` (REST CUD)
+- **Bug**: `loadFaceDatabase()` was called exactly once at AI worker boot. After that, the inference engine's in-memory `face_database_` was frozen for the worker's entire lifetime. When face_controller mutated the DB via REST, the worker never saw the change → newly registered persons never matched in live recognition, deleted persons still matched. Operators could register a face, see it in the UI, and watch live recognition silently ignore it. Same half-dead pipeline shape as BUG-ANPR-PIPELINE (LPR detects, no DB persist) but inverted: DB writes happen but the read-side cache is stale.
+- **Status**: HIGH operational lie — the documented happy-path of "register a face → it appears in live recognition" was a façade until a worker restart.
+- **Fix (worker side)**: new `RELOAD_FACE_DB` ZMQ command — clears the in-memory gallery (`MultiModelInfer::clearDatabase()`) and re-runs `loadFaceDatabase()` under the same TRT mutex used by inference. Atomic-replace from the caller's perspective; takes ~50–200 ms depending on gallery size.
+- **Fix (controller side)**: new `broadcastFaceDbReload()` helper that fans out the command to every active camera's worker port. Best-effort, short timeouts (recv=800ms, send=300ms, no retry). Called after every successful insertPerson / updatePerson / deletePerson. Failures don't fail the REST response (the DB write is the source of truth and the next worker boot will re-sync).
+- **Detection lesson**: when an in-memory cache is populated from a DB and the DB has its own write path, audit "is there a refresh?" alongside "is there a load?". Static-load + DB-write-elsewhere = guaranteed stale read on the worker side.
+
+## 2026-05-08 BUG-AIW-LOOP-01 — Inference loop catch-all retried forever on persistent failure
+
+- **File**: `cpp-backend/src/ai_worker/main.cpp:858` (pre-fix)
+- **Bug**: `catch (const std::exception& e) { LOG; sleep(100ms); }` and continue. If inference threw on every frame (corrupted TRT engine, OOM on input, model file truncated mid-deploy), the worker spammed 10 lines/sec of identical errors indefinitely with no recovery path. Manager could not detect "worker is broken" because the worker stayed alive.
+- **Status**: HIGH — log spam + no auto-recovery on permanent failure mode.
+- **Fix**: consecutive-failure counter; bail after `kMaxConsecutiveFailures = 50`. Counter resets on every successful loop iteration so transient errors don't accumulate. Manager process gets a clean exit and can restart.
+- **Detection lesson**: `catch + sleep + continue` is fine for transient failures, fatal for permanent ones. Any unbounded retry needs a counter; pair `consecutive_failures` with the existing sleep so the same code path handles both.
+
+## 2026-05-08 BUG-AIW-DIAG-01 — VMS_AI_DUMP_FRAMES filled disk indefinitely
+
+- **File**: `cpp-backend/src/ai_worker/main.cpp:505` (pre-fix)
+- **Bug**: When `VMS_AI_DUMP_FRAMES=1`, the worker wrote one diag JPG every 200 frames forever. At 15 fps that's ~6500 files/day per camera. A forgotten env var could fill the disk in days on multi-camera deployments.
+- **Status**: LOW (operational, not security).
+- **Fix**: cap at `kMaxDiagDumps = 50` per process. Logs once when cap is reached so operators know.
+
 ## 2026-05-08 BUG-DETECT-FP-01 — Detection thresholds tuned for "anything moves" → trash cans labelled "person", road texture matched as the operator's face
 
 - **Files**: `cpp-backend/src/ai_worker/main.cpp` (yolo_conf default 0.10, bypass_tracker default true), `cpp-backend/src/ai/inference/include/inference/multi_model_infer.h` (scrfd_conf 0.40, face_match 0.65)

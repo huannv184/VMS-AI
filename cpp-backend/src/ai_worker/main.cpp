@@ -34,6 +34,12 @@ using json = nlohmann::json;
 // Global flag
 volatile std::sig_atomic_t g_running = 1;
 
+// Cap on the base64 image payload accepted by EXTRACT_EMBEDDING. Mirrors the
+// 10MB cap that face_controller.cpp:269 enforces before forwarding; the worker
+// adds 2MB headroom to absorb base64 inflation off raw image bytes (≈4/3) and
+// still reject anything pathological.
+static constexpr size_t kMaxEmbeddingImageBase64Bytes = 12u * 1024u * 1024u;
+
 // Basic Base64 Decoder
 std::string base64_decode(const std::string &in) {
     std::string out;
@@ -56,8 +62,12 @@ std::string base64_decode(const std::string &in) {
     return out;
 }
 
+// Forward decl — defined later; needed by zmq_rep_thread for RELOAD_FACE_DB.
+void loadFaceDatabase(int camera_id, const std::string& db_path, inference::MultiModelInfer* inferer);
+
 // ZMQ Thread Function
-void zmq_rep_thread(int camera_id, inference::MultiModelInfer* inferer, std::mutex* infer_mutex) {
+void zmq_rep_thread(int camera_id, inference::MultiModelInfer* inferer,
+                    std::mutex* infer_mutex, std::string db_path) {
     try {
         zmq::context_t context(1);
         zmq::socket_t socket(context, zmq::socket_type::rep);
@@ -67,7 +77,22 @@ void zmq_rep_thread(int camera_id, inference::MultiModelInfer* inferer, std::mut
         socket.set(zmq::sockopt::linger, linger_ms);
         
         int port = 5560 + camera_id;
-        std::string endpoint = "tcp://*:" + std::to_string(port);
+        // BUG-AIW-NETBIND-01 (audit 2026-05-08): pre-fix bound "tcp://*",
+        // exposing the EXTRACT_EMBEDDING / RELOAD_FACE_DB ZMQ REP socket on
+        // every network interface. Anyone reachable on the LAN could submit
+        // images for face-embedding extraction (computational DoS, plus the
+        // returned embeddings leaked information about whatever the model
+        // produced for that crop), or trigger DB reload churn. Same shape
+        // class as MediaMTX `tcp_address: :8889` → `127.0.0.1:8889` fix
+        // 2026-05-02. The legitimate caller (face_controller) connects to
+        // `tcp://127.0.0.1:port`; loopback-only is sufficient and removes
+        // the entire LAN-exposed surface. Override via VMS_AI_ZMQ_BIND if
+        // a multi-host deployment ever becomes a real requirement.
+        std::string bind_host = "127.0.0.1";
+        if (const char* e = std::getenv("VMS_AI_ZMQ_BIND"); e && *e) {
+            bind_host = e;
+        }
+        std::string endpoint = "tcp://" + bind_host + ":" + std::to_string(port);
         
         // RETRY LOGIC: Try to bind with exponential backoff
         const int max_retries = 5;
@@ -116,19 +141,34 @@ void zmq_rep_thread(int camera_id, inference::MultiModelInfer* inferer, std::mut
                 
                 if (command == "EXTRACT_EMBEDDING") {
                     std::string img_base64 = req_json.value("image", "");
-                    if (!img_base64.empty()) {
+                    if (img_base64.empty()) {
+                        reply_str = "{\"status\": \"error\", \"message\": \"Empty image data\"}";
+                    } else if (img_base64.size() > kMaxEmbeddingImageBase64Bytes) {
+                        // BUG-AIW-INPUT-01 (audit 2026-05-08): pre-fix the worker
+                        // had no upper bound on the ZMQ image payload. A 100 MB
+                        // base64 string would happily decode to ~75 MB and run
+                        // through cv::imdecode — single bad caller could OOM
+                        // the worker or stall the TensorRT mutex for tens of
+                        // seconds. The legitimate caller (face_controller) caps
+                        // at 10 MB on its own; we mirror that limit here so a
+                        // direct ZMQ client can't bypass it.
+                        reply_str = "{\"status\": \"error\", \"message\": \"image payload exceeds 12MB cap\"}";
+                        std::cerr << "[AI-Worker-" << camera_id
+                                  << "] EXTRACT_EMBEDDING rejected: payload "
+                                  << img_base64.size() << " bytes" << std::endl;
+                    } else {
                         std::string decoded = base64_decode(img_base64);
                         std::vector<uchar> data(decoded.begin(), decoded.end());
                         cv::Mat img = cv::imdecode(data, cv::IMREAD_COLOR);
-                        
+
                         if (!img.empty()) {
                             // THREAD SAFETY FIX: Lock mutex before using TensorRT
                             std::lock_guard<std::mutex> lock(*infer_mutex);
-                            std::cerr << "[AI-Worker-" << camera_id << "] EXTRACT_EMBEDDING: img " 
+                            std::cerr << "[AI-Worker-" << camera_id << "] EXTRACT_EMBEDDING: img "
                                       << img.cols << "x" << img.rows << std::endl;
-                            
+
                             auto emb = inferer->embedImage(img);
-                            
+
                             json j_resp;
                             if (emb.empty()) {
                                 j_resp["status"] = "error";
@@ -137,15 +177,31 @@ void zmq_rep_thread(int camera_id, inference::MultiModelInfer* inferer, std::mut
                             } else {
                                 j_resp["status"] = "success";
                                 j_resp["embedding"] = emb;
-                                std::cerr << "[AI-Worker-" << camera_id << "] Embedding extracted (dim=" 
+                                std::cerr << "[AI-Worker-" << camera_id << "] Embedding extracted (dim="
                                           << emb.size() << ")" << std::endl;
                             }
                             reply_str = j_resp.dump();
                         } else {
                             reply_str = "{\"status\": \"error\", \"message\": \"Failed to decode image\"}";
                         }
+                    }
+                } else if (command == "RELOAD_FACE_DB") {
+                    // BUG-AIW-FACEDB-01 (audit 2026-05-08): face_database_ in
+                    // the inference engine is populated only by loadFaceDatabase
+                    // at boot. After boot, when face_controller inserts/updates/
+                    // deletes a person via REST, the live inference path never
+                    // re-reads the DB → newly registered faces never get
+                    // matched, deleted faces still match. Half-dead pipeline,
+                    // same shape as the BUG-ANPR-PIPELINE family. Now the
+                    // controller fans out RELOAD_FACE_DB after every CUD op,
+                    // workers reload + replace their in-memory gallery atomically.
+                    std::lock_guard<std::mutex> lock(*infer_mutex);
+                    if (inferer) {
+                        inferer->clearDatabase();
+                        loadFaceDatabase(camera_id, db_path, inferer);
+                        reply_str = "{\"status\": \"success\", \"message\": \"face DB reloaded\"}";
                     } else {
-                        reply_str = "{\"status\": \"error\", \"message\": \"Empty image data\"}";
+                        reply_str = "{\"status\": \"error\", \"message\": \"inferer not available\"}";
                     }
                 } else {
                     reply_str = "{\"status\": \"error\", \"message\": \"Unknown command\"}";
@@ -443,7 +499,7 @@ int main(int argc, char** argv) {
     
     // Start ZMQ Thread — BUG-003 FIX: join() instead of detach()
     // Detaching caused dangling reference to `inferer` after main() returns
-    std::thread zmq_thread(zmq_rep_thread, camera_id, inferer.get(), &infer_mutex);
+    std::thread zmq_thread(zmq_rep_thread, camera_id, inferer.get(), &infer_mutex, db_path);
     
     std::cerr << "[AI-Worker-" << camera_id << "] Ready processing loop." << std::endl;
     
@@ -454,7 +510,16 @@ int main(int argc, char** argv) {
     uint64_t last_frame_id = 0;
     uint64_t timestamp = 0;
     uint64_t frames_processed = 0;
-    
+    // BUG-AIW-LOOP-01 (audit 2026-05-08): pre-fix the catch-all in the loop
+    // logged at WARN and slept 100ms forever, even if inference threw on
+    // every single frame (e.g. corrupted TRT engine, OOM on input). Combined
+    // with stderr piped to the manager process, that produced 10 lines/sec
+    // of noise indefinitely with no recovery path. Add a consecutive-failure
+    // counter; bail after kMaxConsecutiveFailures so the manager can restart
+    // the worker rather than tail-spin forever.
+    int consecutive_failures = 0;
+    constexpr int kMaxConsecutiveFailures = 50;
+
     auto loop_start = std::chrono::steady_clock::now();
     
     // Face tracker: smoothing + ID persistence across frames
@@ -502,7 +567,16 @@ int main(int argc, char** argv) {
                         const char* e = std::getenv("VMS_AI_DUMP_FRAMES");
                         return e && *e && std::atoi(e) != 0;
                     }();
-                    if (dump_frames && (frames_processed % 200 == 0)) {
+                    // BUG-AIW-DIAG-01 (audit 2026-05-08): pre-fix dumped a JPG
+                    // every 200 frames forever when the env was set. At 15 fps
+                    // that's one file every ~13 seconds → ~6500 files/day per
+                    // camera. With multi-camera deployments and someone
+                    // forgetting the env var was on, the diag dir filled the
+                    // disk in days. Cap total dumps per process.
+                    static thread_local int diag_dumps_done = 0;
+                    constexpr int kMaxDiagDumps = 50;
+                    if (dump_frames && diag_dumps_done < kMaxDiagDumps
+                        && (frames_processed % 200 == 0)) {
                         cv::Scalar mean = cv::mean(frame);
                         std::cerr << "[AI-Worker-" << camera_id << "] frame mean BGR=("
                                   << mean[0] << "," << mean[1] << "," << mean[2]
@@ -511,6 +585,12 @@ int main(int argc, char** argv) {
                         std::string fname = "diag_cam" + std::to_string(camera_id)
                                           + "_frame" + std::to_string(frames_processed) + ".jpg";
                         cv::imwrite(fname, frame);
+                        ++diag_dumps_done;
+                        if (diag_dumps_done == kMaxDiagDumps) {
+                            std::cerr << "[AI-Worker-" << camera_id
+                                      << "] diag dump cap reached (" << kMaxDiagDumps
+                                      << " files); set VMS_AI_DUMP_FRAMES=0 + restart to clear" << std::endl;
+                        }
                     }
                 }
 
@@ -857,10 +937,26 @@ int main(int argc, char** argv) {
             
         } catch (const std::exception& e) {
             std::cerr << "[AI-Worker-" << camera_id << "] Loop Exception: " << e.what() << std::endl;
+            ++consecutive_failures;
+            if (consecutive_failures >= kMaxConsecutiveFailures) {
+                std::cerr << "[AI-Worker-" << camera_id
+                          << "] FATAL: " << consecutive_failures
+                          << " consecutive inference exceptions — exiting so the manager can restart us"
+                          << std::endl;
+                g_running = 0;
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
         }
+        // Reset on any successful loop iteration. Placed at the END of the
+        // try-block path so we only credit "real" frames — frames where shm
+        // had no data fall through the else-branch above without resetting,
+        // which is fine: the failure counter only matters when we actually
+        // tried to do work and it threw.
+        consecutive_failures = 0;
     }
-    
+
     // BUG-003 FIX: Join ZMQ thread before inferer is destroyed
     g_running = 0; // Ensure ZMQ thread exits its loop
     if (zmq_thread.joinable()) {
