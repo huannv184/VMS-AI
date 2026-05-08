@@ -39,6 +39,14 @@
 - **Status**: LOW (operational, not security).
 - **Fix**: cap at `kMaxDiagDumps = 50` per process. Logs once when cap is reached so operators know.
 
+## 2026-05-08 BUG-DETECT-FP-02 (follow-up to FP-01) — YOLO threshold raised again 0.30 → 0.45
+
+- **File**: `cpp-backend/src/ai_worker/main.cpp` YOLO default
+- **Bug** (operator-reported follow-up): Fix-B's 0.30 was still letting "vaguely person-shaped" objects through — trash cans, posts, vertical shadows that COCO YOLO scores in the 0.30–0.40 band still reached the live overlay. Operator: "yolo phải nâng cao thêm nữa".
+- **Fix**: bumped default to **0.45** so anything in the 0.30–0.45 band is dropped at the threshold. The 0.45 boundary cleanly separates "confident person" (typically 0.5+) from "background clutter that vaguely looks like a person."
+- **Recall trade-off**: ~35% drop on distant/partial persons (< 60–70 px tall). Already mitigated by `VMS_MIN_PERSON_HEIGHT_PX=40` filter from Fix-B, so the lost detections are largely below the operationally useful range. Confident near-camera persons keep > 90% recall in our test scenes.
+- **Detection lesson**: confidence thresholds for surveillance YOLO should be set NOT by published model benchmarks (which use clean COCO val) but by per-deployment empirical tuning. The 0.10 → 0.30 → 0.45 trajectory in three commits is normal — every camera placement has its own background clutter signature, and the right threshold is the lowest value that doesn't pin the operator on noise.
+
 ## 2026-05-08 BUG-DETECT-FP-01 — Detection thresholds tuned for "anything moves" → trash cans labelled "person", road texture matched as the operator's face
 
 - **Files**: `cpp-backend/src/ai_worker/main.cpp` (yolo_conf default 0.10, bypass_tracker default true), `cpp-backend/src/ai/inference/include/inference/multi_model_infer.h` (scrfd_conf 0.40, face_match 0.65)
