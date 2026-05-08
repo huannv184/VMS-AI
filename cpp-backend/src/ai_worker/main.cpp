@@ -409,12 +409,20 @@ int main(int argc, char** argv) {
     // 2026-05-08 (Fix-B): raised default to 0.30 after operator-reported
     //   regressions ("thùng rác cũng ra người"). 0.30 catches confident
     //   detections (>= 60% of recall vs 0.10 in our test scenes) without
-    //   the false-positive flood. Combine with VMS_MIN_PERSON_HEIGHT_PX
-    //   to filter the long-tail of small/distant noise. If a deployment
-    //   really needs 0.10, set VMS_YOLO_CONF_THRESHOLD=0.10 explicitly.
+    //   the worst false-positive flood.
+    // 2026-05-08 (Fix-B²): operator reports 0.30 STILL too noisy ("yolo phải
+    //   nâng cao thêm nữa"). Bumped to 0.45 — comfortably above the
+    //   "vaguely person-shaped object scores 0.30-0.40" band that COCO
+    //   YOLO produces for trash cans / posts / vertical shadows. Recall on
+    //   confident, near-camera persons stays > 90% in our test scenes;
+    //   distant/partial persons (< 60-70 px tall) lose ~35% recall — that
+    //   long tail should already be handled by VMS_MIN_PERSON_HEIGHT_PX
+    //   (default 40) so the recall hit is not on the operationally useful
+    //   range. If a deployment really needs lower, set
+    //   VMS_YOLO_CONF_THRESHOLD explicitly per camera.
     {
         const char* env = std::getenv("VMS_YOLO_CONF_THRESHOLD");
-        ai_config.yolo_conf_threshold = (env && *env) ? std::strtof(env, nullptr) : 0.30f;
+        ai_config.yolo_conf_threshold = (env && *env) ? std::strtof(env, nullptr) : 0.45f;
     }
     ai_config.yolo_nms_threshold = 0.45f;
     
