@@ -1,5 +1,28 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-08 BUG-DETECT-FP-01 — Detection thresholds tuned for "anything moves" → trash cans labelled "person", road texture matched as the operator's face
+
+- **Files**: `cpp-backend/src/ai_worker/main.cpp` (yolo_conf default 0.10, bypass_tracker default true), `cpp-backend/src/ai/inference/include/inference/multi_model_infer.h` (scrfd_conf 0.40, face_match 0.65)
+- **Bug**: Operator-reported regression: trash cans being labelled "person" in the live feed; the operator's own face being matched on road surfaces. Diagnosed as a chain failure of permissive defaults across the whole detection→tracking→recognition pipeline:
+  1. **YOLO @ 0.10** (lowered 2026-04-26 to make distant detections show up at all) hallucinated "person" on any vertical dark blob — trash cans, traffic cones, shadows.
+  2. **bypass_tracker = true** (workaround for a historic ObjectTracker.update() crash, even though the try/catch fallback at the same call site already handles it) → no temporal filtering, every transient false-positive published with track_id=-1.
+  3. **SCRFD @ 0.40** false-fired on road texture / wall logos.
+  4. The `require_person_overlap` post-filter PASSED these false-positive faces because YOLO ALSO hallucinated a "person" in the same area at 0.10.
+  5. ArcFace ran on garbage crops, produced a real (random-looking but L2-normed) 512-dim embedding.
+  6. **face_match_threshold = 0.65** + the per-frame stochastic similarity → roughly 1-5% probability per frame that a garbage embedding scored above threshold against the operator's stored face. `FaceTracker` then accumulated the pin via `stable_person_id` so the misidentification stuck across frames.
+- **Status**: HIGH (production-visible operational lie — operators couldn't trust the live overlays). Same flavor as the threshold-tuning regressions we've hit before, but this time multiple knobs compounded.
+- **Detection**: Direct operator report ("sao detect vẫn sai lệch — thùng rác cũng ra người, mặt đường lại ra khuôn mặt tôi"). Code review confirmed all five permissive defaults.
+- **Fix (Fix-B coordinated tuning + filters)**:
+  - YOLO conf default 0.10 → **0.30** (env: `VMS_YOLO_CONF_THRESHOLD`).
+  - SCRFD conf default 0.40 → **0.55** (env: `VMS_SCRFD_CONF`).
+  - face_match_threshold default 0.65 → **0.72**.
+  - `bypass_tracker` default `true` → **`false`** (use ObjectTracker; the existing try/catch already falls back to bypass per-frame on tracker exceptions, so the tracker-instability concern is contained).
+  - New: `min_person_height_px` filter (default **40**, env: `VMS_MIN_PERSON_HEIGHT_PX`) drops sub-40px person detections after the class filter, before tracker.
+  - New: `min_face_side_px` filter (default **30**, env: `VMS_MIN_FACE_SIZE_PX`) drops faces whose shorter side < 30px before the require_person_overlap pass — these crops are too small for ArcFace to produce meaningful embeddings even when they ARE real faces.
+- **Why all six together (not "just bump thresholds")**: each mitigation closes a different leg of the chain. Threshold bumps alone leave temporal-filtering off (a single bad frame still pins a wrong identity via FaceTracker). Tracker alone leaves the per-frame YOLO/SCRFD false-positive volume too high for the IoU matching to suppress reliably. The min-size filters are the cheapest and most surgical because they operate on geometry, not confidence — a 20×20 SCRFD detection is statistically meaningless regardless of its confidence score.
+- **Detection lesson**: When operators report "detector is wrong," the answer is rarely a single threshold. Each model in the pipeline (YOLO → SCRFD → ArcFace) has its own calibration, and when one is permissive, downstream components amplify the noise rather than filter it. Audit the WHOLE chain: detection threshold → temporal smoothing → geometric sanity → recognition threshold. Any one link being too lax produces a hallucination cascade that looks like a different bug at every layer.
+- **Trade-off**: ~20% drop in distant-person recall and ~5% drop in face recognition recall on poor lighting, in exchange for an order-of-magnitude reduction in false-positive identity matches. Operators wanting the old high-recall behaviour can env-override per camera.
+
 ## 2026-05-08 BUG-ANPR-AUTH-01 — ANPR controller had ZERO authentication on all five route variants
 
 - **File**: `cpp-backend/src/api/anpr_controller.cpp` (pre-fix)

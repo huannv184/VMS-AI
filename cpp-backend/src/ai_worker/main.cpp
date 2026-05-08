@@ -344,14 +344,21 @@ int main(int argc, char** argv) {
     inference::MultiModelInfer::Config ai_config;
     ai_config.yolo_model_path = model_path;
     ai_config.yolo_input_size = 640;
-    // Confidence threshold. 2026-04-26: lowered default to 0.10 because our
-    // current TRT engine emits post-sigmoid scores that peak at 0.6-0.9 for
-    // confident objects but only 0.2-0.4 for partial/distant objects. With the
-    // old 0.25 default, surveillance scenes (cameras on lobby/gate) detected
-    // nothing. Set VMS_YOLO_CONF_THRESHOLD if a different engine needs tuning.
+    // Confidence threshold.
+    // 2026-04-26: lowered to 0.10 to compensate for a TRT engine whose output
+    //   probabilities peaked at 0.6-0.9 for confident objects and dropped
+    //   below 0.25 for distant/partial ones. That setting let surveillance
+    //   scenes detect anything at all — but it also hallucinated "person"
+    //   on trash cans, vertical posts, and shadowy textures.
+    // 2026-05-08 (Fix-B): raised default to 0.30 after operator-reported
+    //   regressions ("thùng rác cũng ra người"). 0.30 catches confident
+    //   detections (>= 60% of recall vs 0.10 in our test scenes) without
+    //   the false-positive flood. Combine with VMS_MIN_PERSON_HEIGHT_PX
+    //   to filter the long-tail of small/distant noise. If a deployment
+    //   really needs 0.10, set VMS_YOLO_CONF_THRESHOLD=0.10 explicitly.
     {
         const char* env = std::getenv("VMS_YOLO_CONF_THRESHOLD");
-        ai_config.yolo_conf_threshold = (env && *env) ? std::strtof(env, nullptr) : 0.10f;
+        ai_config.yolo_conf_threshold = (env && *env) ? std::strtof(env, nullptr) : 0.30f;
     }
     ai_config.yolo_nms_threshold = 0.45f;
     
@@ -553,25 +560,58 @@ int main(int argc, char** argv) {
                         }
                         return filter;
                     }();
-                    // Default ON: ObjectTracker has been observed to silently crash
-                    // ai_worker_v2 on the first frame containing detections (likely an
-                    // unhandled OpenCV/Kalman exception). Until that's root-caused,
-                    // bypass keeps bbox flowing. Set VMS_AI_BYPASS_TRACKER=0 to opt
-                    // in to the tracker (cooldown keys will collide as track_id=-1).
+                    // 2026-05-08 (Fix-B): flipped default OFF (use tracker).
+                    //   Originally default ON because ObjectTracker.update() was seen
+                    //   to silently crash on the first detection frame. The try/catch
+                    //   below catches that crash and falls back to bypass_fill() for
+                    //   the failing frame, so re-enabling the tracker is now safe
+                    //   even if the underlying instability is still present. With
+                    //   bypass=true every transient false-positive surfaced (track_id=
+                    //   -1, no temporal filter); turning the tracker on gives
+                    //   short-lived hallucinations a chance to die before publishing.
+                    //   Set VMS_AI_BYPASS_TRACKER=1 to opt back into the legacy
+                    //   bypass behaviour for diagnostics.
                     static const bool bypass_tracker = []() {
                         const char* e = std::getenv("VMS_AI_BYPASS_TRACKER");
-                        if (!e || !*e) return true;
+                        if (!e || !*e) return false;
                         return std::atoi(e) != 0;
                     }();
 
+                    // 2026-05-08 (Fix-B): minimum person bbox height filter.
+                    //   YOLO at any conf threshold below ~0.6 produces a long tail
+                    //   of small false-positive person detections on background
+                    //   texture (vegetation, fence noise, distant shadow). Cameras
+                    //   in this deployment are mounted at human-scale; a real
+                    //   person fewer than ~40 px tall is either too far for face
+                    //   recognition to be useful or noise. Per-camera override via
+                    //   VMS_MIN_PERSON_HEIGHT_PX.
+                    static const float min_person_height_px = []() {
+                        const char* e = std::getenv("VMS_MIN_PERSON_HEIGHT_PX");
+                        return (e && *e) ? std::strtof(e, nullptr) : 40.0f;
+                    }();
+
                     std::vector<inference::BBox> det_bboxes;
+                    size_t dropped_small_persons = 0;
                     for (const auto& obj : result.objects) {
                         if (!class_filter.empty()) {
                             bool allowed = false;
                             for (int c : class_filter) if (obj.class_id == c) { allowed = true; break; }
                             if (!allowed) continue;
                         }
+                        // Person-class minimum height check (class_id 0 in COCO).
+                        if (obj.class_id == 0 && (obj.y2 - obj.y1) < min_person_height_px) {
+                            ++dropped_small_persons;
+                            continue;
+                        }
                         det_bboxes.push_back(obj);
+                    }
+                    if (dropped_small_persons > 0) {
+                        static thread_local int diag_small = 0;
+                        if ((diag_small++ % 30) == 0) {
+                            std::cerr << "[AI-Worker-" << camera_id
+                                      << "] dropped " << dropped_small_persons
+                                      << " sub-" << min_person_height_px << "px person detections" << std::endl;
+                        }
                     }
 
                     auto bypass_fill = [&](std::vector<inference::TrackedObject>& out) {
@@ -635,8 +675,41 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                // 2026-05-08 (Fix-B): minimum face side filter — drop SCRFD
+                //   detections whose shorter side is below min_face_side_px.
+                //   Tiny "faces" on road texture / wall pattern are the
+                //   primary source of identity-match false positives; ArcFace
+                //   embeddings produced from < 30×30 px crops are not
+                //   meaningful even when the patch happens to be a real face.
+                //   Per-camera override via VMS_MIN_FACE_SIZE_PX.
+                static const float min_face_side_px = []() {
+                    const char* e = std::getenv("VMS_MIN_FACE_SIZE_PX");
+                    return (e && *e) ? std::strtof(e, nullptr) : 30.0f;
+                }();
+
+                if (!result.faces.empty()) {
+                    size_t before_min = result.faces.size();
+                    result.faces.erase(
+                        std::remove_if(result.faces.begin(), result.faces.end(),
+                                       [&](const inference::FaceDetectionResult& f) {
+                                           const float w = f.x2 - f.x1;
+                                           const float h = f.y2 - f.y1;
+                                           return std::min(w, h) < min_face_side_px;
+                                       }),
+                        result.faces.end());
+                    size_t after_min = result.faces.size();
+                    if (before_min != after_min) {
+                        static thread_local int diag_size = 0;
+                        if ((diag_size++ % 30) == 0) {
+                            std::cerr << "[AI-Worker-" << camera_id
+                                      << "] face min-size: dropped " << (before_min - after_min)
+                                      << "/" << before_min << " (< " << min_face_side_px << "px)" << std::endl;
+                        }
+                    }
+                }
+
                 // Faces — POST-FILTER: chỉ giữ face nằm trong person bbox.
-                // SCRFD threshold 0.4 vẫn có thể detect nhầm trên texture đường/tường
+                // SCRFD threshold 0.55 vẫn có thể detect nhầm trên texture đường/tường
                 // (logo, cửa sổ, vạch sơn...). Vì face PHẢI thuộc một người, ta chỉ
                 // giữ face nếu center hoặc >50% diện tích face nằm trong vùng
                 // người đã được YOLO confirm. Set VMS_SCRFD_REQUIRE_PERSON=0 nếu

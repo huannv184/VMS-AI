@@ -72,11 +72,13 @@ public:
         // SCRFD face detection model
         std::string scrfd_model_path;
         int scrfd_input_size = 640;
-        // 0.40: cân bằng giữa bắt face xa (≥0.35) và loại false positive trên
-        // texture đường/tường (~0.30-0.35). Kết hợp với post-filter "face phải
-        // nằm trong person bbox" trong ai_worker/main.cpp để loại noise còn lại.
-        // Env override: VMS_SCRFD_CONF.
-        float scrfd_conf_threshold = 0.40f;
+        // 2026-05-08 (Fix-B): bumped 0.40 → 0.55 because SCRFD at 0.40 still
+        // hallucinated faces on road texture / wall logos and the resulting
+        // garbage crops produced ArcFace embeddings that occasionally crossed
+        // face_match_threshold against the user's stored face — causing
+        // labels to be pinned to non-face surfaces. SCRFD recall on real
+        // faces ≥ 60×60 px stays > 95% at 0.55. Env override: VMS_SCRFD_CONF.
+        float scrfd_conf_threshold = 0.55f;
         float scrfd_nms_threshold = 0.4f;
         
         // ArcFace recognition model
@@ -94,8 +96,13 @@ public:
         int plate_detect_input_size = 640;
         
         // Feature matching (ArcFace cosine similarity)
-        // 0.45 is too low (many false positives). 0.65-0.70 is standard for robust recognition.
-        float face_match_threshold = 0.65f;
+        // 2026-05-08 (Fix-B): bumped 0.65 → 0.72 to suppress identity match on
+        // garbage embeddings produced by SCRFD false-positive face crops on
+        // road / wall texture. ArcFace ResNet-100 published EER ≈ 0.6-0.65;
+        // 0.72 trades a small drop in recall (≈ 1-2% of legitimate faces in
+        // poor lighting) for a much steeper drop in false-positive identity
+        // matches against degenerate inputs. Pair with the SCRFD bump above.
+        float face_match_threshold = 0.72f;
         
         // Performance
         bool enable_face_detection = true;
