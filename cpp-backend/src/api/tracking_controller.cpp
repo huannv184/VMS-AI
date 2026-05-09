@@ -14,6 +14,12 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
+// PENDING-AUDIT-2026-05-09: 4 empty-capture handlers (active tracks, stats, config, reset).
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (tracking active by camera)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (tracking stats)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (tracking config GET/PUT)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (tracking reset POST)
 void TrackingController::registerRoutes(vms::server::VmsApp& app) {
     // GET active tracks
     CROW_ROUTE(app, "/api/tracking/cameras/<int>")

@@ -11,8 +11,13 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
+// PENDING-AUDIT-2026-05-09: 2 empty-capture handlers (analytics export CSV, heatmap by camera).
+// CSV export especially sensitive — leaks aggregated event PII without auth.
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (analytics export CSV)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (heatmap by camera)
 void ReportingController::registerRoutes(vms::server::VmsApp& app) {
-    
+
     // GET /api/analytics/export
     CROW_ROUTE(app, "/api/analytics/export")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)

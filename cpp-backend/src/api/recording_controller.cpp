@@ -28,6 +28,16 @@ static bool isValidRecordingId(const std::string& id) {
 namespace vms {
 namespace api {
 
+// PENDING-AUDIT-2026-05-09: 5 empty-capture handlers not yet RBAC-audited
+// (GET /api/recordings, GET /api/recordings/<id>/video, GET/DELETE /api/recordings/<id>,
+// GET /api/recordings/segments, GET /api/recordings/segments/<int>/video).
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// Remove markers as each route gains [&app] + requirePermission(RECORDING_READ/DELETE).
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (recordings list)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (recording video by id)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (recording GET/DELETE by id)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (segments list)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (segment video by id)
 void RecordingController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/recordings - List all recordings (events with video files)
     CROW_ROUTE(app, "/api/recordings")

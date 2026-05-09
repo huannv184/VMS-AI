@@ -35,6 +35,11 @@ std::optional<int> parsePresetIdentifier(const json& body) {
 
 } // namespace
 
+// PENDING-AUDIT-2026-05-09: 2 empty-capture handlers (presets list, capabilities GET).
+// C4 fix (2026-04-18) covered mutating PTZ ops but missed these read-side GETs.
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (ptz presets list)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (ptz capabilities)
 void PTZController::registerRoutes(vms::server::VmsApp& app) {
 
     // POST /api/ptz/<cam_id>/move — Continuous move

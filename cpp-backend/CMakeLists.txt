@@ -139,6 +139,34 @@ add_subdirectory(src/ai_worker)
 # Reuse shared AI inference implementation in backend runtime.
 target_link_libraries(vms_backend PRIVATE inference)
 
+# ─── Controller RBAC lint (configure-time guard) ──────────────────────────
+# Forward-leverage check that catches the `[]`-capture / `auth.validate`
+# anti-patterns BEFORE they ship. Ran at every cmake configure (and as a
+# PRE_BUILD step below for incremental builds). Fails the build if any
+# *_controller.cpp has more empty-capture handlers than LINT-ALLOW-NO-AUTH
+# markers, OR if any `auth.validate(req)` call survives. See
+# cmake/lint_controllers.cmake for the full anti-pattern doc.
+execute_process(
+    COMMAND ${CMAKE_COMMAND}
+        -DCONTROLLERS_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src/api
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/lint_controllers.cmake
+    RESULT_VARIABLE _lint_result
+)
+if(NOT _lint_result EQUAL 0)
+    message(FATAL_ERROR "Controller lint failed at configure time. See messages above.")
+endif()
+
+# Re-run on every build so a developer who edits a controller without
+# reconfiguring still gets caught.
+add_custom_target(lint_controllers ALL
+    COMMAND ${CMAKE_COMMAND}
+        -DCONTROLLERS_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src/api
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/lint_controllers.cmake
+    COMMENT "Linting api/*_controller.cpp for [] capture / auth.validate antipattern"
+    VERBATIM
+)
+add_dependencies(vms_backend lint_controllers)
+
 # ─── Runtime DLL deployment (Windows) ─────────────────────────────────────
 # Without this, a fresh build of vms_backend.exe inside Release/ exits
 # immediately with STATUS_DLL_NOT_FOUND (0xC0000135) because vcpkg DLLs

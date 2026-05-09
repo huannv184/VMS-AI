@@ -11,6 +11,12 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
+// PENDING-AUDIT-2026-05-09: 3 empty-capture handlers (discover POST, status GET, results GET).
+// Discovery POST can scan internal LAN without auth (port-scan amplification).
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (discover POST)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (discover status by id)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (discover results by id)
 void CameraDiscoveryController::registerRoutes(vms::server::VmsApp& app) {
 
     // ═══════════════════════════════════════════════════════════════

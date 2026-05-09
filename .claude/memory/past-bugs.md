@@ -1,5 +1,26 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-09 BUG-LINT-CONTROLLERS-PENDING — 34 unauth controller routes documented + lint guard installed against future regressions
+
+- **Files**: `cpp-backend/cmake/lint_controllers.cmake` (new), `cpp-backend/CMakeLists.txt` (wired), 12 `*_controller.cpp` files (markers added).
+- **Bug**: After 4 SEC-shape audits this week (BUG-ANPR-AUTH-01, BUG-SNAP-AUTH-01, BUG-HLS-AUTH-01, BUG-EX-RBAC-01) all finding the same `[]`-capture-no-requirePermission anti-pattern, a survey grep across `src/api/*_controller.cpp` found **34 more unauth empty-capture handlers** scattered across 10 controllers — including `event_controller` (7 routes inc. fire-test POST that could trigger fake alarms), `traffic_controller` POST counts (data-poison vector), `camera_discovery_controller` discover POST (LAN port-scan amplification), `reporting_controller` analytics CSV export (event PII aggregate). Plus 5 LEGITIMATELY-unauth captures (login/logout/2FA-verify/change-password-on-login + system streaming-config probe) that should be explicitly allowlisted.
+- **Status**: HIGH (catalogue-of-survivors); each individual route warrants its own audit pass.
+- **Fix**: Two-part:
+  1. **Lint guard at build time**: new `cmake/lint_controllers.cmake` script counts `\(\[\]\(` empty-capture lambdas and `LINT-ALLOW-NO-AUTH` markers per file; FATAL_ERRORs if captures > markers, OR if any `auth.validate(req)` survives outside comments. Wired into the main CMakeLists at both configure-time (`execute_process`) and as `add_custom_target(lint_controllers ALL)` that `vms_backend` depends on. New empty-capture without a marker fails the build.
+  2. **Survivor inventory**: each existing capture annotated with `// LINT-ALLOW-NO-AUTH: <reason>` — `auth-flow` for login/2fa/etc., `explicit-public` for the streaming-config probe, `PENDING-AUDIT-2026-05-09 (route)` for the 34 unaudited holes. Each PENDING marker MUST be removed when the corresponding route gains `[&app]` + `requirePermission`.
+- **Why allowlist instead of fix-all**: 34 captures × 10 controllers ≈ a multi-session audit pass. Each route needs Permission-tier decision + audit-log decision + sometimes header signature change + sometimes frontend update (current frontend may consume some unauth paths). The right move was to stop the bleeding (lint blocks new violations forever), document the survivors with date-stamped markers, then audit each controller in its own future session. Same compromise philosophy as BUG-REID-DEAD-PIPELINE (producer_wired flag instead of immediate wiring) and BUG-ANPR-PIPELINE (documented half-dead).
+- **Verification of the lint**: standalone run silent OK; injected violation (sed-swapped one `([&app](` to `([](` in snapshot_controller) → lint immediately FATAL_ERRORed with file:count + fix template; restored, lint clean again.
+- **Detection lesson**: when a SEC pattern recurs 4 times in a week, the meta-fix (lint/CI) has higher leverage than another individual audit. The cost of writing the lint (~50 LoC CMake) << the cost of the next session finding controller #5 with the same bug. Apply this rule whenever you see "this is the Nth time we've found pattern X".
+- **PENDING audit backlog** (priority by suspected blast radius): event_controller×7 → traffic×3 → camera_discovery×3 → reporting×2 → recording×5 → event_engine×4 → camera GET frame×1 → roi×3 / tracking×4 / ptz×2 (read-side leaks).
+
+## 2026-05-09 BUG-AIWORKER-DEAD — `cpp-backend/src/ai/AIWorker.cpp` (766 LoC) was dead-code-on-disk
+
+- **Files**: `cpp-backend/src/ai/AIWorker.cpp` + `AIWorker.h` (deleted)
+- **Bug**: Same shape as PPEDetector + FaceInfer (deleted 2026-05-08): 766 LoC of an early in-process AI worker prototype, zero callers in production, not in any CMakeLists.txt, only self-referenced by its own .cpp/.h. Superseded by the subprocess model (`ai_worker/main.cpp` → `ai_worker_v2.exe`) but never cleaned up.
+- **Status**: LOW (dead code only, no operational impact).
+- **Fix**: deleted both files.
+- **Detection lesson**: when a feature gets re-architected (in-process → subprocess in this case), schedule the original implementation's deletion in the same PR as the architecture change. Carrying the old code as "reference" is technical debt that compounds — every future audit pass has to verify it's still dead.
+
 ## 2026-05-09 BUG-FE-ANPR-DEL-FAKE + BUG-FE-REID-LIE + BUG-FE-REID-DEFAULT — Frontend ignored backend signals from today's RBAC/Fix-B work
 
 - **Files**: `vms-frontend/src/views/AnalyticsView.jsx:290`, `vms-frontend/src/views/ReIDView.jsx`

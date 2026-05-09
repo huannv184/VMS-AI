@@ -419,6 +419,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
         return ApiUtils::createResponse(scanner.getCachedDevicesJson(), 200, origin);
     });
 
+    // LINT-ALLOW-NO-AUTH: explicit-public — frontend probes this BEFORE login to learn the WS port.
     // GET /api/system/streaming-config
     // PUBLIC endpoint — không yêu cầu auth. Frontend gọi trước khi login
     // để lấy WS port thực tế (có thể khác config nếu port bị occupied).

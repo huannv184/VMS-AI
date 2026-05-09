@@ -36,6 +36,12 @@ static json summaryToJson(const TrafficSummary& s) {
     };
 }
 
+// PENDING-AUDIT-2026-05-09: 3 empty-capture handlers (counts GET, counts POST, summary GET).
+// POST /api/traffic/counts can poison the traffic counter table without auth.
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (traffic counts GET)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (traffic counts POST)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (traffic summary GET)
 void TrafficController::registerRoutes(vms::server::VmsApp& app) {
 
     // ----------------------------------------------------------------

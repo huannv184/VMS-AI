@@ -161,9 +161,15 @@ std::optional<std::string> validateCameraPayload(vms::Camera& camera, const json
 
 }
 
+// PENDING-AUDIT-2026-05-09: this controller has 1 empty-capture handler
+// not yet RBAC-audited (GET /api/cameras/<int>/frame ~L475). Tracked in
+// .claude/memory/past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// Remove this LINT-ALLOW-NO-AUTH marker when that route gains [&app] +
+// requirePermission(CAMERA_READ).
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (cameras/<int>/frame)
 void CameraController::registerRoutes(vms::server::VmsApp& app) {
     LOG_INFO("Registering camera routes via controller...");
-    
+
     // /api/cameras (GET, POST)
     CROW_ROUTE(app, "/api/cameras")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Post, crow::HTTPMethod::Options)

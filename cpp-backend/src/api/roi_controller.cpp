@@ -14,6 +14,13 @@ using vms::api::Permission;
 namespace vms {
 namespace api {
 
+// PENDING-AUDIT-2026-05-09: 3 empty-capture handlers (rois list, by camera, stats).
+// Past audit BUG-ROI-01 (2026-05-02) fixed point-in-polygon logic but did NOT
+// touch RBAC — these GETs are still unauthenticated. C4 fix only covered mutations.
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rois list)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rois by camera)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rois stats)
 void ROIController::registerRoutes(vms::server::VmsApp& app) {
     // GET all ROIs
     CROW_ROUTE(app, "/api/rois")

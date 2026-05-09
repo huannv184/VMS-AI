@@ -94,8 +94,14 @@ void syncZoneROI(const json& body, const std::string& zone_name) {
 
 } // namespace
 
+// PENDING-AUDIT-2026-05-09: 4 empty-capture handlers (rules, zones, alerts/triggers, rules/stats).
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rules CRUD)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (zones CRUD)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (alerts triggers GET)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rules stats GET)
 void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
-    
+
     // ============================================================================
     // RULES API
     // ============================================================================

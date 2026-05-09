@@ -129,6 +129,7 @@ static json buildAuthResponse(bool requires_2fa,
 
 void UserController::registerRoutes(vms::server::VmsApp& app) {
     
+    // LINT-ALLOW-NO-AUTH: auth-flow — login is the entry point, must accept unauthed callers.
     // POST /api/auth/login
     CROW_ROUTE(app, "/api/auth/login")
     .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
@@ -337,6 +338,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
         }
     });
 
+    // LINT-ALLOW-NO-AUTH: auth-flow — logout must work on a stale token (best-effort cookie clear).
     // POST /api/auth/logout
     CROW_ROUTE(app, "/api/auth/logout")
     .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
@@ -663,6 +665,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
         return ApiUtils::createErrorResponse("Invalid code or failed to enable", 400, origin);
     });
 
+    // LINT-ALLOW-NO-AUTH: auth-flow — 2FA verify runs against a 2fa_pending token, not a session.
     // POST /api/auth/2fa/verify (During Login)
     CROW_ROUTE(app, "/api/auth/2fa/verify")
     .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
@@ -741,6 +744,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
     // updates the password, clears the global flag, bumps token_version
     // (so any leaked access token from before the rotation is dead), and
     // issues the real access token + session cookie.
+    // LINT-ALLOW-NO-AUTH: auth-flow — runs on the password_change_pending JWT only (SEC-002 default-password gate).
     CROW_ROUTE(app, "/api/auth/change-password-on-login")
     .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
     ([](const crow::request& req) {

@@ -223,6 +223,18 @@ static json enrichEvent(const Event& evt) {
     return j;
 }
 
+// PENDING-AUDIT-2026-05-09: 7 empty-capture handlers (fire-test POST + 6 GETs:
+// events list, events stats, events analytics, events timeline, event video,
+// event GET/DELETE by id). LARGEST single-controller PENDING block in this audit.
+// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
+// fire-test POST is especially suspect — could trigger fake alarms unauth'd.
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (fire-test POST)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (events list)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (events stats)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (events analytics)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (events timeline)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (event video by id)
+// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (event GET/DELETE by id)
 void EventController::registerRoutes(vms::server::VmsApp& app) {
 
     // =========================================================================
