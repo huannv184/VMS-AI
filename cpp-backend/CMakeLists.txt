@@ -143,10 +143,19 @@ target_link_libraries(vms_backend PRIVATE inference)
 # Without this, a fresh build of vms_backend.exe inside Release/ exits
 # immediately with STATUS_DLL_NOT_FOUND (0xC0000135) because vcpkg DLLs
 # (opencv_*4.dll, spdlog.dll, libcurl.dll, libcrypto-3-x64.dll, etc.) are
-# only copied for some targets, not transitive deps.  CMake 3.21's
-# $<TARGET_RUNTIME_DLLS> resolves the full closure including indirect
-# imports (libwebpdemux, abseil_dll, opencv_calib3d4, …) so we can't miss
-# one by accident.  No-op on non-Windows.
+# only copied for some targets, not transitive deps.
+#
+# Two-stage strategy:
+#  (1) $<TARGET_RUNTIME_DLLS> resolves the closure FOR TARGETS THAT SET
+#      IMPORTED_LOCATION on their imported .lib (Qt, FFmpeg, CUDA do this).
+#  (2) Many vcpkg CONFIG packages (OpenCV transitive: jpeg62/png16/webp/
+#      tiff/zlib/protobuf/abseil; spdlog/fmt; libcurl tls deps) DO NOT set
+#      IMPORTED_LOCATION on the imported library, so $<TARGET_RUNTIME_DLLS>
+#      silently omits them and POST_BUILD copies an empty list. The fallback
+#      copies the entire vcpkg_installed/<triplet>/bin/ next to the exe so
+#      no transitive vcpkg DLL is missed. Documented in
+#      .claude/memory/past-bugs.md → BUG-DEPLOY-RECURRENCE 2026-05-09.
+#  No-op on non-Windows.
 if(WIN32)
     add_custom_command(TARGET vms_backend POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -154,7 +163,38 @@ if(WIN32)
             $<TARGET_FILE_DIR:vms_backend>
         COMMAND_EXPAND_LISTS
         VERBATIM
-        COMMENT "vms_backend: deploying runtime DLLs to $<TARGET_FILE_DIR:vms_backend>")
+        COMMENT "vms_backend: deploying TARGET_RUNTIME_DLLS to $<TARGET_FILE_DIR:vms_backend>")
+
+    # Locate the vcpkg installed bin/ (vcpkg manifest mode + classic both).
+    # CMAKE_TOOLCHAIN_FILE is set when configured via vcpkg toolchain; from
+    # there we derive the triplet bin path. Fall back to a manifest path
+    # that matches the layout we already have on disk.
+    set(_vcpkg_bin "")
+    if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+        set(_vcpkg_bin "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/vcpkg_installed/x64-windows/bin")
+        set(_vcpkg_bin "${CMAKE_SOURCE_DIR}/vcpkg_installed/x64-windows/bin")
+    endif()
+    if(_vcpkg_bin AND EXISTS "${_vcpkg_bin}")
+        # `glob` evaluates at configure time; the deploy step still runs at
+        # build time. Acceptable because vcpkg DLLs are pinned per triplet
+        # and rarely added between full reconfigure cycles. If a developer
+        # adds a new vcpkg dep, they'll re-run cmake configure anyway.
+        file(GLOB _vcpkg_dlls "${_vcpkg_bin}/*.dll")
+        if(_vcpkg_dlls)
+            add_custom_command(TARGET vms_backend POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${_vcpkg_dlls}
+                    $<TARGET_FILE_DIR:vms_backend>
+                COMMAND_EXPAND_LISTS
+                VERBATIM
+                COMMENT "vms_backend: deploying vcpkg fallback DLLs from ${_vcpkg_bin}")
+        endif()
+    else()
+        message(WARNING "vcpkg bin not found; transitive DLL deploy may be incomplete. "
+                        "Set VCPKG_INSTALLED_DIR + VCPKG_TARGET_TRIPLET or place "
+                        "vcpkg_installed/x64-windows/bin under ${CMAKE_SOURCE_DIR}")
+    endif()
 endif()
 
 # Trigger CMake reconfigure
