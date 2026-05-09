@@ -1,6 +1,8 @@
 #include "api/export_controller.h"
 #include "core/ffmpeg_process.h"
 #include "core/runtime_state.h"
+#include "database/audit_repository.h"
+#include "middleware/auth_middleware.h"
 #include "utils/api_utils.h"
 #include "utils/background_job_runner.h"
 #include "utils/logger.h"
@@ -22,13 +24,69 @@ namespace api {
 
 namespace {
 
-// In-memory job storage (could be moved to SQLite for persistence)
+// BUG-EX-LEAK-01 (audit 2026-05-09): pre-fix exportJobs grew without bound.
+// Every accepted /api/export/create permanently inserted a job entry — no
+// cleanup on success or failure, plus the matching exports/<jobId>.<format>
+// file leaked on disk. Same shape as BUG-SYN-LEAK-01. Cap the in-memory map
+// at kMaxExportJobs and evict old finished entries on insert.
+constexpr size_t kMaxExportJobs = 200;
+constexpr int    kMaxExportJobAgeSeconds = 24 * 3600;  // 24h
+
 static std::map<std::string, ExportJob> exportJobs;
 static std::mutex jobsMutex;
 
 vms::utils::BackgroundJobRunner& exportJobRunner() {
     static vms::utils::BackgroundJobRunner runner("export-jobs", 2, 64);
     return runner;
+}
+
+// Caller must hold jobsMutex. Mirrors pruneOldJobsLocked() in synopsis_controller.
+// Pending/processing jobs are NEVER evicted because the worker thread reads
+// exportJobs[jobId] to write status updates.
+void pruneOldExportJobsLocked() {
+    auto now = std::time(nullptr);
+    for (auto it = exportJobs.begin(); it != exportJobs.end();) {
+        const auto& job = it->second;
+        bool finished = (job.status == "done" || job.status == "failed");
+        // ExportJob has no createdAt yet; we approximate with the absence of
+        // an in-flight worker. Skip pending/processing aggressively. For
+        // finished jobs, evict ones whose output file no longer exists or
+        // is older than the cap.
+        if (finished) {
+            std::error_code ec;
+            auto last_write = std::filesystem::last_write_time(job.outputPath, ec);
+            if (ec) {
+                // Output gone (manual cleanup, retention sweep) → safe to drop.
+                it = exportJobs.erase(it);
+                continue;
+            }
+            auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                last_write - std::filesystem::file_time_type::clock::now() +
+                std::chrono::system_clock::now());
+            auto file_time = std::chrono::system_clock::to_time_t(sctp);
+            if ((now - file_time) > kMaxExportJobAgeSeconds) {
+                it = exportJobs.erase(it);
+                continue;
+            }
+        }
+        ++it;
+    }
+    // If still over the cap, drop oldest finished jobs by output file mtime.
+    while (exportJobs.size() >= kMaxExportJobs) {
+        auto oldest = exportJobs.end();
+        std::filesystem::file_time_type oldest_time{};
+        for (auto it = exportJobs.begin(); it != exportJobs.end(); ++it) {
+            if (it->second.status != "done" && it->second.status != "failed") continue;
+            std::error_code ec;
+            auto t = std::filesystem::last_write_time(it->second.outputPath, ec);
+            if (ec) { oldest = it; break; }
+            if (oldest == exportJobs.end() || t < oldest_time) {
+                oldest = it; oldest_time = t;
+            }
+        }
+        if (oldest == exportJobs.end()) break;  // all entries are pending/processing
+        exportJobs.erase(oldest);
+    }
 }
 
 void markJobFailed(const std::string& jobId, const std::string& message) {
@@ -159,40 +217,51 @@ void ExportController::processExportJob(const ExportJob& job) {
 }
 
 void ExportController::registerRoutes(vms::server::VmsApp& app, vms::middleware::AuthMiddleware& auth) {
+    (void)auth;  // legacy parameter — auth now goes via app.get_context
     LOG_INFO("Registering export routes...");
-    
+
+    // BUG-EX-RBAC-01 (audit 2026-05-09): pre-fix all 3 routes used
+    // `auth.validate(req)` only — viewer-tier users could spawn FFmpeg
+    // jobs (CPU-expensive, share a 2-worker queue) and download other users'
+    // exports if they could guess/learn the jobId. Same SEC-005 shape as
+    // synopsis pre-fix. Switch to requirePermission(RECORDING_READ) — anyone
+    // who can read recordings can export them; the audit log tells us who
+    // exported what for forensic purposes.
+
     // POST /api/export/create - Create export job
     CROW_ROUTE(app, "/api/export/create")
     .methods(crow::HTTPMethod::Post)
-    ([&auth](const crow::request& req) {
-        if (!auth.validate(req)) {
-            return crow::response(401);
-        }
-        
+    ([&app](const crow::request& req) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
+
         try {
             auto body = json::parse(req.body);
-            
+
             if (!body.contains("recordingId")) {
                 return ApiUtils::createErrorResponse("Missing recordingId", 400);
             }
-            
+
             ExportJob job;
             job.jobId = generateJobId();
-            
+
             std::string recId = body["recordingId"].get<std::string>();
             if (!std::all_of(recId.begin(), recId.end(), [](unsigned char c) { return std::isalnum(c) || c == '-' || c == '_'; })) {
                 return ApiUtils::createErrorResponse("Invalid recordingId format", 400);
             }
             job.recordingId = recId;
             job.format = body.value("format", "mp4");
-            
-            // SECURITY FIX: Prevent Command Injection by strict whitelisting
+
+            // SECURITY FIX: Prevent Command Injection by strict whitelisting.
+            // Pre-fix silently normalised invalid formats to "mp4". That hid
+            // operator typos. Now: reject explicitly with 400.
             if (job.format != "mp4" && job.format != "avi" && job.format != "mkv") {
-                job.format = "mp4";
+                return ApiUtils::createErrorResponse("Invalid format (allowed: mp4, avi, mkv)", 400);
             }
-            
+
             job.status = "queued";
-            
+
             // Parse masks
             if (body.contains("masks") && body["masks"].is_array()) {
                 for (const auto& maskJson : body["masks"]) {
@@ -206,24 +275,38 @@ void ExportController::registerRoutes(vms::server::VmsApp& app, vms::middleware:
                     job.masks.push_back(mask);
                 }
             }
-            
-            // Store job
+
+            // Store job + cap eviction
             {
                 std::lock_guard<std::mutex> lock(jobsMutex);
+                pruneOldExportJobsLocked();
+                if (exportJobs.size() >= kMaxExportJobs) {
+                    return ApiUtils::createErrorResponse(
+                        "Export job queue full; retry shortly", 429);
+                }
                 exportJobs[job.jobId] = job;
             }
-            
+
             if (vms::core::shutting_down.load(std::memory_order_acquire) ||
                 !exportJobRunner().submit([job]() { processExportJob(job); })) {
                 markJobFailed(job.jobId, "Export queue unavailable");
                 return ApiUtils::createErrorResponse("Export queue unavailable", 503);
             }
-            
+
+            // Audit-log: exports are evidence/PII extraction; record who
+            // initiated each one. Helps forensics trace where a leaked clip
+            // originated.
+            if (ctx.user) {
+                vms::database::AuditRepository audit;
+                audit.insertLog(ctx.user->id, "CREATE_EXPORT",
+                                "Export job " + job.jobId + " for recording " + job.recordingId);
+            }
+
             json response = {
                 {"jobId", job.jobId},
                 {"status", "queued"}
             };
-            
+
             return ApiUtils::createResponse(response, 201);
         } catch (const json::exception& e) {
             return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400);
@@ -231,14 +314,14 @@ void ExportController::registerRoutes(vms::server::VmsApp& app, vms::middleware:
             return ApiUtils::createErrorResponse(e.what());
         }
     });
-    
+
     // GET /api/export/:jobId/status - Get export job status
     CROW_ROUTE(app, "/api/export/<string>/status")
     .methods(crow::HTTPMethod::Get)
-    ([&auth](const crow::request& req, std::string jobId) {
-        if (!auth.validate(req)) {
-            return crow::response(401);
-        }
+    ([&app](const crow::request& req, std::string jobId) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
         
         std::lock_guard<std::mutex> lock(jobsMutex);
         auto it = exportJobs.find(jobId);
@@ -264,36 +347,46 @@ void ExportController::registerRoutes(vms::server::VmsApp& app, vms::middleware:
     // GET /api/export/:jobId/download - Download exported video
     CROW_ROUTE(app, "/api/export/<string>/download")
     .methods(crow::HTTPMethod::Get)
-    ([&auth](const crow::request& req, std::string jobId) {
-        if (!auth.validate(req)) {
-            return crow::response(401);
+    ([&app](const crow::request& req, std::string jobId) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
+
+        std::string outputPath;
+        {
+            std::lock_guard<std::mutex> lock(jobsMutex);
+            auto it = exportJobs.find(jobId);
+
+            if (it == exportJobs.end()) {
+                return ApiUtils::createErrorResponse("Export job not found", 404);
+            }
+
+            if (it->second.status != "done") {
+                return ApiUtils::createErrorResponse("Export not ready", 400);
+            }
+            outputPath = it->second.outputPath;
         }
-        
-        std::lock_guard<std::mutex> lock(jobsMutex);
-        auto it = exportJobs.find(jobId);
-        
-        if (it == exportJobs.end()) {
-            return ApiUtils::createErrorResponse("Export job not found", 404);
-        }
-        
-        if (it->second.status != "done") {
-            return ApiUtils::createErrorResponse("Export not ready", 400);
-        }
-        
-        std::string outputPath = it->second.outputPath;
-        
+
         if (!std::filesystem::exists(outputPath)) {
             return ApiUtils::createErrorResponse("Export file not found", 404);
         }
-        
+
+        // Audit-log download — pairs with the CREATE_EXPORT entry so
+        // forensics can see "user X created this export and user Y
+        // downloaded it on date Z."
+        if (ctx.user) {
+            vms::database::AuditRepository audit;
+            audit.insertLog(ctx.user->id, "DOWNLOAD_EXPORT", "Export " + jobId);
+        }
+
         // Use static file info to prevent OOM
         crow::response res;
         res.code = 200;
         res.set_static_file_info(outputPath);
         res.set_header("Content-Type", "video/mp4");
         res.set_header("Content-Disposition", "attachment; filename=\"" + jobId + ".mp4\"");
-        res.set_header("Access-Control-Allow-Origin", "*");
-        
+        res.set_header("Access-Control-Allow-Origin", origin);
+
         return res;
     });
     

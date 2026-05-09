@@ -1,5 +1,30 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-09 BUG-SNAP-AUTH-01 + BUG-SNAP-AUDIT-01 — All 3 snapshot routes used `[]` capture, ZERO auth + DELETE no audit log
+
+- **File**: `cpp-backend/src/api/snapshot_controller.cpp` (pre-fix)
+- **Bug**: Same SEC-shape repetition: `[]` capture, never reads AuthMiddleware ctx. 4 affected routes (GET list, GET by id, DELETE by id, GET file by filename). Anyone reachable on the API port could list, read, delete every snapshot in the system. Snapshots are surveillance evidence + PII. No audit log on DELETE either.
+- **Status**: CRITICAL — direct PII leak + integrity loss against forensic data.
+- **Fix**: `[&app]` + `requirePermission` per method. GET=`RECORDING_READ`, DELETE=`RECORDING_DELETE`, file=`RECORDING_READ`. `AuditRepository::insertLog(user_id, "DELETE_SNAPSHOT", ...)` on delete. Also clamped `limit` query param to `[1, 500]` so a client can't ask for `limit=10M`.
+- **Detection lesson**: this is the 4th controller this week (ANPR, snapshot, plus reaffirmed pattern from synopsis + face) found with `[]`-capture + no `requirePermission`. The fix is mechanical; the meta-issue is that no checklist/CI gate enforces the pattern. Punt list item: lint rule that flags any `CROW_ROUTE` lambda capture that doesn't include `&app`.
+
+## 2026-05-09 BUG-HLS-AUTH-01 + BUG-HLS-EXT-01 — Both HLS routes ZERO auth + extension check was substring not suffix
+
+- **File**: `cpp-backend/src/api/hls_controller.cpp` (pre-fix)
+- **Bug 1**: Both routes (`/api/cameras/<id>/hls/stream.m3u8` + `/api/cameras/<id>/hls/<segment>`) used `[]` capture. Anyone reachable could stream the live HLS feed of any camera — THE most sensitive PII surface in a surveillance product.
+- **Bug 2**: `if (segment.find(".ts") == npos && segment.find(".m3u8") == npos)` used substring search. `evil.ts.exe` passed (`.ts` appears mid-string). `hls/<id>/` is server-controlled directory so practical exploit was limited, but the contract is wrong.
+- **Status**: CRITICAL (live video PII) + LOW (substring quirk).
+- **Fix**: `requirePermission(CAMERA_READ)` on both routes. Cookie-based auth (H5 hardening 2026-04) means `<video src="..."/>` includes session cookies for same-origin; cross-origin needs `crossorigin="use-credentials"`. Substring check replaced by `endsWithCi` lambda; Content-Type set from same flag so file-type gate and Content-Type can't disagree.
+
+## 2026-05-09 BUG-EX-RBAC-01 + BUG-EX-LEAK-01 — Export controller weak auth + unbounded jobs map
+
+- **File**: `cpp-backend/src/api/export_controller.cpp` (pre-fix)
+- **Bug 1 (RBAC)**: 3 routes used `auth.validate(req)` only (the SEC-005 anti-pattern). Viewer-tier users could spawn FFmpeg jobs (CPU expensive, 2-worker shared queue) and download other users' exports if they could guess/learn the jobId. Same as synopsis pre-fix.
+- **Bug 2 (LEAK)**: `exportJobs` map grew without bound — every accepted POST inserted a permanent entry, no cleanup on success or failure. Plus `exports/<jobId>.<format>` files leaked on disk. Same shape as BUG-SYN-LEAK-01.
+- **Status**: HIGH RBAC + MEDIUM leak.
+- **Fix (RBAC)**: `requirePermission(RECORDING_READ)` on POST/GET-status/GET-download. `AuditRepository::insertLog` on CREATE_EXPORT and DOWNLOAD_EXPORT — pairs so forensics can see "user X created, user Y downloaded, on date Z." Format whitelist now rejects with 400 instead of silently normalising invalid → mp4.
+- **Fix (LEAK)**: `kMaxExportJobs = 200`, `kMaxExportJobAgeSeconds = 24h`, `pruneOldExportJobsLocked()` evicts on insert. Pending/processing jobs are NEVER evicted (worker thread reads `exportJobs[jobId]` to write status). All 200 slots busy → 429.
+
 ## 2026-05-09 BUG-PM-RESTART-01 — `FFmpegProcess::processStopped` was unwired; AI worker crashes silently disabled per-camera detection forever
 
 - **Files**: `cpp-backend/src/core/camera_pipeline_manager.cpp`, `cpp-backend/include/core/camera_pipeline_manager.h`

@@ -1,6 +1,9 @@
 #include "api/snapshot_controller.h"
 #include "core/snapshot_manager.h"
+#include "database/audit_repository.h"
+#include "middleware/auth_middleware.h"
 #include "utils/api_utils.h"
+#include "utils/logger.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <filesystem>
@@ -10,19 +13,37 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
+// BUG-SNAP-AUTH-01 (audit 2026-05-09): pre-fix all 3 snapshot routes used
+// `[]` capture and never read AuthMiddleware context. Anyone reachable on
+// the API port could (a) list every snapshot in the system (camera_id +
+// filepath + metadata = sensitive surveillance PII), (b) read raw image
+// files via /api/snapshots/files/<filename>, (c) DELETE individual
+// snapshots with no auth, no audit log. Same SEC-shape as BUG-ANPR-AUTH-01
+// (5 routes, 2026-05-08), SEC-008/009 (attendance/counter unauth GETs).
+// Fix: GET = RECORDING_READ (snapshots are evidence/PII), DELETE =
+// RECORDING_DELETE, file fetch = RECORDING_READ. Audit log on DELETE.
+
 void SnapshotController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/snapshots
     CROW_ROUTE(app, "/api/snapshots")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
 
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
+
         auto& manager = vms::core::SnapshotManager::getInstance();
         int camera_id = req.url_params.get("camera_id") ? std::atoi(req.url_params.get("camera_id")) : -1;
         int limit = req.url_params.get("limit") ? std::atoi(req.url_params.get("limit")) : 50;
+        // Clamp pathological values — pre-fix a client could request limit=10M
+        // and the snapshot manager would blindly try to materialise that many
+        // rows. Bound to a reasonable page size.
+        if (limit < 1) limit = 50;
+        if (limit > 500) limit = 500;
         
         auto snapshots = manager.getRecentSnapshots(camera_id, limit);
         json out = json::array();
@@ -49,14 +70,19 @@ void SnapshotController::registerRoutes(vms::server::VmsApp& app) {
     // GET/DELETE /api/snapshots/:id
     CROW_ROUTE(app, "/api/snapshots/<string>")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Delete, crow::HTTPMethod::Options)
-    ([](const crow::request& req, const std::string& id) {
+    ([&app](const crow::request& req, const std::string& id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
 
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        const Permission needed = (req.method == crow::HTTPMethod::Get)
+            ? Permission::RECORDING_READ : Permission::RECORDING_DELETE;
+        if (auto err = ApiUtils::requirePermission(ctx, needed, origin)) return std::move(*err);
+
         auto& manager = vms::core::SnapshotManager::getInstance();
-        
+
         if (req.method == crow::HTTPMethod::Get) {
             auto snaps = manager.getRecentSnapshots();
             auto it = std::find_if(snaps.begin(), snaps.end(), [&](const vms::Snapshot& s) { return s.id == id; });
@@ -77,6 +103,13 @@ void SnapshotController::registerRoutes(vms::server::VmsApp& app) {
         }
 
         if (manager.deleteSnapshot(id)) {
+            // BUG-SNAP-AUDIT-01: snapshots are evidence material; deletion
+            // must be traceable to a specific user. Pre-fix the only record
+            // was the implicit `now-it's-gone` change in DB.
+            if (ctx.user) {
+                vms::database::AuditRepository audit;
+                audit.insertLog(ctx.user->id, "DELETE_SNAPSHOT", "Snapshot id=" + id);
+            }
             return ApiUtils::createResponse(json::object(), 200, origin);
         }
         return ApiUtils::createErrorResponse("Snapshot not found or failed to delete", 404, origin);
@@ -85,7 +118,15 @@ void SnapshotController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/snapshots/files/:filename
     CROW_ROUTE(app, "/api/snapshots/files/<string>")
     .methods(crow::HTTPMethod::Get)
-    ([](const crow::request&, const std::string& filename) {
+    ([&app](const crow::request& req, const std::string& filename) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) {
+            // requirePermission returns a Crow response; convert to bare 401/403
+            // so the file-serving callers get a uniform error rather than a
+            // CORS-padded JSON body where they expect raw image bytes.
+            return std::move(*err);
+        }
         if (filename.find("..") != std::string::npos ||
             filename.find('/') != std::string::npos ||
             filename.find('\\') != std::string::npos) {
