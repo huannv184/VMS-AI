@@ -1,5 +1,18 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-09 BUG-FE-ANPR-DEL-FAKE + BUG-FE-REID-LIE + BUG-FE-REID-DEFAULT — Frontend ignored backend signals from today's RBAC/Fix-B work
+
+- **Files**: `vms-frontend/src/views/AnalyticsView.jsx:290`, `vms-frontend/src/views/ReIDView.jsx`
+- **Bug 1 (FE-ANPR-DEL-FAKE, HIGH UX)**: After `BUG-ANPR-AUTH-01` raised the DELETE bar to `SYSTEM_ADMIN`, operator-tier users get 403. Pre-fix the delete-button click handler awaited the call but ignored the response: `await apiClient.deleteAnprPlates(); setLprData([]); window.alert("Đã xóa xong!");` — operator clicked delete, saw success, refreshed, all entries reappeared. Operational lie at the UX layer.
+- **Bug 2 (FE-REID-LIE, HIGH UX)**: Backend `BUG-REID-DEAD-PIPELINE` (2026-05-08) added `producer_wired` to `/api/reid/gallery` to surface that the cross-camera ReID pipeline is dormant. Frontend ignored the field; the empty-gallery message always read "Persons will appear here as AI detects them across cameras" — operators stared at the optimistic message indefinitely while the backend silently waved the `producer_wired:false` flag.
+- **Bug 3 (FE-REID-DEFAULT, MEDIUM UX)**: ReID config slider initial state `match_threshold: 0.65` while backend default after Fix-B is `0.72`. Race during first render: user opens config panel before fetchConfig lands → sees 0.65 → saves → silently weakens the threshold from 0.72 back to 0.65.
+- **Status**: HIGH UX / data-integrity (FE-ANPR-DEL-FAKE), HIGH UX (FE-REID-LIE), MEDIUM UX (FE-REID-DEFAULT).
+- **Detection**: 2026-05-09 frontend audit pass after the 6 backend fixes landed (`33fea193`). Cross-referencing today's backend changes against frontend `apiClient` usage. Synopsis/HLS/export/snapshot endpoints turned out to be unused by frontend (external-API surface only) — no UI regression there. ANPR delete + ReID gallery were the two paths the UI actually consumes that today's changes touched.
+- **Fix (FE-ANPR-DEL-FAKE)**: check `res.success`, branch on status (403 → "no permission", 401 → "session expired", else → generic). Local state only clears when the server confirmed the wipe.
+- **Fix (FE-REID-LIE)**: `useState(producerWired = true)` so the warning doesn't flash during first-fetch race; `fetchGallery` reads `res.data.producer_wired`; empty-gallery message branches on the flag; warning banner appears at top of gallery panel when dormant, citing the backend bug ID and explaining the dormant state.
+- **Fix (FE-REID-DEFAULT)**: bumped frontend default to 0.72. fetchConfig still wins once the request lands; the change matters only for the brief initial-render interval.
+- **Detection lesson**: when a backend audit adds a new field/status code, immediately cross-reference frontend usage. The "backend fixes" → "frontend audit" cadence is one session of lag minimum, but the lag should be ZERO sessions for breaking changes (e.g. RBAC tightening that turns a 200 into 403). Add a "frontend impact" checklist line to the backend audit template.
+
 ## 2026-05-09 BUG-SNAP-AUTH-01 + BUG-SNAP-AUDIT-01 — All 3 snapshot routes used `[]` capture, ZERO auth + DELETE no audit log
 
 - **File**: `cpp-backend/src/api/snapshot_controller.cpp` (pre-fix)

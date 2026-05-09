@@ -6,7 +6,17 @@ const ReIDView = () => {
   const cameras = useVmsStore(s => s.cameras);
   const [gallery, setGallery] = useState([]);
   const [stats, setStats] = useState({});
-  const [config, setConfig] = useState({ enabled: true, match_threshold: 0.65, gallery_ttl_sec: 1800, max_gallery_size: 500 });
+  // FE-3 FIX (2026-05-09): match_threshold default kept loosely in sync with
+  // backend Fix-B (0.72) so the slider shows the right value before
+  // fetchConfig completes. fetchConfig still overrides with the actual
+  // server value once the request lands. The other defaults
+  // (gallery_ttl_sec, max_gallery_size) match the engine header.
+  const [config, setConfig] = useState({ enabled: true, match_threshold: 0.72, gallery_ttl_sec: 1800, max_gallery_size: 500 });
+  // FE-2 FIX: surface backend's BUG-REID-DEAD-PIPELINE producer_wired flag
+  // so the empty-gallery message reflects "feature dormant" instead of
+  // "scene quiet". Default true so the UX doesn't flash the warning during
+  // the first fetch race.
+  const [producerWired, setProducerWired] = useState(true);
   const [selectedPerson, setSelectedPerson] = useState(null);
   const [trail, setTrail] = useState([]);
   const [searchResults, setSearchResults] = useState(null);
@@ -20,6 +30,12 @@ const ReIDView = () => {
       if (res?.success && res.data?.gallery) {
         setGallery(res.data.gallery);
         setStats(res.data.statistics || {});
+        // Backend response includes producer_wired (BUG-REID-DEAD-PIPELINE
+        // 2026-05-08). Defaults to true if absent so older backends don't
+        // trigger the warning.
+        if (typeof res.data.producer_wired === 'boolean') {
+          setProducerWired(res.data.producer_wired);
+        }
       }
     } catch {}
   }, []);
@@ -196,11 +212,29 @@ const ReIDView = () => {
             ACTIVE GALLERY ({gallery.length})
           </div>
 
+          {!producerWired && (
+            <div style={{ marginBottom: 16, padding: 12, background: 'rgba(255, 152, 0, 0.08)', borderRadius: 8, border: '1px solid rgba(255, 152, 0, 0.3)', fontSize: 11, color: '#FF9800' }}>
+              <strong>⚠ Re-ID detection pipeline not connected.</strong> The cross-camera tracking
+              feature is dormant — no producer is feeding the gallery. The backend reports this
+              as <code>producer_wired: false</code> (BUG-REID-DEAD-PIPELINE). Search-by-image
+              still works against the empty gallery; live tracking will appear once the
+              inference pipeline wires <code>processDetection()</code>.
+            </div>
+          )}
           {gallery.length === 0 ? (
             <div style={{ textAlign: 'center', padding: 60, color: 'var(--text-dim)', fontSize: 12 }}>
               <div style={{ fontSize: 40, marginBottom: 12, opacity: 0.3 }}>👤</div>
-              No persons in Re-ID gallery yet.<br/>
-              <span style={{ fontSize: 10 }}>Persons will appear here as AI detects them across cameras.</span>
+              {producerWired ? (
+                <>
+                  No persons in Re-ID gallery yet.<br/>
+                  <span style={{ fontSize: 10 }}>Persons will appear here as AI detects them across cameras.</span>
+                </>
+              ) : (
+                <>
+                  Re-ID gallery is empty because the detection pipeline is not yet active.<br/>
+                  <span style={{ fontSize: 10 }}>See the warning banner above.</span>
+                </>
+              )}
             </div>
           ) : (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))', gap: 8 }}>

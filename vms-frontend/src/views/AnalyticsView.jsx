@@ -289,10 +289,24 @@ const AnalyticsView = () => {
                 <button className="grid-btn" style={{ padding:'0 10px' }} onClick={handleLprSearch}><Search size={12} /></button>
                <button className="grid-btn" style={{ padding:'0 10px', color: 'var(--danger)', border: '1px solid var(--danger)', marginLeft: '10px' }} onClick={async () => {
                  if (window.confirm("Xác nhận XÓA SẠCH dữ liệu nhật ký ANPR rác này?")) {
-                   await apiClient.deleteAnprPlates();
-                   setLprData([]);
-                   setLprSearch('');
-                   window.alert("Đã xóa xong!");
+                   // FE-1 FIX (2026-05-09): backend tightened ANPR DELETE to
+                   // SYSTEM_ADMIN. Pre-fix this code didn't check the result
+                   // and showed "Đã xóa xong!" even when the server returned
+                   // 403 — DB unchanged but local state cleared, refresh
+                   // brought everything back. Now we check success and only
+                   // clear local state on confirmed delete.
+                   const res = await apiClient.deleteAnprPlates();
+                   if (res?.success) {
+                     setLprData([]);
+                     setLprSearch('');
+                     window.alert("Đã xóa xong!");
+                   } else if (res?.status === 403) {
+                     window.alert("Bạn không có quyền xóa nhật ký ANPR (cần quyền admin).");
+                   } else if (res?.status === 401) {
+                     window.alert("Phiên đăng nhập đã hết hạn.");
+                   } else {
+                     window.alert("Xóa thất bại: " + (res?.error || "Lỗi không xác định"));
+                   }
                  }
                }}>
                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
