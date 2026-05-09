@@ -389,7 +389,21 @@ bool CameraManager::refreshAdvancedConfig(int camera_id) {
     }
     
     if (cfg.host.empty()) {
-        LOG_ERROR("Could not parse host from RTSP URL: {}", camera.rtsp_url);
+        // BUG-CM-CREDLEAK-01 (audit 2026-05-09): pre-fix logged
+        // `camera.rtsp_url` raw, which contains user:pass@host credentials.
+        // Anything in the log file (or wired log shipper) leaks the camera
+        // password. Same lesson as BUG-C3 (channels endpoint leaked
+        // rtsp://user:pass@... in API responses). Strip the credential
+        // segment before logging so the error stays useful but the secret
+        // doesn't escape.
+        std::string sanitized = camera.rtsp_url;
+        if (auto scheme_end = sanitized.find("://"); scheme_end != std::string::npos) {
+            std::string after = sanitized.substr(scheme_end + 3);
+            if (auto at_pos = after.find('@'); at_pos != std::string::npos) {
+                sanitized = sanitized.substr(0, scheme_end + 3) + "***@" + after.substr(at_pos + 1);
+            }
+        }
+        LOG_ERROR("Could not parse host from RTSP URL (camera_id={}): {}", camera_id, sanitized);
         return false;
     }
 

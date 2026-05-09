@@ -1,5 +1,21 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-09 BUG-PM-RESTART-01 — `FFmpegProcess::processStopped` was unwired; AI worker crashes silently disabled per-camera detection forever
+
+- **Files**: `cpp-backend/src/core/camera_pipeline_manager.cpp`, `cpp-backend/include/core/camera_pipeline_manager.h`
+- **Bug**: When `ai_worker_v2` was spawned per camera, only `stdoutReady` and `stderrReady` were connected. The third signal `processStopped(int exitCode)` (`ffmpeg_process.h:73`, emitted at `ffmpeg_process.cpp:304`) had ZERO listeners across the codebase. `CameraPipelineManager::isRunning(camera_id)` only checks `pipelines_[id]->running.load()` — a flag set at startPipeline and only cleared by stopPipeline. So when the worker exited (yesterday's BUG-AIW-LOOP-01 50-failure bail, segfault, OOM, OS kill, anything): QProcess emits `finished` → FFmpegProcess emits `processStopped` → nothing listens → `running` stays true → Health Supervisor sees "running, all good" → no restart. The camera silently lost AI detection until manual stop/start.
+- **Status**: HIGH operational silent failure. Made BUG-AIW-LOOP-01 fix half-broken — the worker exited cleanly but the manager never noticed.
+- **Detection**: 2026-05-09 audit pass on process_manager + camera_manager. Tracing the contract from yesterday's BUG-AIW-LOOP-01 ("manager will restart us") to verify the manager actually does. `Grep "processStopped"` returned only declaration + emit, no `connect()`.
+- **Fix**: Connected `processStopped` → new private method `onAiWorkerStopped(camera_id, exit_code)`. Added `ai_cmd_cache` / `ai_restart_count` / `ai_last_restart_ms` to PipelineContext. Backoff schedule 5s/15s/60s/300s/600s, hard cap at 5 restarts in a 10-min sliding window (counter ages out so a flaky day doesn't permanently exhaust the budget). Restart runs on Qt main thread via `QTimer::singleShot(delay_ms, qApp, ...)` (FFmpegProcess::start asserts thread affinity). Reuses the same FFmpegProcess instance — its start() internally calls stop() first then re-runs.
+- **Detection lesson**: When you write a fix whose contract depends on another module's behaviour ("manager will restart us"), the fix is not done until you've VERIFIED the other module actually does that. Yesterday's BUG-AIW-LOOP-01 commit should have included a check on the supervisor side. From now on: any "system X will react to this" comment in a fix needs an immediate grep to confirm before commit.
+
+## 2026-05-09 BUG-CM-CREDLEAK-01 — `refreshAdvancedConfig` logged the full RTSP URL on parse failure, leaking user:pass to logs
+
+- **File**: `cpp-backend/src/core/camera_manager.cpp:392` (pre-fix)
+- **Bug**: `LOG_ERROR("Could not parse host from RTSP URL: {}", camera.rtsp_url)`. The DB stores RTSP URLs as `rtsp://user:pass@host:port/path`. Anything with log file access (operator console, log shipper, screenshot) leaked the camera credentials. Same lesson as BUG-C2 (devices API leaked plaintext password) and BUG-C3 (channels endpoint leaked rtsp://user:pass URL): credentials must never leave the backend, including via logs.
+- **Status**: MEDIUM info disclosure (requires log access).
+- **Fix**: strip `user:pass@` to `***@` before logging. Inline implementation; if another site logs RTSP URLs, extract `vms::utils::sanitizeRtspForLog()`.
+
 ## 2026-05-09 BUG-DEPLOY-RECURRENCE — Fresh `vms_backend.exe` again exited with STATUS_DLL_NOT_FOUND despite the 2026-05-03 POST_BUILD fix
 
 - **Files**: `cpp-backend/CMakeLists.txt:142-158` (pre-fix), `cpp-backend/src/ai_worker/CMakeLists.txt` (verified — no fallback needed)

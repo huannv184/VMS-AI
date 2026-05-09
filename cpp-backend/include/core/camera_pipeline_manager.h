@@ -164,6 +164,17 @@ private:
     // Called via QueuedConnection when worker exhausts all reconnects
     void handleStreamFailed(int camera_id);
 
+    // BUG-PM-RESTART-01 (2026-05-09): wired to FFmpegProcess::processStopped on
+    // the per-camera ai_worker_v2 child. Pre-fix nothing listened to that
+    // signal — when the AI worker exited (BUG-AIW-LOOP-01 50-failure bail,
+    // segfault, OS kill, anything), the camera silently lost AI detection
+    // until manual stop/start. Now: log + schedule respawn with backoff
+    // (5s / 15s / 60s / 300s / give-up after 5 attempts in a sliding window).
+    // Runs on the Qt main thread; the actual respawn happens via
+    // QTimer::singleShot back onto qApp.
+    void onAiWorkerStopped(int camera_id, int exit_code);
+    void respawnAiWorkerOnQtThread(int camera_id);
+
     // Batch inference worker (replaces ai_worker.exe when batch inference enabled)
     void workerBatchInference(int camera_id, PipelineContext* ctx);
 

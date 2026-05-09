@@ -10,6 +10,7 @@
 #include <QMetaObject>
 #include <QObject>
 #include <QCoreApplication>
+#include <QTimer>
 #include "core/native_reader_worker.h"
 #include <QByteArray>
 #include "streaming/camera_stream_manager_qt.h"
@@ -21,6 +22,7 @@
 #include "core/media_pipeline.h"
 #include "core/pipeline_state_store.h"
 #include "core/camera_manager.h"
+#include "core/runtime_state.h"
 #include "database/models.h"
 #include "utils/logger.h"
 #include "utils/config.h" // Added for config access
@@ -153,6 +155,17 @@ struct PipelineContext {
     std::atomic<int> restart_count{0};
     std::atomic<int> no_frame_count{0};
     std::atomic<int> camera_state{static_cast<int>(CameraState::CONNECTING)};
+
+    // BUG-PM-RESTART-01: AI worker subprocess restart-on-crash state.
+    // ai_cmd_cache stores the final spawn command string so a respawn after
+    // crash can re-run start() without re-deriving paths/json. ai_restart_count
+    // bounds the retry loop. ai_last_restart_ms is the steady-clock epoch of
+    // the last respawn attempt; we use it to age out the count after a calm
+    // 10-minute window (so a flaky camera doesn't permanently exhaust its
+    // budget after a single bad day).
+    std::string ai_cmd_cache;
+    std::atomic<int> ai_restart_count{0};
+    std::atomic<int64_t> ai_last_restart_ms{0};
     
     std::chrono::steady_clock::time_point last_log_time;
     std::chrono::steady_clock::time_point last_ai_log_time;          // PERF: throttle AI detection logging
@@ -400,11 +413,25 @@ bool CameraPipelineManager::startPipeline(int camera_id, const std::string& rtsp
 
         std::string ai_cmd = "\"" + ai_worker_exe + "\" " + std::to_string(camera_id) + " \"" + abs_model + "\" \"" + abs_db + "\" \"" + escaped_json + "\"";
         LOG_INFO("[Manager] Launching AI Worker for camera {}: {}", camera_id, ai_cmd);
-        
+
+        // Cache for BUG-PM-RESTART-01 respawn path. Stored before start() so
+        // even if the first launch fails the cache is populated and a future
+        // restart attempt has the right string to retry.
+        ctx->ai_cmd_cache = ai_cmd;
+
         QObject::connect(ctx->ai_process.get(), &vms::core::FFmpegProcess::stdoutReady, ctx->ai_process.get(),
                          [this, camera_id](const QByteArray& data) { handleAiLogData(camera_id, data); });
         QObject::connect(ctx->ai_process.get(), &vms::core::FFmpegProcess::stderrReady, ctx->ai_process.get(),
                          [this, camera_id](const QByteArray& data) { handleAiLogData(camera_id, data); });
+        // BUG-PM-RESTART-01: pre-fix nothing listened to processStopped — when
+        // the worker exited (BUG-AIW-LOOP-01 50-failure bail, segfault, OS
+        // kill, or any other reason), the camera silently lost AI detection
+        // until manual stop/start. Now we log the death and schedule a
+        // respawn with backoff. Receiver context is the ai_process instance
+        // itself so the connection is auto-disposed when the FFmpegProcess
+        // is destroyed in ~PipelineContext.
+        QObject::connect(ctx->ai_process.get(), &vms::core::FFmpegProcess::processStopped, ctx->ai_process.get(),
+                         [this, camera_id](int code) { onAiWorkerStopped(camera_id, code); });
         
         // start() must run on the object's owner thread (main Qt thread).
         // startPipeline() may be called from a Crow HTTP thread — marshal with blocking call.
@@ -1025,6 +1052,106 @@ void CameraPipelineManager::handleStreamFailed(int camera_id) {
     PipelineStateStore::getInstance().setState(
         camera_id, CameraState::FAILED, "All reconnect attempts exhausted");
     FrameBus::getInstance().publishStateChange(camera_id, CameraState::FAILED);
+}
+
+// BUG-PM-RESTART-01 (audit 2026-05-09): runs on the Qt main thread (because
+// it's invoked from a signal whose receiver is the FFmpegProcess QObject,
+// which lives on the main thread). Bounded backoff so a permanently-broken
+// model file (e.g., truncated mid-deploy) doesn't infinite-restart at high
+// rate and burn CPU + log volume.
+void CameraPipelineManager::onAiWorkerStopped(int camera_id, int exit_code) {
+    if (vms::core::shutting_down.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Backoff schedule (ms): 5s, 15s, 60s, 300s, then 600s steady.
+    static constexpr int kBackoffMs[] = {5000, 15000, 60000, 300000, 600000};
+    static constexpr int kMaxRestarts = 5;
+    // After this many milliseconds of no restart attempts, the counter ages
+    // back to 0 — a flaky day shouldn't permanently exhaust the budget.
+    static constexpr int64_t kCounterResetWindowMs = 10 * 60 * 1000;
+
+    int attempt = -1;
+    int delay_ms = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto it = pipelines_.find(camera_id);
+        if (it == pipelines_.end()) {
+            LOG_INFO("[Manager] AI Worker for camera {} stopped (exit={}); pipeline already gone — not restarting",
+                     camera_id, exit_code);
+            return;
+        }
+        auto* ctx = it->second.get();
+
+        // If the pipeline is being torn down (stopPipeline already called),
+        // don't fight the teardown by respawning. should_stop is the right
+        // signal — it's set in ~PipelineContext too.
+        if (ctx->should_stop.load(std::memory_order_acquire) ||
+            !ctx->running.load(std::memory_order_acquire)) {
+            LOG_INFO("[Manager] AI Worker for camera {} stopped (exit={}); pipeline shutting down — not restarting",
+                     camera_id, exit_code);
+            return;
+        }
+
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t last_ms = ctx->ai_last_restart_ms.load(std::memory_order_acquire);
+        if (last_ms > 0 && (now_ms - last_ms) > kCounterResetWindowMs) {
+            ctx->ai_restart_count.store(0, std::memory_order_release);
+        }
+        attempt = ctx->ai_restart_count.fetch_add(1, std::memory_order_acq_rel);
+        ctx->ai_last_restart_ms.store(now_ms, std::memory_order_release);
+
+        if (attempt >= kMaxRestarts) {
+            LOG_ERROR("[Manager] AI Worker for camera {} has restarted {} times in 10 min — giving up. "
+                      "Operator must restart the camera manually.",
+                      camera_id, attempt);
+            return;
+        }
+        delay_ms = kBackoffMs[std::min<size_t>(attempt, sizeof(kBackoffMs)/sizeof(int) - 1)];
+    }
+
+    LOG_WARN("[Manager] AI Worker for camera {} exited (code={}); scheduling restart attempt {} in {}ms",
+             camera_id, exit_code, attempt + 1, delay_ms);
+
+    // Schedule on the Qt main thread; FFmpegProcess::start() asserts thread
+    // affinity. qApp lives forever so the timer can't outlive its parent.
+    QTimer::singleShot(delay_ms, qApp, [this, camera_id]() {
+        respawnAiWorkerOnQtThread(camera_id);
+    });
+}
+
+void CameraPipelineManager::respawnAiWorkerOnQtThread(int camera_id) {
+    if (vms::core::shutting_down.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = pipelines_.find(camera_id);
+    if (it == pipelines_.end()) {
+        LOG_INFO("[Manager] AI Worker respawn for camera {}: pipeline gone, skipping", camera_id);
+        return;
+    }
+    auto* ctx = it->second.get();
+    if (ctx->should_stop.load(std::memory_order_acquire) ||
+        !ctx->running.load(std::memory_order_acquire)) {
+        LOG_INFO("[Manager] AI Worker respawn for camera {}: pipeline shutting down, skipping", camera_id);
+        return;
+    }
+    if (!ctx->ai_process || ctx->ai_cmd_cache.empty()) {
+        LOG_WARN("[Manager] AI Worker respawn for camera {}: no cached cmd or process, skipping", camera_id);
+        return;
+    }
+
+    LOG_INFO("[Manager] Respawning AI Worker for camera {}", camera_id);
+    bool started = ctx->ai_process->start(ctx->ai_cmd_cache);
+    if (!started) {
+        LOG_ERROR("[Manager] AI Worker respawn for camera {} failed at start()", camera_id);
+        // The new failure will trip processStopped again and re-enter the
+        // backoff path; no need to manually re-schedule here.
+    } else {
+        LOG_INFO("[Manager] AI Worker respawn for camera {} succeeded", camera_id);
+    }
 }
 
 CameraState CameraPipelineManager::getCameraState(int camera_id) {
