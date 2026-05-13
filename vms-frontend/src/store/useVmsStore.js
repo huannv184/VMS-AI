@@ -39,7 +39,10 @@ const useVmsStore = create((set) => ({
   // ── Analytics (from /api/events/analytics) ──
   eventAnalytics: [],
 
-  // ── ANPR (from /api/anpr/plates) ──
+  // ── ANPR (from /api/anpr/plates + WS LPR events) ──
+  // Real-time updates: WS handler calls addLpr() to prepend new plates;
+  // AnalyticsView subscribes via useVmsStore(s => s.lprData) so the gallery
+  // updates without waiting for the next poll cycle.
   lprData: [],
 
   // ── Audit Logs ──
@@ -89,6 +92,20 @@ const useVmsStore = create((set) => ({
   setSystemStats: (stats) => set({ systemStats: stats }),
   setEventAnalytics: (data) => set({ eventAnalytics: Array.isArray(data) ? data : [] }),
   setLprData: (data) => set({ lprData: Array.isArray(data) ? data : [] }),
+  addLpr: (plate) => set((state) => {
+    // Prepend new plate, dedupe consecutive same-plate hits on the same camera
+    // within 10s (matches backend's processLicensePlate cooldown semantics so
+    // we don't double-render edge events that slipped through the cooldown).
+    if (!plate || !plate.plate_number) return state;
+    const head = state.lprData[0];
+    if (head &&
+        head.plate_number === plate.plate_number &&
+        head.camera_id === plate.camera_id &&
+        Math.abs((head.detected_at || 0) - (plate.detected_at || 0)) < 10) {
+      return state;
+    }
+    return { lprData: [plate, ...state.lprData].slice(0, 500) };
+  }),
   setLineCrossingData: (data) => set({ lineCrossingData: data || {} }),
   setAuditLogs: (logs) => set({ auditLogs: Array.isArray(logs) ? logs : [] }),
   setPpeEvents: (events) => set({ ppeEvents: Array.isArray(events) ? events : [] }),

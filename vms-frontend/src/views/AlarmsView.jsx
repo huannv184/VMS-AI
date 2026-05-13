@@ -66,6 +66,11 @@ const AlarmsView = () => {
             img: evt.snapshot_url ? `${API_BASE}${evt.snapshot_url}` : null,
             rule_name: meta.rule_name || null,
             confidence: meta.confidence != null ? Math.round(meta.confidence * 100) : null,
+            // ReID stitch — populated by AiEventProcessor::processIntrusion when
+            // the ReID engine has resolved a global identity for this person.
+            // Backend memo: closeouts_bundle_2026_05_12 (lookupGlobalId helper).
+            reid_global_id: typeof meta.reid_global_id === 'number' && meta.reid_global_id > 0
+              ? meta.reid_global_id : null,
           };
         });
 
@@ -85,13 +90,26 @@ const AlarmsView = () => {
   }, [fetchAlarms]);
 
   const handleDelete = async (id) => {
+    // Pre-fix removed the row from local state regardless of server outcome.
+    // If the user lacks EVENTS_DELETE the backend returns 403 with success:
+    // false but apiClient does NOT throw, so the optimistic local-filter ran
+    // anyway and the next refresh brought the alarm back — looked like a
+    // flaky UI. Same fix shape as ANPR / Person delete.
     if (!window.confirm("Bạn có chắc chắn muốn xóa sự kiện cảnh báo này?")) return;
     try {
-      await apiClient.deleteEvent(id);
-      setSelectedAlarm(null);
-      setAlarms(alarms.filter(a => a.id !== id));
+      const res = await apiClient.deleteEvent(id);
+      if (res?.success) {
+        setSelectedAlarm(null);
+        setAlarms(alarms.filter(a => a.id !== id));
+      } else if (res?.status === 403) {
+        alert("Bạn không có quyền xóa cảnh báo.");
+      } else if (res?.status === 401) {
+        alert("Phiên đăng nhập đã hết hạn.");
+      } else {
+        alert("Xóa thất bại: " + (res?.error || "Lỗi không xác định"));
+      }
     } catch (e) {
-      alert("Lỗi khi xóa sự kiện!");
+      alert("Lỗi kết nối khi xóa.");
     }
   };
 
@@ -333,7 +351,32 @@ const AlarmsView = () => {
                      <div style={{fontSize:'12px', color:'var(--accent3)', fontFamily:"'Share Tech Mono',monospace"}}>{selectedAlarm.confidence}%</div>
                    </div>
                  )}
-                 
+
+                 {selectedAlarm.reid_global_id != null && (
+                   <div>
+                     <div style={{fontSize:'10px', color:'var(--text-dim)', letterSpacing:'1px', marginBottom:'4px'}}>NHẬN DẠNG ReID (CROSS-CAMERA)</div>
+                     <a
+                       href={`/api/reid/trail/${selectedAlarm.reid_global_id}`}
+                       target="_blank"
+                       rel="noopener noreferrer"
+                       title="Xem hành trình của người này qua các camera"
+                       style={{
+                         display: 'inline-flex', alignItems: 'center', gap: 6,
+                         fontSize: '12px', color: 'var(--accent2, #b87aff)',
+                         fontFamily: "'Share Tech Mono',monospace",
+                         padding: '4px 10px',
+                         background: 'rgba(184,122,255,0.10)',
+                         border: '1px solid rgba(184,122,255,0.35)',
+                         borderRadius: '4px',
+                         textDecoration: 'none',
+                         cursor: 'pointer',
+                       }}
+                     >
+                       Người #{selectedAlarm.reid_global_id} → Xem hành trình
+                     </a>
+                   </div>
+                 )}
+
                  <div style={{flex:1}}></div>
                  
                  {/* Actions */}

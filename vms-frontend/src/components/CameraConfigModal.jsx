@@ -41,6 +41,26 @@ const CameraConfigModal = ({ onClose, initialData }) => {
     site_id: initialData?.site_id || -1
   });
 
+  // Hardware event-subscription health snapshot (ONVIF PullPoint / Axis
+  // eventfeed / Dahua attach / Hanwha poll / Hikvision adapter). Only
+  // meaningful when editing an existing camera; new cameras have no
+  // CameraEventService session yet. Polled every 5s while the modal is open.
+  // See backend endpoint added in closeouts_bundle_2026_05_12.
+  const [subStatus, setSubStatus] = useState(null);
+  useEffect(() => {
+    if (!initialData?.id) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await apiClient.getEventSubscriptionStatus?.(initialData.id);
+        if (!cancelled && res?.success) setSubStatus(res.data || null);
+      } catch (_) { /* ignore */ }
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [initialData?.id]);
+
   useEffect(() => {
     if (initialData && initialData.rtsp_url) {
       const parsed = parseRtspUrl(initialData.rtsp_url);
@@ -501,6 +521,56 @@ const CameraConfigModal = ({ onClose, initialData }) => {
                </div>
             </div>
             
+            {/* Hardware event subscription status — only shown when editing
+                an existing camera. Operators use this to distinguish "scene
+                quiet" from "subscription wedged" without tail-ing logs. */}
+            {initialData?.id && subStatus && subStatus.listening && (() => {
+              const stateColor = {
+                active:  'var(--accent3, #32e827)',
+                pending: 'var(--accent, #00c8f5)',
+                failed:  'var(--danger, #ff3060)',
+                stopped: 'var(--text-dim)',
+              }[subStatus.state] || 'var(--text-dim)';
+              const stateLabel = {
+                active:  'ĐANG NHẬN',
+                pending: 'ĐANG KẾT NỐI',
+                failed:  'MẤT KẾT NỐI',
+                stopped: 'TẮT',
+              }[subStatus.state] || subStatus.state?.toUpperCase();
+              const fmtSec = (s) => {
+                if (s == null || s < 0) return '—';
+                if (s < 60) return `${s}s`;
+                if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
+                return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+              };
+              return (
+                <div style={{
+                  marginTop: 12, padding: 10,
+                  background: 'rgba(0,200,245,0.04)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4, fontSize: 11,
+                }}>
+                  <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom: 6}}>
+                    <span style={{color:'var(--text-secondary)', letterSpacing:'1px'}}>HARDWARE EVENT SUB ({subStatus.brand || 'unknown'})</span>
+                    <span style={{
+                      padding:'2px 8px', borderRadius:'3px',
+                      background:`${stateColor}22`, color:stateColor,
+                      fontFamily:"'Share Tech Mono',monospace", fontWeight:700,
+                    }}>{stateLabel}</span>
+                  </div>
+                  <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:4, fontFamily:"'Share Tech Mono',monospace", color:'var(--text-primary)'}}>
+                    <span>Sự kiện đã nhận: <b>{subStatus.total_events ?? 0}</b></span>
+                    <span>Lần kết nối lại: <b>{subStatus.reconnect_count ?? 0}</b></span>
+                    <span>Cuối cùng nhận: <b>{fmtSec(subStatus.seconds_since_event)}</b> trước</span>
+                    <span style={{color:'var(--text-dim)'}}>
+                      {subStatus.state === 'failed' && 'Đang thử kết nối lại sau 5s…'}
+                      {subStatus.state === 'active' && subStatus.total_events === 0 && 'Chưa có sự kiện'}
+                    </span>
+                  </div>
+                </div>
+              );
+            })()}
+
             <div style={{marginTop:'auto', paddingTop:'20px', display:'flex', gap:'10px'}}>
                 <button onClick={onClose} disabled={loading || deepScanning} style={{flex:1, padding:'10px', background:'transparent', border:'1px solid var(--border)', color:'var(--text-secondary)', cursor:'pointer', fontWeight:'bold', borderRadius:'4px'}}>HỦY BỎ</button>
                 <button onClick={handleSave} disabled={loading || deepScanning} style={{flex:1, padding:'10px', background:loading ? '#333' : 'var(--accent)', border:'none', color:'#000', fontWeight:'bold', cursor:loading ? 'wait' : 'pointer', borderRadius:'4px', boxShadow:'0 0 10px rgba(0,200,245,0.4)'}}>

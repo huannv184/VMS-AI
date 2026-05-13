@@ -102,10 +102,20 @@ const VideoWallView = () => {
   };
 
   const deleteLayout = async (id) => {
+    // Pre-fix had no else branch — a 403 from VIDEOWALL_DELETE silently
+    // failed and the UI looked frozen on that row. Match the AlarmsView /
+    // ANPR / Person fix shape.
+    if (!window.confirm('Xóa layout videowall này?')) return;
     const res = await apiClient.deleteVideoWallLayout?.(id);
     if (res?.success) {
       setLayouts(prev => prev.filter(l => l.id !== id));
       if (activeLayoutId === id) setActiveLayoutId(null);
+    } else if (res?.status === 403) {
+      alert('Bạn không có quyền xóa layout videowall.');
+    } else if (res?.status === 401) {
+      alert('Phiên đăng nhập đã hết hạn.');
+    } else {
+      alert('Xóa layout thất bại: ' + (res?.error || 'Lỗi không xác định'));
     }
   };
 

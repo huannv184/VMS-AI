@@ -19,6 +19,7 @@ const useWebSocket = () => {
 
   const addFace           = useVmsStore((s) => s.addFace);
   const addAlarm          = useVmsStore((s) => s.addAlarm);
+  const addLpr            = useVmsStore((s) => s.addLpr);
   const setCounts         = useVmsStore((s) => s.setCounts);
   const updateLineCrossing= useVmsStore((s) => s.updateLineCrossing);
   const setIsConnected    = useVmsStore((s) => s.setIsConnected);
@@ -109,6 +110,24 @@ const useWebSocket = () => {
         case 'detection':
         case 'alert':
         case 'event':
+          // LPR alerts get routed to the plate gallery (real-time prepend on
+          // AnalyticsView) instead of the generic alarms list. Backend
+          // shape: {event_type:"LPR", plate, confidence, camera_id, snapshot_url, timestamp}
+          // from AiEventProcessor::processLicensePlate + ZmqEventBridge::handleLpr.
+          if (payload.event_type === 'LPR' && payload.plate) {
+            addLpr({
+              id: payload.id || `${Date.now()}-${++alarmIdCounter.current}`,
+              plate_number: payload.plate,
+              camera_id:    payload.camera_id,
+              confidence:   payload.confidence || 0,
+              image_path:   payload.snapshot_url || '',
+              detected_at:  payload.timestamp || Math.floor(Date.now() / 1000),
+              vehicle_type: payload.vehicle_type || 'unknown',
+              color:        payload.color || '',
+            });
+            break;
+          }
+
           addAlarm({
             // Date.now() ties at sub-ms when bursty events arrive in the same tick.
             // Combine with a per-message counter to keep React keys unique.
@@ -204,7 +223,7 @@ const useWebSocket = () => {
       console.error('[WS] error — URL was:', wsUrl, err);
       setIsConnected(false);
     };
-  }, [addFace, addAlarm, disconnect, setCounts, updateLineCrossing, setIsConnected]);
+  }, [addFace, addAlarm, addLpr, disconnect, setCounts, updateLineCrossing, setIsConnected]);
 
   useEffect(() => {
     connectRef.current = connect;

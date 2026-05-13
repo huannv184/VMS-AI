@@ -976,11 +976,25 @@ const SettingsView = () => {
                           <button className="grid-btn" style={{flex:1}} onClick={() => setZoneCameraPickerOpen(true)}>
                             ⚙ VÙNG ROI
                           </button>
-                          <button className="grid-btn" style={{padding:'5px 8px', color:'var(--danger)', border:'1px solid rgba(255,48,96,0.3)'}} onClick={() => {
-                            if (window.confirm('Xóa quy tắc này?')) {
-                              apiClient.deleteRule(rule.rule_id).then(res => {
-                                if (res.success) refreshRules();
-                              });
+                          <button className="grid-btn" style={{padding:'5px 8px', color:'var(--danger)', border:'1px solid rgba(255,48,96,0.3)'}} onClick={async () => {
+                            // Pre-fix only refreshed on success, no feedback on 403 →
+                            // user clicked X, nothing visibly changed, no idea whether
+                            // it failed. Mirror the ANPR / Person fix shape.
+                            if (!window.confirm('Xóa quy tắc này?')) return;
+                            try {
+                              const res = await apiClient.deleteRule(rule.rule_id);
+                              if (res?.success) {
+                                refreshRules();
+                                showToast('Đã xóa quy tắc', 'success');
+                              } else if (res?.status === 403) {
+                                showToast('Bạn không có quyền xóa quy tắc.', 'error');
+                              } else if (res?.status === 401) {
+                                showToast('Phiên đăng nhập đã hết hạn.', 'error');
+                              } else {
+                                showToast(res?.error || 'Xóa quy tắc thất bại', 'error');
+                              }
+                            } catch (e) {
+                              showToast('Lỗi kết nối khi xóa quy tắc', 'error');
                             }
                           }}>✕</button>
                         </div>
@@ -1369,10 +1383,24 @@ const SettingsView = () => {
                             setEditingZone(zone);
                             setEditingCameraForZone(zone.camera_id);
                         }}>SỬA VÙNG</button>
-                        <button className="grid-btn danger" style={{padding:'5px', color:'var(--danger)'}} onClick={() => {
-                           apiClient.deleteZone(zone.zone_id).then((res) => {
-                             if (res.success) refreshZones();
-                           });
+                        <button className="grid-btn danger" style={{padding:'5px', color:'var(--danger)'}} onClick={async () => {
+                          // Pre-fix swallowed 403 — same shape as deleteRule above.
+                          if (!window.confirm('Xóa vùng ROI này?')) return;
+                          try {
+                            const res = await apiClient.deleteZone(zone.zone_id);
+                            if (res?.success) {
+                              refreshZones();
+                              showToast('Đã xóa vùng', 'success');
+                            } else if (res?.status === 403) {
+                              showToast('Bạn không có quyền xóa vùng.', 'error');
+                            } else if (res?.status === 401) {
+                              showToast('Phiên đăng nhập đã hết hạn.', 'error');
+                            } else {
+                              showToast(res?.error || 'Xóa vùng thất bại', 'error');
+                            }
+                          } catch (e) {
+                            showToast('Lỗi kết nối khi xóa vùng', 'error');
+                          }
                         }}>XÓA</button>
                     </div>
                   </div>

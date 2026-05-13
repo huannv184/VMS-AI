@@ -100,13 +100,27 @@ const FaceIdView = () => {
   };
 
   const handleDelete = async (id) => {
+    // Same shape as the AnalyticsView ANPR delete (FE-1 FIX 2026-05-09):
+    // checking only `try/catch` lets a 403 from FACE_DELETE permission gate
+    // pass silently — apiClient resolves with success:false rather than
+    // throwing, so the UI cleared the person locally + refresh brought it
+    // back. Now the result envelope is inspected and 403/401 surface a
+    // user-readable message before any state mutation.
     if (!window.confirm("Bạn có chắc chắn muốn xóa khuôn mặt này?")) return;
     try {
-      await apiClient.deletePerson(id);
-      setSelectedPerson(null);
-      fetchData();
-    } catch(e) {
-      alert("Xóa thất bại!");
+      const res = await apiClient.deletePerson(id);
+      if (res?.success) {
+        setSelectedPerson(null);
+        fetchData();
+      } else if (res?.status === 403) {
+        alert("Bạn không có quyền xóa khuôn mặt (cần quyền admin).");
+      } else if (res?.status === 401) {
+        alert("Phiên đăng nhập đã hết hạn.");
+      } else {
+        alert("Xóa thất bại: " + (res?.error || "Lỗi không xác định"));
+      }
+    } catch (e) {
+      alert("Lỗi kết nối khi xóa.");
     }
   };
 

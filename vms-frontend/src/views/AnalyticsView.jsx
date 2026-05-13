@@ -1,12 +1,18 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Download, Calendar, Search } from 'lucide-react';
 import apiClient from '../api/apiClient';
+import useVmsStore from '../store/useVmsStore';
 
 // eslint-disable-next-line no-unused-vars
 const API_BASE = ''; // Vite proxy forward đến :8000
 
 const AnalyticsView = () => {
-  const [lprData, setLprData] = useState([]);
+  // Plate gallery is now store-driven so the WS hook's addLpr() prepends
+  // surface here in real-time without a re-poll. `setLprData` is the initial
+  // hydrate (called from fetchData on mount); `addLpr` (WS hook) prepends
+  // new arrivals.
+  const lprData = useVmsStore((s) => s.lprData);
+  const setLprData = useVmsStore((s) => s.setLprData);
   const [lprSearch, setLprSearch] = useState('');
   
   // States to hold the raw backend data
@@ -62,22 +68,21 @@ const AnalyticsView = () => {
     fetchData();
   }, []);
 
-  const handleLprSearch = async () => {
-    // If the backend has a search API you can call it here.
-    // For now we simulate or refetch with no filter if empty
-    if (!lprSearch.trim()) {
-      const platesRes = await apiClient.getAnprPlates({ limit: 50 });
-      if (platesRes.success) {
-        const platesPayload = platesRes.data || {};
-        setLprData(platesPayload.plates || (Array.isArray(platesPayload) ? platesPayload : []));
-      }
-      return;
-    }
-    
-    // Simulate searching locally if backend doesn't support plate_number directly via param
-    const lowerSearch = lprSearch.toLowerCase();
-    const filtered = lprData.filter(p => p.plate_number && p.plate_number.toLowerCase().includes(lowerSearch));
-    setLprData(filtered);
+  // Filter is derived (useMemo) instead of mutating lprData so a destructive
+  // search doesn't wipe the WS-prepended live plates. handleLprSearch is kept
+  // as a no-op for the existing button binding — typing in the search box
+  // already filters via displayedPlates.
+  const displayedPlates = useMemo(() => {
+    const term = lprSearch.trim().toLowerCase();
+    if (!term) return lprData;
+    return lprData.filter((p) =>
+      p.plate_number && p.plate_number.toLowerCase().includes(term)
+    );
+  }, [lprData, lprSearch]);
+
+  const handleLprSearch = () => {
+    // No-op: search is reactive via displayedPlates. Kept so any onClick={}
+    // binding in the JSX still has a target.
   };
 
   // --------------------------------------------------------
@@ -327,7 +332,7 @@ const AnalyticsView = () => {
                 </tr>
               </thead>
               <tbody>
-                {lprData.map((lpr, idx) => (
+                {displayedPlates.map((lpr, idx) => (
                   <tr key={lpr.id || idx} style={{borderBottom:'1px dashed rgba(255,255,255,0.05)'}}>
                     <td style={{padding:'12px 8px', fontFamily:"'Share Tech Mono',monospace", color:'var(--text-secondary)'}}>
                       {lpr.detected_at || lpr.timestamp ? new Date((lpr.detected_at || lpr.timestamp) * 1000).toLocaleString('vi-VN') : '-'}
@@ -345,7 +350,7 @@ const AnalyticsView = () => {
                     </td>
                   </tr>
                 ))}
-                {lprData.length === 0 && (
+                {displayedPlates.length === 0 && (
                   <tr>
                     <td colSpan="6" style={{ textAlign: 'center', padding: '40px', color: 'var(--text-dim)' }}>
                       {loading ? <div className="ai-dot-spin" style={{margin:'0 auto'}}></div> : 'Không có dữ liệu nhận diện biển số nào'}

@@ -487,6 +487,24 @@ const apiClient = {
   deleteShift: (id) => apiClient.request(`/api/attendance/shifts/${id}`,
     { method: 'DELETE' }),
 
+  // ── Holidays (skip late/OT computation on holiday dates) ───────────────
+  getHolidays: (year) => apiClient.request(
+    `/api/attendance/holidays${year ? buildQuery({ year }) : ''}`),
+  getHoliday: (id) => apiClient.request(`/api/attendance/holidays/${id}`),
+  createHoliday: (data) => apiClient.request('/api/attendance/holidays',
+    { method: 'POST', body: JSON.stringify(data) }),
+  updateHoliday: (id, data) => apiClient.request(`/api/attendance/holidays/${id}`,
+    { method: 'PUT', body: JSON.stringify(data) }),
+  deleteHoliday: (id) => apiClient.request(`/api/attendance/holidays/${id}`,
+    { method: 'DELETE' }),
+
+  // ── Hardware event subscription health (per camera) ────────────────────
+  // Returns { listening, state, brand, total_events, reconnect_count,
+  // seconds_since_event, ... }. Surfaced by CameraConfigModal when editing
+  // an existing camera so operators can tell "scene quiet" from "wedged".
+  getEventSubscriptionStatus: (cameraId) => apiClient.request(
+    `/api/cameras/${cameraId}/event_subscription_status`),
+
   // ── Counter (counting lines) ───────────────────────────────────────────
   getCountingLines: (cameraId) => apiClient.request(
     `/api/counter/lines${cameraId ? buildQuery({ camera_id: cameraId }) : ''}`),
