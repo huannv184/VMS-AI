@@ -24,8 +24,13 @@ database:
 auth:
   enabled: true
   # SEC-C1: Set VMS_JWT_SECRET env var (min 32 chars) before deploying.
-  # This default will cause startup failure unless VMS_ALLOW_DEFAULT_SECRET=1 is set.
-  secret_key: "vms-ai-secret-key-for-local-development-testing-only-12345"
+  # This default value matches the sentinel in config.cpp::loadConfig (SEC-C1
+  # guard). Backend WILL refuse to start unless one of:
+  #   - VMS_JWT_SECRET=<32+ char random> is exported (production path), OR
+  #   - VMS_ALLOW_DEFAULT_SECRET=1 is exported (dev escape hatch, logs CRITICAL).
+  # Earlier this YAML drifted to "vms-ai-secret-key-for-local-development-..."
+  # which silently bypassed the guard because the sentinel string didn't match.
+  secret_key: "vms-ai-secret-key-change-me-in-production"
   algorithm: "HS256"
   token_expire_minutes: 480   # 8 hours — reduced from 7 days; revocation via token_version
   
