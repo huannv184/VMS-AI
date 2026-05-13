@@ -842,6 +842,41 @@ void DbManager::initializeTables(QSqlDatabase& primary) {
     safeAlterTable(primary, "ALTER TABLE shifts ADD COLUMN ot_max_minutes INTEGER NOT NULL DEFAULT 720", "shifts.ot_max_minutes");
 
     // =========================================================
+    // 16b. HOLIDAYS (Lịch nghỉ — tắt tính trễ cho ngày trong bảng)
+    //
+    // Per-date holiday calendar. queryAttendanceForDate looks up the row for
+    // the requested date and, when present, sets is_holiday=true on every
+    // employee's rollup + skips late_minutes / OT computation (presence on a
+    // holiday is recorded but doesn't count against the operator's late
+    // metric). Punted from the 2026-05-03 shifts pass; landed 2026-05-12.
+    //
+    // V1: exact-date matches only (one row per holiday per year). Recurring
+    // annual holidays (e.g. Tết Dương lịch 1/1) get duplicated rows each
+    // year — operators pre-load the next year's calendar in advance. A
+    // future `recurring` flag matching by MM-DD is documented in the
+    // holidays_calendar memory note.
+    // =========================================================
+    const std::string sql_holidays = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS holidays (
+            id SERIAL PRIMARY KEY,
+            date TEXT NOT NULL UNIQUE,            -- 'YYYY-MM-DD'
+            name TEXT NOT NULL,                   -- 'Tết Dương lịch', 'Quốc khánh', ...
+            description TEXT,                     -- optional notes / nghị định ref
+            created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()))
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS holidays (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            description TEXT,
+            created_at INTEGER DEFAULT (strftime('%s','now'))
+        );
+    )";
+    if (!executeOnConnection(primary, sql_holidays)) LOG_ERROR("Failed to create holidays table");
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_holidays_date ON holidays(date)");
+
+    // =========================================================
     // 17. EMPLOYEES (Liên kết người trong face DB → mã nhân viên + ca)
     // =========================================================
     const std::string sql_employees = (config_.driver == "postgresql") ? R"(

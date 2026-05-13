@@ -63,13 +63,19 @@ const AttendanceView = () => {
 
   // Derived stats — uses backend-computed is_late which honours each
   // employee's assigned shift (start_time + grace_min). Records with no shift
-  // assignment have is_late=null and are bucketed as "unscheduled".
+  // assignment have is_late=null and are bucketed as "unscheduled". Records
+  // on a holiday date (is_holiday=true) skip the late/onTime buckets entirely;
+  // the late/onTime metric would otherwise misrepresent a holiday-with-punches
+  // as a perfect-attendance day.
   const stats = useMemo(() => {
     let late = 0;
     let onTime = 0;
     let unscheduled = 0;
+    let holiday = 0;
     attendanceData.forEach(record => {
-      if (record.is_late === null || record.is_late === undefined) {
+      if (record.is_holiday) {
+        holiday++;
+      } else if (record.is_late === null || record.is_late === undefined) {
         unscheduled++;
       } else if (record.is_late) {
         late++;
@@ -77,7 +83,7 @@ const AttendanceView = () => {
         onTime++;
       }
     });
-    return { total: attendanceData.length, present: attendanceData.length, late, onTime, unscheduled };
+    return { total: attendanceData.length, present: attendanceData.length, late, onTime, unscheduled, holiday };
   }, [attendanceData]);
 
   const filteredData = useMemo(() => {
@@ -262,12 +268,19 @@ const AttendanceView = () => {
                    const diffHours = Math.floor(diffMs / 3600000);
                    const diffMins = Math.floor((diffMs % 3600000) / 60000);
 
-                   // Status priority: missing checkout > severe-late > late > on-time > unscheduled.
+                   // Status priority: holiday > missing checkout > severe-late > late > on-time > unscheduled.
+                   // Holiday short-circuits everything because the operator
+                   // explicitly marked the day as non-counting — late/OT are
+                   // null in that case (skipped server-side too).
                    // is_late / is_late_severe come from backend (per-employee shift); null when
                    // no shift is assigned to the employee.
                    const hasShift = record.is_late !== null && record.is_late !== undefined;
+                   const isHoliday = !!record.is_holiday;
                    let statusLabel, statusClass;
-                   if (diffMs === 0) {
+                   if (isHoliday) {
+                     statusLabel = record.holiday_name ? `Ngày lễ – ${record.holiday_name}` : 'Ngày lễ';
+                     statusClass = 'active';
+                   } else if (diffMs === 0) {
                      statusLabel = 'Thiếu Check-out';
                      statusClass = 'danger';
                    } else if (!hasShift) {

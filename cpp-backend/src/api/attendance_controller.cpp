@@ -225,6 +225,25 @@ json queryAttendanceForDate(QSqlDatabase& db, const std::string& date_str) {
     json out = json::array();
     const bool is_pg = vms::Config::getInstance().getDatabaseConfig().driver == "postgresql";
 
+    // Holiday lookup. When the requested date is in the holidays table we
+    // still compute the per-employee aggregation (operators want to see who
+    // came in on a holiday), but we mark the rollup row `is_holiday=true` and
+    // skip late_minutes / OT computation. Coming in on a holiday is not "late"
+    // — it's a separate accounting concept (operators might pay holiday rate
+    // or compensate-with-day-off, but that's an HRIS concern, not a tardiness
+    // metric). Punted from the 2026-05-03 shifts pass; landed 2026-05-12.
+    std::string holiday_name;
+    bool is_holiday = false;
+    {
+        QSqlQuery hq(db);
+        hq.prepare("SELECT name FROM holidays WHERE date = ?");
+        hq.bindValue(0, QString::fromStdString(date_str));
+        if (hq.exec() && hq.next()) {
+            is_holiday = true;
+            holiday_name = hq.value(0).toString().toStdString();
+        }
+    }
+
     // Day boundaries in local time → epoch seconds.
     // We compute the bounds in C++ (rather than relying on DB timezone) so
     // SQLite and Postgres behave identically.
@@ -386,28 +405,38 @@ json queryAttendanceForDate(QSqlDatabase& db, const std::string& date_str) {
         json is_late_severe_v = nullptr;
         json overtime_minutes_v = nullptr;
         json has_overtime_v = nullptr;
-        if (a.has_shift && ci_s > 0 && isValidHmTime(a.shift_start_hm)) {
-            const int shift_min = hmToMinutes(a.shift_start_hm);
-            const int late = lateMinutesForPunch(
-                static_cast<std::time_t>(ci_s),
-                a.shift_date_midnight, shift_min, a.shift_grace);
-            late_minutes_v   = late;
-            is_late_v        = late > 0;
-            is_late_severe_v = late >= a.shift_late_thr;
-        }
-        // OT: requires usable check-out punch + valid shift end_time_hm.
-        // Worker who only punched once (max_ts==min_ts) yields delta<0 and
-        // overtimeMinutesForPunch returns 0 — no false OT.
-        if (a.has_shift && co_s > 0 &&
-            isValidHmTime(a.shift_start_hm) && isValidHmTime(a.shift_end_hm)) {
-            const int sm = hmToMinutes(a.shift_start_hm);
-            const int em = hmToMinutes(a.shift_end_hm);
-            const int ot = overtimeMinutesForPunch(
-                static_cast<std::time_t>(co_s),
-                a.shift_date_midnight, sm, em,
-                a.ot_grace, a.ot_min, a.ot_max);
-            overtime_minutes_v = ot;
-            has_overtime_v     = ot > 0;
+        // Holiday short-circuit: leave late/OT fields null + is_late=false so
+        // the UI badge logic treats this row as "On holiday" rather than the
+        // ambiguous "Unscheduled" bucket (a person without an assigned shift
+        // also has null late_minutes — without is_holiday we couldn't
+        // distinguish the two cases).
+        if (is_holiday) {
+            is_late_v = false;
+            is_late_severe_v = false;
+        } else {
+            if (a.has_shift && ci_s > 0 && isValidHmTime(a.shift_start_hm)) {
+                const int shift_min = hmToMinutes(a.shift_start_hm);
+                const int late = lateMinutesForPunch(
+                    static_cast<std::time_t>(ci_s),
+                    a.shift_date_midnight, shift_min, a.shift_grace);
+                late_minutes_v   = late;
+                is_late_v        = late > 0;
+                is_late_severe_v = late >= a.shift_late_thr;
+            }
+            // OT: requires usable check-out punch + valid shift end_time_hm.
+            // Worker who only punched once (max_ts==min_ts) yields delta<0 and
+            // overtimeMinutesForPunch returns 0 — no false OT.
+            if (a.has_shift && co_s > 0 &&
+                isValidHmTime(a.shift_start_hm) && isValidHmTime(a.shift_end_hm)) {
+                const int sm = hmToMinutes(a.shift_start_hm);
+                const int em = hmToMinutes(a.shift_end_hm);
+                const int ot = overtimeMinutesForPunch(
+                    static_cast<std::time_t>(co_s),
+                    a.shift_date_midnight, sm, em,
+                    a.ot_grace, a.ot_min, a.ot_max);
+                overtime_minutes_v = ot;
+                has_overtime_v     = ot > 0;
+            }
         }
 
         out.push_back({
@@ -434,7 +463,9 @@ json queryAttendanceForDate(QSqlDatabase& db, const std::string& date_str) {
             {"is_late",           is_late_v},
             {"is_late_severe",    is_late_severe_v},
             {"overtime_minutes",  overtime_minutes_v},
-            {"has_overtime",      has_overtime_v}
+            {"has_overtime",      has_overtime_v},
+            {"is_holiday",        is_holiday},
+            {"holiday_name",      holiday_name}
         });
     }
 
@@ -504,7 +535,7 @@ std::string buildCsv(const json& rows) {
     std::stringstream ss;
     ss << "\xEF\xBB\xBF"; // UTF-8 BOM for Excel
     ss << "Mã NV,Họ tên,Phòng ban,Ca,Giờ vào ca,Check-in,Check-out,"
-          "Trễ (phút),Trạng thái,OT (phút),Số lần chấm,Nguồn\n";
+          "Trễ (phút),Trạng thái,OT (phút),Ngày lễ,Số lần chấm,Nguồn\n";
     for (const auto& r : rows) {
         const auto fmt_ts = [](int64_t ms) -> std::string {
             if (ms <= 0) return "";
@@ -515,13 +546,16 @@ std::string buildCsv(const json& rows) {
             return std::string(buf);
         };
 
-        // late_minutes is nullable (no shift assigned, or no check-in).  Render
-        // empty cell rather than "0" so Excel filters distinguish "on time" vs
-        // "no shift configured".
+        // late_minutes is nullable (no shift assigned, no check-in, or holiday).
+        // Render empty cell rather than "0" so Excel filters distinguish
+        // "on time" vs "no shift configured" vs "holiday".
         std::string late_cell;
         std::string status_cell;
+        const bool is_holiday = r.value("is_holiday", false);
         const auto& lm = r.contains("late_minutes") ? r["late_minutes"] : json(nullptr);
-        if (lm.is_number_integer()) {
+        if (is_holiday) {
+            status_cell = "Ngày lễ";  // holiday short-circuit wins over all
+        } else if (lm.is_number_integer()) {
             late_cell = std::to_string(lm.get<int>());
             const bool severe = r.value("is_late_severe", false);
             const bool late   = r.value("is_late", false);
@@ -529,6 +563,7 @@ std::string buildCsv(const json& rows) {
         } else {
             status_cell = "Chưa gán ca";
         }
+        const std::string holiday_name = r.value("holiday_name", std::string{});
 
         // overtime_minutes mirrors late_minutes — nullable, empty cell keeps
         // Excel filters honest ("not configured" vs "0 OT").
@@ -546,6 +581,7 @@ std::string buildCsv(const json& rows) {
            << "\"" << late_cell   << "\","
            << "\"" << status_cell << "\","
            << "\"" << ot_cell     << "\","
+           << "\"" << holiday_name << "\","
            << r.value("count", 0) << ","
            << "\"" << r.value("source", "") << "\"\n";
     }
@@ -582,7 +618,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             json rows = queryAttendanceForDate(db, date_str);
             return ApiUtils::createResponse({{"attendance", rows}, {"date", date_str}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -617,7 +653,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             res.add_header("Access-Control-Allow-Origin", origin.empty() ? "*" : origin);
             return res;
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -654,7 +690,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"queued", true}, {"timestamp", ts_s}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 
@@ -729,7 +765,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(
                 {{"id", q.lastInsertId().toInt()}, {"person_id", person_id}}, 201, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -798,7 +834,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             vms::core::AttendanceTracker::getInstance().reloadEmployees();
             return ApiUtils::createResponse({{"updated", true}, {"id", id}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -861,7 +897,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             vms::core::AttendanceTracker::getInstance().reloadCameraRoles();
             return ApiUtils::createResponse({{"camera_id", camera_id}, {"role", role}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -1005,7 +1041,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             const int new_id = q.lastInsertId().toInt();
             return ApiUtils::createResponse({{"id", new_id}, {"name", name}}, 201, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -1195,7 +1231,219 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"updated", true}, {"id", id}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
+        }
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // GET/POST /api/attendance/holidays
+    //   GET  → list (optional ?year=YYYY filter; defaults to all dates)
+    //   POST → create. Admin only.
+    // Validates `date` strictly as YYYY-MM-DD; rejects duplicates with 409.
+    // Holiday calendar is consulted by queryAttendanceForDate which sets
+    // `is_holiday=true` on the day's rollup + skips late_minutes / OT calc.
+    // ─────────────────────────────────────────────────────────────────────
+    CROW_ROUTE(app, "/api/attendance/holidays")
+    .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Post, crow::HTTPMethod::Options)
+    ([&app](const crow::request& req) {
+        const std::string origin = ApiUtils::resolveCorsOrigin(req);
+        if (req.method == crow::HTTPMethod::Options) {
+            return ApiUtils::createResponse(json::object(), 204, origin);
+        }
+        if (req.method == crow::HTTPMethod::Get) {
+            if (auto err = requireAttendanceRead(app, req, origin)) return std::move(*err);
+        }
+
+        try {
+            auto db = vms::database::DbManager::getInstance().getThreadConnection();
+            if (!db.isValid() || !db.isOpen()) {
+                return ApiUtils::createErrorResponse("Database unavailable", 503, origin);
+            }
+
+            if (req.method == crow::HTTPMethod::Get) {
+                // ?year=YYYY filters to a single year. Without it we return
+                // everything so the admin UI can show multi-year history.
+                const char* year_param = req.url_params.get("year");
+                QSqlQuery q(db);
+                if (year_param) {
+                    std::string year_s = year_param;
+                    // Strict 4-digit year guard — `date LIKE '2026%'` would
+                    // also match malformed rows that shouldn't be there but
+                    // we defend against bad input regardless.
+                    if (year_s.size() != 4 ||
+                        !std::all_of(year_s.begin(), year_s.end(),
+                                     [](char c) { return c >= '0' && c <= '9'; })) {
+                        return ApiUtils::createErrorResponse("year must be 4 digits", 400, origin);
+                    }
+                    q.prepare("SELECT id, date, name, description "
+                              "FROM holidays WHERE date LIKE ? "
+                              "ORDER BY date ASC");
+                    q.bindValue(0, QString::fromStdString(year_s + "%"));
+                } else {
+                    q.prepare("SELECT id, date, name, description "
+                              "FROM holidays ORDER BY date ASC");
+                }
+                if (!q.exec()) {
+                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                }
+                json arr = json::array();
+                while (q.next()) {
+                    arr.push_back({
+                        {"id",          q.value(0).toInt()},
+                        {"date",        q.value(1).toString().toStdString()},
+                        {"name",        q.value(2).toString().toStdString()},
+                        {"description", q.value(3).isNull() ? "" : q.value(3).toString().toStdString()}
+                    });
+                }
+                return ApiUtils::createResponse({{"holidays", arr}}, 200, origin);
+            }
+
+            // POST → create. Admin only.
+            if (auto err = requireAttendanceAdmin(app, req, origin)) return std::move(*err);
+
+            auto body = json::parse(req.body);
+            const std::string date = body.value("date", std::string{});
+            const std::string name = body.value("name", std::string{});
+            const std::string desc = body.value("description", std::string{});
+
+            if (!isValidIsoDate(date)) {
+                return ApiUtils::createErrorResponse("date must be YYYY-MM-DD", 400, origin);
+            }
+            if (name.empty() || name.size() > 200) {
+                return ApiUtils::createErrorResponse("name required (1..200 chars)", 400, origin);
+            }
+            if (desc.size() > 500) {
+                return ApiUtils::createErrorResponse("description too long (max 500 chars)", 400, origin);
+            }
+
+            QSqlQuery q(db);
+            q.prepare("INSERT INTO holidays (date, name, description) VALUES (?, ?, ?)");
+            q.bindValue(0, QString::fromStdString(date));
+            q.bindValue(1, QString::fromStdString(name));
+            q.bindValue(2, desc.empty() ? QVariant() : QVariant(QString::fromStdString(desc)));
+
+            if (!q.exec()) {
+                const std::string msg = q.lastError().text().toStdString();
+                if (msg.find("UNIQUE") != std::string::npos ||
+                    msg.find("unique") != std::string::npos ||
+                    msg.find("duplicate key") != std::string::npos) {
+                    return ApiUtils::createErrorResponse("holiday on this date already exists", 409, origin);
+                }
+                return ApiUtils::createErrorResponse(msg, 500, origin);
+            }
+
+            const int new_id = q.lastInsertId().toInt();
+            return ApiUtils::createResponse({
+                {"id", new_id}, {"date", date}, {"name", name}
+            }, 201, origin);
+        } catch (const std::exception& e) {
+            return ApiUtils::createSafeError(e, 500, origin);
+        }
+    });
+
+    // GET/PUT/DELETE /api/attendance/holidays/<int>
+    // DELETE is hard-delete (no FK references; safe). Soft-delete pattern
+    // from shifts doesn't apply — holidays don't anchor historical rows the
+    // way shift_id does in attendance_events.
+    CROW_ROUTE(app, "/api/attendance/holidays/<int>")
+    .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Put,
+             crow::HTTPMethod::Delete, crow::HTTPMethod::Options)
+    ([&app](const crow::request& req, int id) {
+        const std::string origin = ApiUtils::resolveCorsOrigin(req);
+        if (req.method == crow::HTTPMethod::Options) {
+            return ApiUtils::createResponse(json::object(), 204, origin);
+        }
+        if (req.method == crow::HTTPMethod::Get) {
+            if (auto err = requireAttendanceRead(app, req, origin)) return std::move(*err);
+        } else {
+            if (auto err = requireAttendanceAdmin(app, req, origin)) return std::move(*err);
+        }
+
+        try {
+            auto db = vms::database::DbManager::getInstance().getThreadConnection();
+            if (!db.isValid() || !db.isOpen()) {
+                return ApiUtils::createErrorResponse("Database unavailable", 503, origin);
+            }
+
+            if (req.method == crow::HTTPMethod::Get) {
+                QSqlQuery q(db);
+                q.prepare("SELECT id, date, name, description FROM holidays WHERE id = ?");
+                q.bindValue(0, id);
+                if (!q.exec()) {
+                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                }
+                if (!q.next()) {
+                    return ApiUtils::createErrorResponse("holiday not found", 404, origin);
+                }
+                return ApiUtils::createResponse({
+                    {"id",          q.value(0).toInt()},
+                    {"date",        q.value(1).toString().toStdString()},
+                    {"name",        q.value(2).toString().toStdString()},
+                    {"description", q.value(3).isNull() ? "" : q.value(3).toString().toStdString()}
+                }, 200, origin);
+            }
+
+            if (req.method == crow::HTTPMethod::Delete) {
+                QSqlQuery q(db);
+                q.prepare("DELETE FROM holidays WHERE id = ?");
+                q.bindValue(0, id);
+                if (!q.exec()) {
+                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                }
+                if (q.numRowsAffected() == 0) {
+                    return ApiUtils::createErrorResponse("holiday not found", 404, origin);
+                }
+                return ApiUtils::createResponse({{"deleted", true}, {"id", id}}, 200, origin);
+            }
+
+            // PUT — partial update via COALESCE-style guards.
+            auto body = json::parse(req.body);
+            if (body.contains("date")) {
+                if (!body["date"].is_string() || !isValidIsoDate(body["date"].get<std::string>())) {
+                    return ApiUtils::createErrorResponse("date must be YYYY-MM-DD", 400, origin);
+                }
+            }
+            if (body.contains("name")) {
+                if (!body["name"].is_string() ||
+                    body["name"].get<std::string>().empty() ||
+                    body["name"].get<std::string>().size() > 200) {
+                    return ApiUtils::createErrorResponse("name must be 1..200 chars", 400, origin);
+                }
+            }
+            if (body.contains("description")) {
+                if (!body["description"].is_string() ||
+                    body["description"].get<std::string>().size() > 500) {
+                    return ApiUtils::createErrorResponse("description too long (max 500 chars)", 400, origin);
+                }
+            }
+
+            QSqlQuery q(db);
+            q.prepare(
+                "UPDATE holidays SET "
+                "  date = COALESCE(?, date), "
+                "  name = COALESCE(?, name), "
+                "  description = COALESCE(?, description) "
+                "WHERE id = ?");
+            q.bindValue(0, body.contains("date") ? QVariant(QString::fromStdString(body["date"].get<std::string>())) : QVariant());
+            q.bindValue(1, body.contains("name") ? QVariant(QString::fromStdString(body["name"].get<std::string>())) : QVariant());
+            q.bindValue(2, body.contains("description") ? QVariant(QString::fromStdString(body["description"].get<std::string>())) : QVariant());
+            q.bindValue(3, id);
+
+            if (!q.exec()) {
+                const std::string msg = q.lastError().text().toStdString();
+                if (msg.find("UNIQUE") != std::string::npos ||
+                    msg.find("unique") != std::string::npos ||
+                    msg.find("duplicate key") != std::string::npos) {
+                    return ApiUtils::createErrorResponse("another holiday already exists on this date", 409, origin);
+                }
+                return ApiUtils::createErrorResponse(msg, 500, origin);
+            }
+            if (q.numRowsAffected() == 0) {
+                return ApiUtils::createErrorResponse("holiday not found", 404, origin);
+            }
+            return ApiUtils::createResponse({{"updated", true}, {"id", id}}, 200, origin);
+        } catch (const std::exception& e) {
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 

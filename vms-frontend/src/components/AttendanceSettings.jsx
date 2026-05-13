@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { UserPlus, Trash2, Save, RefreshCw, Heart, Edit2, Clock, Plus } from 'lucide-react';
+import { UserPlus, Trash2, Save, RefreshCw, Heart, Edit2, Clock, Plus, Calendar } from 'lucide-react';
 import apiClient from '../api/apiClient';
 
 const ROLE_OPTIONS = [
@@ -33,26 +33,35 @@ const AttendanceSettings = ({ cameras = [], onToast = () => {} }) => {
   const [editingShift, setEditingShift] = useState(null);
   const [draftShift,   setDraftShift]   = useState(EMPTY_SHIFT_DRAFT);
 
+  // Holidays — minimal CRUD (list + add + delete). Edit-in-place punted; ops
+  // can delete + re-add for the rare correction case.
+  const todayIso = () => new Date().toISOString().slice(0, 10);
+  const [holidays, setHolidays] = useState([]);
+  const [draftHoliday, setDraftHoliday] = useState({ date: todayIso(), name: '', description: '' });
+  const [holidayYear, setHolidayYear] = useState(new Date().getFullYear());
+
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       // include_inactive=true so admins can see and re-activate disabled shifts.
-      const [emp, sh, roles, hp] = await Promise.all([
+      const [emp, sh, roles, hp, hd] = await Promise.all([
         apiClient.getAttendanceEmployees(),
         apiClient.getShifts(true),
         apiClient.getCameraRoles(),
         apiClient.getAttendanceHealth(),
+        apiClient.getHolidays(holidayYear),
       ]);
       if (emp.success)   setEmployees(emp.data?.employees || []);
       if (sh.success)    setShifts(sh.data?.shifts || []);
       if (roles.success) setCameraRoles(roles.data?.camera_roles || []);
       if (hp.success)    setHealth(hp.data || { pending_rows: 0, dropped_rows: 0 });
+      if (hd.success)    setHolidays(hd.data?.holidays || []);
     } catch (e) {
       console.error('AttendanceSettings refresh failed', e);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [holidayYear]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -527,6 +536,118 @@ const AttendanceSettings = ({ cameras = [], onToast = () => {} }) => {
                 )}
               </tr>
             ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ── Holidays (lịch nghỉ — tắt tính trễ/OT) ──────────────────────── */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <div className="config-section-title" style={{ marginBottom: 0 }}>
+          <Calendar size={12} style={{ marginRight: 6, verticalAlign: '-2px' }} />
+          Lịch nghỉ
+        </div>
+        <select
+          value={holidayYear}
+          onChange={(e) => setHolidayYear(parseInt(e.target.value, 10))}
+          style={{ ...inputStyle, width: 90 }}
+        >
+          {[-1, 0, 1, 2].map((delta) => {
+            const y = new Date().getFullYear() + delta;
+            return <option key={y} value={y}>{y}</option>;
+          })}
+        </select>
+      </div>
+      <div style={{ marginBottom: 8, fontSize: 10, color: 'var(--text-secondary)' }}>
+        Ngày trong bảng này sẽ KHÔNG tính trễ / OT — báo cáo chấm công hiện
+        nhãn "Ngày lễ" cho mọi nhân viên ngày hôm đó (có punch hay không).
+        Ngày lễ tái diễn hàng năm (Tết Dương lịch, Quốc khánh, …) cần thêm
+        lại cho từng năm.
+      </div>
+      <div style={{
+        background: 'var(--bg-card)', border: '1px solid var(--border)',
+        borderRadius: 6, padding: 8, marginBottom: 20,
+      }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ borderBottom: '1px solid var(--border)' }}>
+              <th style={{ ...cellStyle, textAlign: 'center', width: 130 }}>Ngày</th>
+              <th style={{ ...cellStyle, textAlign: 'left' }}>Tên dịp</th>
+              <th style={{ ...cellStyle, textAlign: 'left' }}>Ghi chú</th>
+              <th style={{ ...cellStyle, textAlign: 'right', width: 110 }}>Hành động</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style={{ background: 'rgba(0,200,245,0.05)' }}>
+              <td style={{ ...cellStyle, textAlign: 'center' }}>
+                <input type="date" style={{ ...inputStyle, width: 130 }}
+                       value={draftHoliday.date}
+                       onChange={(e) => setDraftHoliday({ ...draftHoliday, date: e.target.value })} />
+              </td>
+              <td style={cellStyle}>
+                <input style={{ ...inputStyle, width: '100%' }}
+                       placeholder="Tết Dương lịch"
+                       value={draftHoliday.name}
+                       onChange={(e) => setDraftHoliday({ ...draftHoliday, name: e.target.value })} />
+              </td>
+              <td style={cellStyle}>
+                <input style={{ ...inputStyle, width: '100%' }}
+                       placeholder="(tùy chọn)"
+                       value={draftHoliday.description}
+                       onChange={(e) => setDraftHoliday({ ...draftHoliday, description: e.target.value })} />
+              </td>
+              <td style={{ ...cellStyle, textAlign: 'right' }}>
+                <button className="config-btn" style={{ padding: '3px 8px' }}
+                        onClick={async () => {
+                          if (!draftHoliday.name.trim()) { onToast('Tên dịp không được để trống', 'error'); return; }
+                          if (!/^\d{4}-\d{2}-\d{2}$/.test(draftHoliday.date)) { onToast('Ngày phải dạng YYYY-MM-DD', 'error'); return; }
+                          const res = await apiClient.createHoliday(draftHoliday);
+                          if (res?.success) {
+                            onToast(`Đã thêm ngày lễ ${draftHoliday.date}`, 'success');
+                            setDraftHoliday({ date: todayIso(), name: '', description: '' });
+                            await refresh();
+                          } else if (res?.status === 403) {
+                            onToast('Cần quyền admin để thêm ngày lễ', 'error');
+                          } else if (res?.status === 409) {
+                            onToast('Ngày này đã có trong lịch lễ', 'error');
+                          } else {
+                            onToast(res?.error || 'Thêm thất bại', 'error');
+                          }
+                        }}>
+                  <Plus size={11} /> Thêm
+                </button>
+              </td>
+            </tr>
+            {holidays.map((h) => (
+              <tr key={h.id}>
+                <td style={{ ...cellStyle, textAlign: 'center', fontFamily: "'Share Tech Mono',monospace" }}>{h.date}</td>
+                <td style={cellStyle}>{h.name}</td>
+                <td style={{ ...cellStyle, color: 'var(--text-secondary)' }}>{h.description || ''}</td>
+                <td style={{ ...cellStyle, textAlign: 'right' }}>
+                  <button className="config-btn danger" style={{ padding: '3px 8px' }}
+                          onClick={async () => {
+                            if (!window.confirm(`Xóa ngày lễ ${h.date} – ${h.name}?`)) return;
+                            const res = await apiClient.deleteHoliday(h.id);
+                            if (res?.success) {
+                              onToast('Đã xóa', 'success');
+                              await refresh();
+                            } else if (res?.status === 403) {
+                              onToast('Cần quyền admin để xóa ngày lễ', 'error');
+                            } else {
+                              onToast(res?.error || 'Xóa thất bại', 'error');
+                            }
+                          }}>
+                    <Trash2 size={11} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {holidays.length === 0 && (
+              <tr>
+                <td colSpan={4} style={{ ...cellStyle, textAlign: 'center', color: 'var(--text-secondary)' }}>
+                  Chưa có ngày lễ nào cho năm {holidayYear}.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
