@@ -69,6 +69,13 @@ private:
     // Accepts pre-decoded frame to avoid repeated imdecode per object
     void processFace(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
     void processIntrusion(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
+    void processLicensePlate(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
+    // BUG-REID-DEAD-PIPELINE producer: cross-camera ReID enrichment for every
+    // person detection with a stable track_id. Engine handles its own cache
+    // (track_to_global_) so per-frame calls short-circuit cheaply on known
+    // tracks; only the first observation of a (camera, track) pair runs the
+    // DNN embedding extraction.
+    void processReID(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
     // Batched line-crossing pass — runs once per metadata batch, after the
     // per-object loop has populated the TrackerStateManager. Builds the
     // detection list internally so the tracker only advances once per frame.

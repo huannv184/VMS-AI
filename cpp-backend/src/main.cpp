@@ -37,6 +37,7 @@
 #include "core/runtime_state.h"
 #include "core/roi_manager.h"
 #include "core/event_manager.h"
+#include "core/reid_engine.h"
 #include "core/attendance_tracker.h"
 #include "core/counter_bucket_aggregator.h"
 #include "events/alert_router.h"
@@ -361,6 +362,20 @@ int main(int argc, char* argv[]) {
             vms::events::RuleEngine::getInstance().loadFromDatabase();
         } catch (const std::exception& e) {
             LOG_WARN("RuleEngine loadFromDatabase exception: {}", e.what());
+        }
+
+        // Initialise ReIDEngine. Pre-fix this getInstance() was only called
+        // from the REST controller, which doesn't call init(). The engine's
+        // initialized_ flag stayed false forever → processDetection short-
+        // circuited on `if (!initialized_) return -1` → /api/reid/gallery
+        // and /api/reid/search always returned empty. Closes the boot side
+        // of BUG-REID-DEAD-PIPELINE; the producer side is wired in
+        // AiEventProcessor::processReID. Falls back to color-histogram
+        // embedding if the ONNX model is missing (logged at WARN, not fatal).
+        try {
+            vms::core::ReIDEngine::getInstance().init();
+        } catch (const std::exception& e) {
+            LOG_WARN("ReIDEngine init exception: {}", e.what());
         }
 
         LOG_INFO("All managers initialized successfully");

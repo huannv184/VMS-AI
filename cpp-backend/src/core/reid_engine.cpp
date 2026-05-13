@@ -381,6 +381,14 @@ std::vector<ReIDTrailPoint> ReIDEngine::getPersonTrail(int global_id) {
     return it->second;
 }
 
+int ReIDEngine::lookupGlobalId(int camera_id, int track_id) const {
+    if (track_id < 0) return -1;
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string key = std::to_string(camera_id) + ":" + std::to_string(track_id);
+    auto it = track_to_global_.find(key);
+    return (it == track_to_global_.end()) ? -1 : it->second;
+}
+
 std::vector<std::pair<int, float>> ReIDEngine::searchByImage(const cv::Mat& query_image, int top_k) {
     std::lock_guard<std::mutex> lock(mutex_);
     

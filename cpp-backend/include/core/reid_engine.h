@@ -95,6 +95,13 @@ public:
     // Query gallery
     std::vector<ReIDEntry> getActiveGallery();
     std::vector<ReIDTrailPoint> getPersonTrail(int global_id);
+
+    // Look up the cross-camera global_id assigned to a local tracker. Returns
+    // -1 if the (camera_id, track_id) pair has not been observed yet (or was
+    // pruned past the gallery TTL). Cheap O(1) hash lookup — safe to call
+    // from per-frame handlers that want to enrich event metadata with the
+    // re-identified global identity without re-running the DNN.
+    int lookupGlobalId(int camera_id, int track_id) const;
     
     // Search by image
     std::vector<std::pair<int, float>> searchByImage(const cv::Mat& query_image, int top_k = 5);

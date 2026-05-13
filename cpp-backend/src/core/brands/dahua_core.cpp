@@ -1,5 +1,6 @@
 #include "core/brands/dahua_core.hpp"
 #include "core/brands/DahuaAdapter.hpp"
+#include "core/brands/http_client.h"
 #include "utils/logger.h"
 #include <map>
 #include <vector>
@@ -184,14 +185,140 @@ bool DahuaCore::ptzControl(const CameraDiscovery::DiscoveryConfig& cfg, const st
 // Real Dahua EventManager subscription (HTTP multipart on
 // /cgi-bin/eventManager.cgi?action=attach) was never wired. See ONVIFCore
 // for the full lesson.
+// Map Dahua native Code= identifiers to the brand-agnostic event_type vocabulary
+// the consumer (camera_event_service_qt.cpp) routes on.
+//
+// Dahua emits dozens of codes; we map only the ones that have a one-to-one
+// equivalent in the VMS event model. Unmapped codes fall back to
+// "hardware_alarm" so operators still see something fire instead of a silent
+// drop (BUG-EVENTS-01 lesson: silent-drop is worse than imprecise dispatch).
+static std::string dahuaCodeToEventType(const std::string& code) {
+    if (code == "VideoMotion")            return "motion_detect";
+    if (code == "CrossLineDetection")     return "line_crossing";
+    if (code == "CrossRegionDetection")   return "intrusion";
+    if (code == "LoiteringDetection" ||
+        code == "WanderDetection")        return "loitering";
+    if (code == "FaceDetection")          return "face";
+    if (code == "AudioAnomaly" ||
+        code == "AudioMutation")          return "audio_alarm";
+    if (code == "VideoBlind"  ||
+        code == "VideoLoss"   ||
+        code == "VideoUnFocus")           return "tampering";
+    if (code == "AlarmLocal"  ||
+        code == "FireWarning")            return "fire";
+    if (code == "SmokeDetection")         return "smoke";
+    if (code == "TakenAwayDetection")     return "object_taken";
+    if (code == "LeftDetection")          return "object_left";
+    return "hardware_alarm";
+}
+
+// BUG-EVENTS-01 fix (Dahua): real multipart long-poll subscription via
+// `/cgi-bin/eventManager.cgi?action=attach`. The endpoint returns a
+// chunked text stream with one event per chunk in `Code=X;action=Y;index=N;`
+// shape, separated by mime boundaries. Heartbeat=5 keeps the connection
+// alive so a quiet camera doesn't get dropped by Dahua's idle timeout.
+//
+// We accumulate partial-chunk text across callback invocations until we hit a
+// newline; only then do we parse, so a Code= line split across two TCP reads
+// still gets reconstructed.
+//
+// Connection lifecycle is owned by the caller (CameraEventService::workerLoop):
+// when its session->stop_flag flips the callback returns false, streamWriteCallback
+// signals abort to libcurl, and we unwind. The outer loop reconnects after
+// a 5s grace.
 void DahuaCore::pullEvents(const CameraDiscovery::DiscoveryConfig& cfg, std::function<bool(const std::string&)> onEvent) {
-    LOG_WARN("[DahuaCore] Hardware event subscription is NOT implemented "
-             "for Dahua host {}:{}. Real Dahua events require "
-             "/cgi-bin/eventManager.cgi multipart streaming. Sleeping 60s "
-             "before returning.",
-             cfg.host, cfg.http_port);
-    (void)onEvent;
-    std::this_thread::sleep_for(std::chrono::seconds(60));
+    CameraDiscovery::HttpClient http(cfg);
+    std::string buffer; // Cross-chunk reassembly buffer
+
+    LOG_INFO("[DahuaCore] Subscribing to events on {}:{}", cfg.host, cfg.http_port);
+
+    // codes=[All] subscribes to every event class the device supports. We do
+    // brand-side filtering instead of letting the camera pre-filter so that
+    // any new firmware-introduced event type still flows through unchanged.
+    http.streamGet("/cgi-bin/eventManager.cgi?action=attach&codes=[All]&heartbeat=5",
+        [&](const std::string& chunk) -> bool {
+            buffer.append(chunk);
+
+            // Process every complete line, leave the trailing partial line
+            // (if any) in the buffer for the next callback.
+            size_t pos = 0;
+            while (true) {
+                size_t nl = buffer.find('\n', pos);
+                if (nl == std::string::npos) break;
+                std::string line = buffer.substr(pos, nl - pos);
+                pos = nl + 1;
+
+                // Strip trailing \r — Dahua uses CRLF line endings inside
+                // mime parts.
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+
+                // Only `Code=...;` lines carry events. Header lines (mime
+                // boundary, Content-Type, Content-Length) and heartbeat
+                // `Heartbeat` keepalives are skipped.
+                if (line.rfind("Code=", 0) != 0) continue;
+
+                // Parse `key=value;` pairs.
+                std::string code, action, index, data;
+                size_t i = 0;
+                while (i < line.size()) {
+                    size_t eq = line.find('=', i);
+                    if (eq == std::string::npos) break;
+                    size_t semi = line.find(';', eq);
+                    if (semi == std::string::npos) semi = line.size();
+                    std::string key = line.substr(i, eq - i);
+                    std::string val = line.substr(eq + 1, semi - eq - 1);
+                    if      (key == "Code")   code   = val;
+                    else if (key == "action") action = val;
+                    else if (key == "index")  index  = val;
+                    else if (key == "data")   data   = val;
+                    i = semi + 1;
+                }
+
+                if (code.empty()) continue;
+                // `Pulse` and `Stop` are valid Dahua action verbs alongside
+                // `Start`. We treat Start/Pulse as active=true (alarm raised),
+                // Stop as active=false (alarm cleared). Anything else we let
+                // through with active=true so the operator still sees it.
+                bool active = (action != "Stop");
+
+                int channel = 0;
+                try { channel = std::stoi(index); } catch (...) {}
+
+                nlohmann::json envelope = {
+                    {"type",        "camera_event"},
+                    {"brand",       "Dahua"},
+                    {"event_type",  dahuaCodeToEventType(code)},
+                    {"active",      active},
+                    {"channel",     channel},
+                    {"native_code", code},
+                    {"native_action", action.empty() ? "Start" : action},
+                    {"timestamp",   (long long)std::time(nullptr)}
+                };
+                if (!data.empty()) envelope["data"] = data;
+
+                if (!onEvent(envelope.dump())) {
+                    // Caller asked us to stop — drain the buffer and bail.
+                    buffer.clear();
+                    return false;
+                }
+            }
+
+            // Trim consumed prefix so the buffer doesn't grow without bound
+            // if the camera never emits a newline (pathological case).
+            if (pos > 0) buffer.erase(0, pos);
+            // Guard against unbounded growth on a broken stream.
+            if (buffer.size() > 64 * 1024) {
+                LOG_WARN("[DahuaCore] Event stream produced {} bytes without "
+                         "a newline — dropping buffer to recover.", buffer.size());
+                buffer.clear();
+            }
+            return true;
+        },
+        /*digest=*/true,
+        ""
+    );
+
+    LOG_INFO("[DahuaCore] Event stream closed for {}:{}", cfg.host, cfg.http_port);
 }
 
 } // namespace brands

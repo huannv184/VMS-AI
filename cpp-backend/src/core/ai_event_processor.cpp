@@ -6,10 +6,15 @@
 #include "core/people_count_tracker.h"
 #include "core/roi_manager.h"
 #include "core/tracker_state_manager.h"
+#include "core/reid_engine.h"
+#include "database/anpr_repository.h"
 #include "events/rule_engine.h"
 #include "events/event_types.h"
+#include "streaming/camera_stream_manager_qt.h"
 #include "utils/logger.h"
 #include "utils/storage_manager.h"
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <chrono>
 #include <thread>
@@ -135,10 +140,29 @@ void AiEventProcessor::eventWorkerLoop() {
                 std::string type = obj.value("type", obj.value("class_name", ""));
                 int class_id = obj.value("class_id", -1);
 
+                // Worker writes either `label` (since 2026-04) or `type`/`class_name`
+                // (legacy). Plate path keys on either label="LicensePlate" or
+                // class_id=200 (see ai_worker/main.cpp:1047-1064).
+                std::string label = obj.value("label", std::string(""));
+
                 if (class_id == 100 || type == "Face" || type == "face") {
                     processFace(job.camera_id, obj, job.frame);
                 } else if (class_id == 0 || type == "person" || type == "Person") {
+                    // Two consumers per person detection:
+                    //   1. processIntrusion — cooldown-gated event creation
+                    //      (snapshot + ROI check + Event row).
+                    //   2. processReID — cross-camera identity bookkeeping.
+                    //      Engine's track_to_global_ cache means per-frame
+                    //      calls on existing tracks are O(1); only the first
+                    //      observation runs DNN embedding.
+                    // Order: ReID first so a successful match can later be
+                    // joined onto the intrusion event metadata (currently
+                    // post-hoc via /api/reid/trail; future enrichment can
+                    // attach global_id inline).
+                    processReID(job.camera_id, obj, job.frame);
                     processIntrusion(job.camera_id, obj, job.frame);
+                } else if (class_id == 200 || label == "LicensePlate") {
+                    processLicensePlate(job.camera_id, obj, job.frame);
                 }
             }
             // Single tracker advance + line crossing pass per frame so the
@@ -298,6 +322,17 @@ void AiEventProcessor::processIntrusion(int camera_id, const nlohmann::json& obj
 
     nlohmann::json enhanced_meta = obj;
     enhanced_meta["snapshot_url"] = snapshot_path;
+    // ReID stitch: dispatch order in eventWorkerLoop runs processReID before
+    // this handler, so by the time we reach here the engine's track_to_global_
+    // cache has the gid for this (camera, track). Look it up cheaply (no DNN)
+    // and embed in the event metadata so EventsView can show "Person #N" and
+    // a "view trail" deep-link to /api/reid/trail/<gid>. -1 means ReID is
+    // disabled / model missing / track_id was -1 — we omit the key rather
+    // than serialize the sentinel.
+    int reid_gid = ReIDEngine::getInstance().lookupGlobalId(camera_id, track_id);
+    if (reid_gid > 0) {
+        enhanced_meta["reid_global_id"] = reid_gid;
+    }
     event.metadata_json = enhanced_meta.dump();
 
     // EventManager::createEvent triggers RuleEngine internally — see processFace.
@@ -306,6 +341,193 @@ void AiEventProcessor::processIntrusion(int camera_id, const nlohmann::json& obj
     setCooldown(key);
 
     LOG_INFO("Person event: camera={} track={} conf={:.2f}", camera_id, track_id, confidence);
+}
+
+// ── License plate handler ────────────────────────────────────────────────────
+//
+// BUG-ANPR-PIPELINE half-dead fix (documented in synopsis_anpr_audit memory
+// 2026-05-08b): ai_worker detects plates (multi_model_infer + LPR engine) and
+// emits each plate as an object with class_id=200 / label="LicensePlate" /
+// text="<plate string>" in the per-frame metadata. Pre-fix nothing on the
+// backend side consumed that — the eventWorkerLoop switch only dispatched
+// class_id 0/100 (person/face), so ANPRRepository::insertPlate had ZERO
+// callers, the `license_plates` table stayed empty, and AnprView's gallery
+// always rendered "no plates yet" no matter how many vehicles passed.
+//
+// Now: parallel to processIntrusion / processFace. Cooldown by camera + plate
+// text (so the same plate sitting in frame for 30s doesn't insert 30 rows)
+// rather than by track_id (worker writes track_id=-1 for plates). Empty-OCR
+// detections are dropped — there's no point storing a row whose plate_number
+// is "".
+void AiEventProcessor::processLicensePlate(int camera_id,
+                                           const nlohmann::json& obj,
+                                           const cv::Mat& frame) {
+    // OCR text is the only field worth keying on. Worker sets it from the
+    // LPR OCR pass; missing/empty text means the detector framed a plate-shaped
+    // region but OCR failed — useless for the gallery and would create rows
+    // we can't index by plate_number. Drop silently.
+    std::string plate_text = obj.value("text", std::string(""));
+    // Trim whitespace + reject obvious garbage (length < 2). Conservative.
+    plate_text.erase(plate_text.begin(),
+                     std::find_if(plate_text.begin(), plate_text.end(),
+                                  [](unsigned char ch) { return !std::isspace(ch); }));
+    plate_text.erase(std::find_if(plate_text.rbegin(), plate_text.rend(),
+                                  [](unsigned char ch) { return !std::isspace(ch); }).base(),
+                     plate_text.end());
+    if (plate_text.size() < 2) {
+        return;
+    }
+
+    double confidence = obj.value("confidence", 0.0);
+    // YOLO bbox conf is the only number worker emits per plate today. The OCR
+    // pass would supply its own confidence in a richer message; until that's
+    // wired, gate on the detection conf to suppress ghost detections.
+    if (confidence < 0.40) {
+        return;
+    }
+
+    // Cooldown key = camera + plate_text. Reading the same plate twice in <10s
+    // is almost certainly the same vehicle in the same frame sequence; the
+    // gallery doesn't gain anything from duplicate rows. Track_id is -1 for
+    // plates today so we can't use it.
+    std::string key = std::to_string(camera_id) + ":LPR:" + plate_text;
+    if (isOnCooldown(key)) return;
+
+    auto j_bbox = obj.value("box",
+                            obj.value("bbox", nlohmann::json::array()));
+    cv::Mat crop = cropSnapshot(frame, j_bbox);
+    std::string snapshot_path = saveSnapshot(camera_id, crop);
+
+    vms::LicensePlate plate;
+    plate.plate_number = plate_text;
+    plate.vehicle_type = obj.value("vehicle_type", std::string("unknown"));
+    plate.color        = obj.value("color",        std::string(""));
+    plate.camera_id    = camera_id;
+    plate.confidence   = static_cast<float>(confidence);
+    plate.image_path   = snapshot_path;
+    plate.detected_at  = std::chrono::time_point_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now()).time_since_epoch().count();
+
+    try {
+        vms::database::ANPRRepository repo;
+        if (!repo.insertPlate(plate)) {
+            LOG_ERROR("ANPR insert failed: camera={} plate='{}'", camera_id, plate_text);
+            return;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("ANPR insert exception: camera={} plate='{}' err={}",
+                  camera_id, plate_text, e.what());
+        return;
+    }
+    setCooldown(key);
+
+    // Broadcast for the AnprView gallery to update in real-time without
+    // waiting for the next poll cycle. Schema matches the generic alert
+    // shape so useWebSocket.js handlers can route on event_type.
+    nlohmann::json broadcast_msg = {
+        {"type", "alert"},
+        {"event_type", "LPR"},
+        {"camera_id", camera_id},
+        {"timestamp", plate.detected_at},
+        {"severity", "low"},
+        {"plate", plate_text},
+        {"confidence", confidence},
+        {"snapshot_url", snapshot_path}
+    };
+    try {
+        auto& ws = vms::streaming::CameraStreamManager::getInstance();
+        if (camera_id > 0) ws.broadcastEvent(camera_id, broadcast_msg);
+        ws.broadcastEvent(0, broadcast_msg);
+    } catch (...) {
+        // WS broadcast failures must never break the DB-insert success path.
+    }
+
+    LOG_INFO("ANPR plate persisted: camera={} plate='{}' conf={:.2f}",
+             camera_id, plate_text, confidence);
+}
+
+// ── Cross-camera ReID producer ────────────────────────────────────────────────
+//
+// BUG-REID-DEAD-PIPELINE producer fix (Face/ReID Audit 2026-05-08). Pre-fix:
+//   - ReIDEngine::init() was never called from boot → initialized_ = false
+//     forever → processDetection short-circuited and returned -1.
+//   - Even if init had been called, no producer ever invoked processDetection
+//     → gallery/trail/search REST endpoints returned [] forever, indistinguishable
+//     from "scene quiet" (operators thought ReID worked but saw nothing).
+//
+// Producer side fix (here): every person detection (class_id=0) with a stable
+// track_id is forwarded to ReIDEngine::processDetection. Engine maintains its
+// own (camera_id, track_id) → global_id cache, so per-frame calls on already-
+// seen tracks short-circuit in O(1) without rerunning the DNN. Only the first
+// observation of a (cam, track) pair runs embedding extraction; subsequent
+// frames just refresh last_seen on the existing entry.
+//
+// Why skip track_id=-1: ReID cross-camera matching needs a stable per-camera
+// identity to detect "same track moving" vs "new person walked in". When the
+// tracker is bypassed (Fix-B detect tuning default OFF, but operators can flip
+// to bypass mode for high-FPS scenes), every detection is independent and ReID
+// would create one global_id per frame — useless noise. Drop silently in that
+// mode.
+//
+// Cost note: the engine's first-observation path runs a DNN forward (~10-50ms
+// depending on model) inside the AiEventProcessor worker pool (MAX_EVENT_THREADS
+// = 2). Sustained burst of NEW tracks across many cameras could backpressure;
+// the bounded event_queue_ (MAX_EVENT_QUEUE = 16) provides drop-oldest backstop.
+void AiEventProcessor::processReID(int camera_id,
+                                   const nlohmann::json& obj,
+                                   const cv::Mat& frame) {
+    if (frame.empty()) return;
+
+    int track_id = obj.value("track_id", -1);
+    if (track_id < 0) {
+        // bypass_tracker mode — no stable identity available.
+        return;
+    }
+
+    // Optional confidence floor: ghost detections shouldn't pollute the
+    // gallery. ReID accuracy degrades sharply on tiny / occluded persons, so
+    // we mirror the intrusion gate (0.5) here.
+    double confidence = obj.value("confidence", 0.0);
+    if (confidence < 0.5) return;
+
+    // bbox in worker emit shape is "box" (since 2026-04). Older producers used
+    // "bbox". Accept both. Reject if neither is a 4-element array.
+    auto j_bbox = obj.value("box",
+                            obj.value("bbox", nlohmann::json::array()));
+    if (!j_bbox.is_array() || j_bbox.size() < 4) return;
+
+    int x1 = j_bbox[0].get<int>();
+    int y1 = j_bbox[1].get<int>();
+    int x2 = j_bbox[2].get<int>();
+    int y2 = j_bbox[3].get<int>();
+
+    // Clamp + sanity-check before crop so we never call cv::Mat(roi) with an
+    // out-of-frame Rect (throws).
+    x1 = std::max(0, std::min(x1, frame.cols - 1));
+    y1 = std::max(0, std::min(y1, frame.rows - 1));
+    x2 = std::max(0, std::min(x2, frame.cols));
+    y2 = std::max(0, std::min(y2, frame.rows));
+    if (x2 - x1 < 16 || y2 - y1 < 32) {
+        // Smaller than 16×32 is too small for OSNet-class embedding networks
+        // to produce meaningful features. Discard silently.
+        return;
+    }
+
+    cv::Mat person_crop = frame(cv::Rect(x1, y1, x2 - x1, y2 - y1)).clone();
+    if (person_crop.empty()) return;
+
+    try {
+        int global_id = ReIDEngine::getInstance().processDetection(camera_id, track_id, person_crop);
+        if (global_id < 0) {
+            // Engine not initialized / disabled / extract failed. Already
+            // logged once at engine side. Don't spam per-frame.
+            return;
+        }
+        // Successful match/insert. Don't LOG_INFO per frame — engine logs
+        // the first observation and re-ID match events itself.
+    } catch (const std::exception& e) {
+        LOG_THROTTLED_WARN(5000, "AiEventProcessor::processReID exception: {}", e.what());
+    }
 }
 
 void AiEventProcessor::processLineCrossings(int camera_id,

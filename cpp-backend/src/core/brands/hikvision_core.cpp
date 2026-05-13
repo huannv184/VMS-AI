@@ -1,6 +1,7 @@
 #include "core/brands/hikvision_core.hpp"
 #include "core/brands/HikvisionAdapter.hpp"
 #include <pugixml.hpp>
+#include <ctime>
 #include <vector>
 #include <string>
 
@@ -161,13 +162,31 @@ void HikvisionCore::pullEvents(const CameraDiscovery::DiscoveryConfig& cfg, std:
     if (!adapter->connect()) return;
 
     adapter->startEventSubscription([onEvent](const vms::CameraEvent& ev) {
-        nlohmann::json j;
-        j["type"] = "camera_event";
-        j["event_type"] = (int)ev.type;
-        j["channel"] = ev.channel;
-        j["active"] = ev.active;
-        j["extra"] = ev.extra;
-        
+        // Normalize Hikvision-internal enum to the brand-agnostic string
+        // vocabulary the consumer (camera_event_service_qt.cpp) routes on.
+        // Pre-fix this emitted (int)ev.type, which made the consumer's
+        // string-keyed routing silently ignore Hikvision hardware events.
+        const char* evt_type = "hardware_alarm";
+        switch (ev.type) {
+            case vms::CameraEvent::Type::Motion:           evt_type = "motion_detect"; break;
+            case vms::CameraEvent::Type::LineCrossing:     evt_type = "line_crossing"; break;
+            case vms::CameraEvent::Type::Intrusion:        evt_type = "intrusion";     break;
+            case vms::CameraEvent::Type::FaceDetection:    evt_type = "face";          break;
+            case vms::CameraEvent::Type::TamperDetection:  evt_type = "tampering";     break;
+            default:                                       evt_type = "hardware_alarm"; break;
+        }
+
+        nlohmann::json j = {
+            {"type",         "camera_event"},
+            {"brand",        "Hikvision"},
+            {"event_type",   evt_type},
+            {"active",       ev.active},
+            {"channel",      ev.channel},
+            {"native_code",  ev.typeRaw},
+            {"extra",        ev.extra},
+            {"timestamp",    (long long)std::time(nullptr)}
+        };
+
         onEvent(j.dump());
     }, nullptr);
 

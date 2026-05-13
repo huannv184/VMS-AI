@@ -1,11 +1,56 @@
 #include "core/camera_event_service.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include "core/brands/core_factory.hpp"
-#include "utils/logger.h"
+#include "core/event_manager.h"
 #include "database/camera_repository.h"
+#include "database/db_manager.h"
+#include "database/models.h"
 #include "database/traffic_repository.h"
+#include "utils/logger.h"
+#include <algorithm>
+#include <nlohmann/json.hpp>
+
 namespace vms {
 namespace core {
+
+namespace {
+
+// Severity rule of thumb: detection events (intrusion / line_crossing /
+// loitering / fire / smoke) escalate to "high" because they typically demand
+// human acknowledgement; motion / face / tampering / audio default to
+// "medium"; everything else stays "low". Mirrors the severity ladder used by
+// ZmqEventBridge so the AlertManager/RuleEngine dispatch table doesn't have to
+// special-case hardware-driven events differently from AI-driven ones.
+const char* severityForEventType(const std::string& evt) {
+    if (evt == "intrusion" || evt == "line_crossing" || evt == "loitering" ||
+        evt == "fire"      || evt == "smoke") {
+        return "high";
+    }
+    if (evt == "motion_detect" || evt == "face" || evt == "tampering" ||
+        evt == "audio_alarm") {
+        return "medium";
+    }
+    return "low";
+}
+
+// Brand-agnostic event_type → human-readable Vietnamese description so the
+// EventsView shows a useful row instead of just the raw token.
+std::string descriptionForEventType(const std::string& evt, const std::string& brand) {
+    const std::string brand_tag = brand.empty() ? "Phần cứng" : brand;
+    if (evt == "motion_detect")  return "[" + brand_tag + "] Phát hiện chuyển động";
+    if (evt == "line_crossing")  return "[" + brand_tag + "] Phát hiện đối tượng vượt qua đường ranh";
+    if (evt == "intrusion")      return "[" + brand_tag + "] Phát hiện đối tượng xâm nhập vùng";
+    if (evt == "loitering")      return "[" + brand_tag + "] Phát hiện đối tượng lảng vảng";
+    if (evt == "tampering")      return "[" + brand_tag + "] Cảnh báo camera bị che/đổi cảnh";
+    if (evt == "audio_alarm")    return "[" + brand_tag + "] Cảnh báo âm thanh bất thường";
+    if (evt == "face")           return "[" + brand_tag + "] Phát hiện khuôn mặt";
+    if (evt == "fire")           return "[" + brand_tag + "] Cảnh báo cháy";
+    if (evt == "smoke")          return "[" + brand_tag + "] Cảnh báo khói";
+    if (evt == "hardware_alarm") return "[" + brand_tag + "] Tín hiệu báo động phần cứng";
+    return "[" + brand_tag + "] " + evt;
+}
+
+} // namespace
 
 CameraEventService& CameraEventService::getInstance() {
     static CameraEventService instance;
@@ -22,9 +67,55 @@ void CameraEventService::startListening(const std::string& cam_id) {
 
     auto session = std::make_shared<EventSession>();
     session->cam_id = cam_id;
+    session->started_at = (long long)std::time(nullptr);
+    session->state = static_cast<int>(SubscriptionState::Pending);
     session->worker = std::thread(&CameraEventService::workerLoop, this, session);
     sessions_[cam_id] = session;
-    LOG_INFO("CameraEventService started listing for camera {}", cam_id);
+    LOG_INFO("CameraEventService started listening for camera {}", cam_id);
+}
+
+const char* CameraEventService::subscriptionStateName(SubscriptionState s) {
+    switch (s) {
+        case SubscriptionState::Pending: return "pending";
+        case SubscriptionState::Active:  return "active";
+        case SubscriptionState::Failed:  return "failed";
+        case SubscriptionState::Stopped: return "stopped";
+    }
+    return "unknown";
+}
+
+nlohmann::json CameraEventService::getStatus(const std::string& cam_id) {
+    std::shared_ptr<EventSession> session;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = sessions_.find(cam_id);
+        if (it == sessions_.end()) {
+            return nlohmann::json{
+                {"cam_id",      cam_id},
+                {"listening",   false},
+                {"state",       "not_started"},
+                {"reason",      "startListening has not been called for this camera"}
+            };
+        }
+        session = it->second;
+    }
+
+    SubscriptionState st = static_cast<SubscriptionState>(session->state.load());
+    long long now_ts = (long long)std::time(nullptr);
+    long long last_event = session->last_event_at.load();
+
+    return nlohmann::json{
+        {"cam_id",            cam_id},
+        {"listening",         true},
+        {"state",             subscriptionStateName(st)},
+        {"brand",             session->brand},
+        {"started_at",        session->started_at.load()},
+        {"last_attempt_at",   session->last_attempt_at.load()},
+        {"last_event_at",     last_event},
+        {"seconds_since_event", last_event > 0 ? (now_ts - last_event) : -1},
+        {"total_events",      session->total_events.load()},
+        {"reconnect_count",   session->reconnect_count.load()}
+    };
 }
 
 void CameraEventService::stopListening(const std::string& cam_id) {
@@ -131,67 +222,162 @@ void CameraEventService::workerLoop(std::shared_ptr<EventSession> session) {
     while (!session->stop_flag) {
         CameraDiscovery::DiscoveryConfig cfg = getCameraConfig(session->cam_id);
         if (cfg.host.empty()) {
+            session->state = static_cast<int>(SubscriptionState::Failed);
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
-        
+
         auto core = brands::CoreFactory::getCore(cfg.brand);
         if (!core) {
+            session->state = static_cast<int>(SubscriptionState::Failed);
             std::this_thread::sleep_for(std::chrono::seconds(10));
             continue;
         }
 
-        LOG_INFO("CameraEventService polling events for {}", session->cam_id);
+        // Record brand once (immutable after first set) so status snapshots
+        // can show which protocol path is active without parsing cfg again.
+        if (session->brand.empty()) {
+            session->brand = core->getBrandName();
+        }
+        session->last_attempt_at = (long long)std::time(nullptr);
+        session->state = static_cast<int>(SubscriptionState::Active);
+
+        LOG_INFO("CameraEventService polling events for {} (brand={})",
+                 session->cam_id, session->brand);
         
-        // This is a blocking/chunk stream function
+        // BUG-EVENTS-01 followup (2026-05-12): consumer pre-fix only handled
+        // the legacy Hikvision raw-XML `EventNotificationAlert` substring shape
+        // and only inserted a TrafficCount row — Event rows were never created,
+        // so EventsView never saw hardware alarms and RuleEngine never fired
+        // alerts on them. Two parallel half-dead paths converging at the same
+        // dead-end. Now: try JSON envelope first (new brand impls emit that),
+        // fall back to legacy substring matching for backwards-compat with any
+        // Hikvision adapter variant still emitting raw XML, and inject an
+        // Event row so event_manager's broadcast loop picks it up + dispatches
+        // through RuleEngine → AlertRouter / AlertManager naturally.
         core->pullEvents(cfg, [session](const std::string& chunk) -> bool {
             if (session->stop_flag) return false;
-            
-            // Only broadcast non-empty keep-alives or actual alarms
-            if (chunk.size() > 50 && chunk.find("EventNotificationAlert") != std::string::npos) {
-                // Determine event type
-                std::string evt_type = "hardware_alarm";
-                if (chunk.find("VMD") != std::string::npos) evt_type = "motion_detect";
-                else if (chunk.find("linedetection") != std::string::npos) evt_type = "line_crossing";
-                else if (chunk.find("fielddetection") != std::string::npos) evt_type = "intrusion";
-                
-                nlohmann::json notif = {
-                    {"type", "event"},
-                    {"camera_id", std::stoi(session->cam_id)},
-                    {"event_type", evt_type},
-                    {"severity", "major"},
-                    {"message", "Phát hiện tín hiệu báo động phần cứng (Edge AI)"},
-                    {"timestamp", std::time(nullptr)}
-                };
-                
-                // 4. Persistence for Analytics (Counter)
-                if (evt_type == "line_crossing" || evt_type == "intrusion") {
-                    vms::TrafficCount tc;
-                    tc.camera_id = std::stoi(session->cam_id);
-                    tc.roi_id = 1; // Default ROI for now
-                    tc.direction = (evt_type == "line_crossing") ? "in" : "out";
-                    tc.vehicle_type = "person"; // Default
-                    tc.count = 1;
-                    tc.period_start = std::time(nullptr);
-                    tc.period_end = tc.period_start;
-                    
-                    vms::database::TrafficRepository traffic_repo;
-                    traffic_repo.insertCount(tc);
-                }
+            if (chunk.empty()) return !session->stop_flag;
 
-                // Broadcast to Global Dashboard (Cam 0) and local camera stream
-                vms::streaming::CameraStreamManager::getInstance().broadcastEvent(0, notif);
-                vms::streaming::CameraStreamManager::getInstance().broadcastEvent(std::stoi(session->cam_id), notif);
-                LOG_INFO("CameraEventService intercepted hardware alarm: {}", evt_type);
+            std::string evt_type;
+            bool active = true;
+            int channel = 0;
+            std::string brand;
+            std::string raw_topic;
+
+            // Attempt JSON envelope parse — the modern path. New brand impls
+            // (Dahua/Axis/Hanwha/ONVIF) and the patched Hikvision adapter all
+            // emit `{type, brand, event_type, active, channel, ...}`.
+            bool parsed_envelope = false;
+            try {
+                auto j = nlohmann::json::parse(chunk);
+                if (j.is_object() && j.value("type", std::string()) == "camera_event") {
+                    evt_type  = j.value("event_type", std::string("hardware_alarm"));
+                    active    = j.value("active",     true);
+                    channel   = j.value("channel",    0);
+                    brand     = j.value("brand",      std::string());
+                    raw_topic = j.value("topic",      j.value("native_code", std::string()));
+                    parsed_envelope = true;
+                }
+            } catch (...) {
+                // Not JSON — fall through to legacy XML substring match.
             }
+
+            // Legacy Hikvision raw-XML fallback (kept for adapters not yet
+            // converted to the JSON envelope).
+            if (!parsed_envelope) {
+                if (chunk.size() < 50 || chunk.find("EventNotificationAlert") == std::string::npos) {
+                    return !session->stop_flag;
+                }
+                evt_type = "hardware_alarm";
+                if      (chunk.find("VMD")            != std::string::npos) evt_type = "motion_detect";
+                else if (chunk.find("linedetection")  != std::string::npos) evt_type = "line_crossing";
+                else if (chunk.find("fielddetection") != std::string::npos) evt_type = "intrusion";
+                else if (chunk.find("facedetection")  != std::string::npos) evt_type = "face";
+                else if (chunk.find("shelteralarm")   != std::string::npos) evt_type = "tampering";
+                brand = "Hikvision";
+            }
+
+            // Only `active=true` transitions surface as new events. Edge-off
+            // (active=false from Dahua Stop / ONVIF false) are not stored —
+            // they would otherwise double the row count and confuse operators
+            // who expect "1 row = 1 alarm raised".
+            if (!active) {
+                LOG_DEBUG("CameraEventService: ignoring inactive transition for {} cam={}",
+                          evt_type, session->cam_id);
+                return !session->stop_flag;
+            }
+
+            int camera_id = 0;
+            try { camera_id = std::stoi(session->cam_id); } catch (...) {}
+
+            const std::time_t now_ts = std::time(nullptr);
+
+            // BUG-EVENT-DISPATCH-BYPASS-01 fix (2026-05-12): pre-fix this site
+            // wrote the Event row via DbManager::enqueueEvent + did its own WS
+            // broadcast inline. The original comment claimed event_manager.cpp
+            // would pick it up and fire RuleEngine + AlertManager — that claim
+            // was WRONG. Only EventManager::createEvent fires those, and
+            // enqueueEvent bypasses createEvent entirely. So hardware alarms
+            // appeared in EventsView but never triggered operator-configured
+            // webhook/email/Telegram rules. Same shape bug as ZmqEventBridge
+            // (now fixed in zmq_event_bridge.cpp::dispatchHardwareEvent helper).
+            //
+            // Fix: funnel through EventManager::createEvent which handles WS
+            // broadcast + RuleEngine::evaluateEvent + AlertManager::processEvent
+            // inline. Drop the redundant inline WS broadcast.
+            //
+            // Metadata enrichment: we keep the brand/channel/native_topic info
+            // in metadata_json so EventsView can show the source brand and
+            // RuleEngine condition expressions can pattern-match on those
+            // fields if operators want hardware-specific rules.
+            nlohmann::json metadata = {
+                {"camera_id",   camera_id},
+                {"channel",     channel},
+                {"brand",       brand},
+                {"event_type",  evt_type},
+                {"severity",    severityForEventType(evt_type)},
+                {"description", descriptionForEventType(evt_type, brand)}
+            };
+            if (!raw_topic.empty()) metadata["native"] = raw_topic;
+
+            try {
+                vms::Event evt;
+                evt.camera_id     = camera_id;
+                evt.event_type    = evt_type;
+                evt.description   = descriptionForEventType(evt_type, brand);
+                evt.severity      = severityForEventType(evt_type);
+                evt.timestamp     = now_ts;
+                evt.metadata_json = metadata.dump();
+                evt.snapshot_path = ""; // Brand events don't carry frames today.
+                vms::core::EventManager::getInstance().createEvent(evt);
+            } catch (const std::exception& e) {
+                LOG_ERROR("CameraEventService: failed to create Event for {} cam={}: {}",
+                          evt_type, session->cam_id, e.what());
+            }
+
+            // Health counter: an event made it all the way through the
+            // envelope-parse → DB-enqueue → WS-broadcast path. Use this to
+            // distinguish "subscription is healthy but no alarms" from
+            // "subscription is wedged" in the status endpoint.
+            session->total_events.fetch_add(1, std::memory_order_relaxed);
+            session->last_event_at = (long long)std::time(nullptr);
+
+            LOG_INFO("CameraEventService intercepted hardware alarm: brand={} type={} cam={} channel={}",
+                     brand, evt_type, camera_id, channel);
             return !session->stop_flag;
         });
 
-        // If Stream disconnects, wait 5 sec before reconnecting
+        // pullEvents returned. If the caller didn't stop us, the brand stub
+        // exited (ONVIF subscription expired, Hanwha poll hit an error,
+        // Dahua disconnect, etc.). Mark Failed and reconnect after 5s.
         if (!session->stop_flag) {
+            session->state = static_cast<int>(SubscriptionState::Failed);
+            session->reconnect_count.fetch_add(1, std::memory_order_relaxed);
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }
+    session->state = static_cast<int>(SubscriptionState::Stopped);
 }
 
 } // namespace core

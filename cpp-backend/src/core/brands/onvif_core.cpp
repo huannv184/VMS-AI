@@ -207,27 +207,213 @@ bool ONVIFCore::ptzControl(const CameraDiscovery::DiscoveryConfig& cfg, const st
     return resp.ok();
 }
 
-// BUG-EVENTS-01 (2026-05-07): the previous body sent a single
+// Map ONVIF Topic strings → brand-agnostic event_type vocabulary.
+// Topics use `tns1:` (ONVIF schema) and sometimes vendor extensions like
+// `tnsaxis:` / `tns-h:`. We match on substring of the trailing topic segments
+// to stay vendor-agnostic.
+static std::string onvifTopicToEventType(const std::string& topic) {
+    auto contains = [&](const char* needle) { return topic.find(needle) != std::string::npos; };
+    if (contains("CellMotion") ||
+        contains("MotionAlarm") ||
+        contains("MotionDetect"))          return "motion_detect";
+    if (contains("LineDetector") ||
+        contains("LineCrossing"))           return "line_crossing";
+    if (contains("FieldDetector") ||
+        contains("ObjectsInside") ||
+        contains("Intrusion"))              return "intrusion";
+    if (contains("LoiteringDetector") ||
+        contains("Loitering"))              return "loitering";
+    if (contains("Tampering") ||
+        contains("SceneChange") ||
+        contains("ImageTooBlurry") ||
+        contains("ImageTooDark"))           return "tampering";
+    if (contains("AudioSource") ||
+        contains("AudioDetection") ||
+        contains("AudioState"))             return "audio_alarm";
+    if (contains("FaceDetect"))             return "face";
+    if (contains("DigitalInput") ||
+        contains("Trigger"))                return "hardware_alarm";
+    if (contains("Fire"))                   return "fire";
+    if (contains("Smoke"))                  return "smoke";
+    return "hardware_alarm";
+}
+
+// Extract the path component from a SubscriptionReference Address URL. ONVIF
+// returns an absolute URL like `http://192.168.1.10/onvif/Subscription?Idx=7`;
+// we feed only the path-and-query into HttpClient so the host/port stays
+// pinned to cfg_ (no leak across cameras).
+static std::string onvifSubscriptionPath(const std::string& addr) {
+    auto pos = addr.find("://");
+    if (pos == std::string::npos) return addr; // already a path
+    pos = addr.find('/', pos + 3);
+    if (pos == std::string::npos) return "/";
+    return addr.substr(pos);
+}
+
+// BUG-EVENTS-01 fix (ONVIF): the previous body sent a single
 // `GetSystemDateAndTime` SOAP probe and then spun a 1-second
 // `onEvent("keepalive")` loop forever. It NEVER subscribed to real ONVIF
-// events (no `CreatePullPointSubscription` / `PullMessages` flow) — operators
-// configuring an ONVIF camera saw "polling events for cam X" in logs but no
-// motion / line-crossing / intrusion alerts ever arrived. Same operational
-// lie as `AdvancedInfer` face stubs and the legacy `AlertManager::sendEmail`
-// MOCK we already fixed this session.
+// events — operators configuring an ONVIF camera saw "polling events for cam X"
+// in logs but no motion / line-crossing / intrusion alerts ever arrived.
 //
-// Until a real ONVIF event subscription is implemented (see punt list in
-// `.claude/memory/stub_audit_2026_05_07.md`), surface the limitation
-// explicitly: log a WARN once per call, sleep 60s so the caller's outer
-// reconnect loop doesn't burn CPU re-entering this stub, and return.
+// Now: full WS-BaseNotification + PullPoint flow:
+//   1. POST `CreatePullPointSubscription` to `/onvif/event_service`
+//      → device returns a `SubscriptionReference` Address URL pointing to a
+//        per-subscriber endpoint (e.g. `/onvif/Subscription?Idx=N`).
+//   2. Loop: POST `PullMessages` to that endpoint with a 5s Timeout. The camera
+//      returns up to MessageLimit `NotificationMessage`s, blocking up to the
+//      Timeout when no events are pending. We bound at 5s so cancellation
+//      (onEvent returning false) is felt within one round-trip.
+//   3. Parse each NotificationMessage's Topic + Source + Data SimpleItems,
+//      normalize via `onvifTopicToEventType`, emit the common envelope.
+//   4. On exit (caller cancellation OR camera disconnect): POST `Unsubscribe`
+//      to release the device-side subscription slot. ONVIF spec lets cameras
+//      reclaim slots via TerminationTime so this isn't critical, but it's
+//      polite and avoids slow leaks on chatty subscribe/unsubscribe cycles.
 void ONVIFCore::pullEvents(const CameraDiscovery::DiscoveryConfig& cfg, std::function<bool(const std::string&)> onEvent) {
-    LOG_WARN("[ONVIFCore] Hardware event subscription is NOT implemented "
-             "for ONVIF host {}:{}. Real ONVIF events require "
-             "CreatePullPointSubscription + PullMessages flow. Sleeping 60s "
-             "before returning so the worker loop doesn't spin.",
-             cfg.host, cfg.http_port);
-    (void)onEvent;
-    std::this_thread::sleep_for(std::chrono::seconds(60));
+    CameraDiscovery::HttpClient http(cfg);
+
+    // ── Step 1: CreatePullPointSubscription ──────────────────────────────
+    std::string create_body =
+        R"(<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+             xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+             xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+             xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+          <s:Header>)" + wsseHeader(cfg.username, cfg.password) + R"(</s:Header>
+          <s:Body>
+            <tev:CreatePullPointSubscription>
+              <tev:InitialTerminationTime>PT1H</tev:InitialTerminationTime>
+            </tev:CreatePullPointSubscription>
+          </s:Body>
+        </s:Envelope>)";
+
+    auto create_resp = http.post("/onvif/event_service", create_body,
+                                 /*digest=*/false, "application/soap+xml");
+    if (!create_resp.ok()) {
+        LOG_WARN("[ONVIFCore] CreatePullPointSubscription failed on {}:{} status={} "
+                 "— event subscription unavailable, sleeping 30s before retry.",
+                 cfg.host, cfg.http_port, create_resp.status);
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        return;
+    }
+
+    pugi::xml_document create_doc;
+    if (!create_doc.load_string(create_resp.body.c_str())) {
+        LOG_WARN("[ONVIFCore] CreatePullPointSubscription returned unparseable XML.");
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        return;
+    }
+
+    std::string subscription_addr;
+    if (auto addr_node = create_doc.select_node("//SubscriptionReference/Address").node()) {
+        subscription_addr = addr_node.child_value();
+    }
+    if (subscription_addr.empty()) {
+        LOG_WARN("[ONVIFCore] No SubscriptionReference/Address in response — device does not advertise PullPoint.");
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        return;
+    }
+    std::string sub_path = onvifSubscriptionPath(subscription_addr);
+    LOG_INFO("[ONVIFCore] Pull-point subscription established at {}", sub_path);
+
+    // ── Step 2: PullMessages loop ────────────────────────────────────────
+    bool caller_cancelled = false;
+    while (!caller_cancelled) {
+        std::string pull_body =
+            R"(<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+                 xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+              <s:Header>)" + wsseHeader(cfg.username, cfg.password) + R"(</s:Header>
+              <s:Body>
+                <tev:PullMessages>
+                  <tev:Timeout>PT5S</tev:Timeout>
+                  <tev:MessageLimit>100</tev:MessageLimit>
+                </tev:PullMessages>
+              </s:Body>
+            </s:Envelope>)";
+
+        auto pull_resp = http.post(sub_path, pull_body,
+                                   /*digest=*/false, "application/soap+xml");
+
+        if (!pull_resp.ok()) {
+            // Camera disconnected / subscription expired. Bail out so the
+            // outer worker loop reconnects from CreatePullPointSubscription.
+            LOG_WARN("[ONVIFCore] PullMessages returned status={} on {}:{} — "
+                     "subscription dropped, will re-establish.",
+                     pull_resp.status, cfg.host, cfg.http_port);
+            break;
+        }
+
+        pugi::xml_document pull_doc;
+        if (!pull_doc.load_string(pull_resp.body.c_str())) {
+            // Couldn't parse — skip this round but keep the subscription open.
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+
+        for (auto& nm : pull_doc.select_nodes(".//NotificationMessage")) {
+            auto nm_node = nm.node();
+            std::string topic = nm_node.child_value("Topic");
+            if (topic.empty()) {
+                // Defensive: some devices nest Topic under wsnt:.
+                if (auto t = nm_node.select_node(".//Topic").node()) topic = t.child_value();
+            }
+            if (topic.empty()) continue;
+
+            // ONVIF data convention: `<Data><SimpleItem Name="State|IsMotion|..." Value="true|false|1|0"/></Data>`.
+            bool active = true;
+            for (auto& si : nm_node.select_nodes(".//Message//Data//SimpleItem")) {
+                std::string v = si.node().attribute("Value").as_string();
+                if (v == "0" || v == "false" || v == "False") active = false;
+            }
+
+            std::string source_val;
+            for (auto& si : nm_node.select_nodes(".//Message//Source//SimpleItem")) {
+                source_val = si.node().attribute("Value").as_string();
+                if (!source_val.empty()) break;
+            }
+
+            // Extract channel from source token (often "VideoSourceConfigToken_1"
+            // or just "1"). Fall back to 0.
+            int channel = 0;
+            for (auto it = source_val.rbegin(); it != source_val.rend(); ++it) {
+                if (!std::isdigit(static_cast<unsigned char>(*it))) {
+                    size_t pos = source_val.size() - (it - source_val.rbegin());
+                    if (pos < source_val.size()) {
+                        try { channel = std::stoi(source_val.substr(pos)); } catch (...) {}
+                    }
+                    break;
+                }
+            }
+
+            nlohmann::json envelope = {
+                {"type",       "camera_event"},
+                {"brand",      "ONVIF"},
+                {"event_type", onvifTopicToEventType(topic)},
+                {"active",     active},
+                {"channel",    channel},
+                {"topic",      topic},
+                {"source",     source_val},
+                {"timestamp",  (long long)std::time(nullptr)}
+            };
+
+            if (!onEvent(envelope.dump())) {
+                caller_cancelled = true;
+                break;
+            }
+        }
+    }
+
+    // ── Step 3: Unsubscribe (best-effort) ────────────────────────────────
+    std::string unsub_body =
+        R"(<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+             xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+             xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+          <s:Header>)" + wsseHeader(cfg.username, cfg.password) + R"(</s:Header>
+          <s:Body><wsnt:Unsubscribe/></s:Body>
+        </s:Envelope>)";
+    http.post(sub_path, unsub_body, /*digest=*/false, "application/soap+xml");
+    LOG_INFO("[ONVIFCore] Event subscription closed for {}:{}", cfg.host, cfg.http_port);
 }
 
 } // namespace brands
