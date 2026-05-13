@@ -4,6 +4,7 @@
 #include "utils/background_job_runner.h"
 #include "utils/email_sender.h"
 #include "utils/logger.h"
+#include "utils/url_validator.h"
 #include <QSqlQuery>
 #include <QSqlError>
 #include <curl/curl.h>
@@ -103,6 +104,31 @@ void AlertManager::sendEmail(const vms::Event& event, const std::string& recipie
 }
 
 void AlertManager::sendWebhook(const vms::Event& event, const std::string& url) {
+    // Scheme guard. Webhook URLs come from the alert_rules table populated via
+    // the ALERT_WRITE-gated POST /api/alerts/rules — operator-trusted input,
+    // but a misconfiguration could still steer the request at file:// or other
+    // schemes cURL would happily process.
+    bool is_http  = url.rfind("http://",  0) == 0;
+    bool is_https = url.rfind("https://", 0) == 0;
+    if (!is_http && !is_https) {
+        LOG_ERROR("AlertManager: Webhook rejected — URL must be http(s)://. Got: {}", url);
+        return;
+    }
+
+    // SSRF guard + DNS-rebind pin. Pre-fix this site had NO SSRF check at all
+    // (audit gap exposed by 2026-05-12 SSRF TOCTOU follow-up): an operator
+    // configuring recipient=http://192.168.x.x/internal would silently get a
+    // POST to any LAN target reachable from the backend host. AlertRouter's
+    // sendWebhook already validates; this is the parallel legacy path firing
+    // from EventManager::broadcast → AlertManager::processEvent → here.
+    auto v = vms::utils::isInternalUrl(url);
+    if (v.internal) {
+        LOG_ERROR("AlertManager: Webhook rejected (SSRF guard): host='{}' resolved='{}' reason={}",
+                  v.host, v.resolved_ip, v.reason);
+        return;
+    }
+    std::string resolve_entry = vms::utils::buildResolveEntry(v);
+
     // Build the payload on the calling thread (EventManager broadcast loop)
     // so a stale `event` reference can't outlive the queued job. Then hand
     // the cheap value-type copy to the background runner — the actual
@@ -116,13 +142,14 @@ void AlertManager::sendWebhook(const vms::Event& event, const std::string& url) 
     std::string json_str = payload.dump();
     std::string url_copy = url;
 
-    if (!webhookRunner().submit([url_copy, json_str]() {
+    if (!webhookRunner().submit([url_copy, json_str, resolve_entry]() {
         if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
         CURL* curl = curl_easy_init();
         if (!curl) return;
 
         struct curl_slist* headers = nullptr;
+        struct curl_slist* resolve_list = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
 
         curl_easy_setopt(curl, CURLOPT_URL, url_copy.c_str());
@@ -134,12 +161,18 @@ void AlertManager::sendWebhook(const vms::Event& event, const std::string& url) 
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
+        if (!resolve_entry.empty()) {
+            resolve_list = curl_slist_append(nullptr, resolve_entry.c_str());
+            curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve_list);
+        }
+
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
             LOG_ERROR("AlertManager: Webhook to {} failed: {}", url_copy, curl_easy_strerror(res));
         }
 
         curl_slist_free_all(headers);
+        if (resolve_list) curl_slist_free_all(resolve_list);
         curl_easy_cleanup(curl);
     })) {
         LOG_THROTTLED_WARN(5000, "AlertManager: webhook queue full, dropping send to {}", url_copy);

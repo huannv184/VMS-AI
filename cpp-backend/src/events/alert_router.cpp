@@ -9,6 +9,7 @@
 #include "utils/background_job_runner.h"
 #include "utils/email_sender.h"
 #include "utils/logger.h"
+#include "utils/url_validator.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include "database/db_manager.h"
 #include <algorithm>
@@ -688,31 +689,45 @@ void AlertRouter::sendSMS(const CorrelatedEvent& event, const AlertRule& rule) {
     }
 }
 
-// Helper to handle curl post on a detached thread
-static void executeAsyncPost(const std::string& url, const std::string& payload) {
+// Helper to handle curl post on a detached thread.
+// `resolve_entry` (optional) is a "host:port:ip" string from
+// vms::utils::buildResolveEntry() — when non-empty, it pins cURL's DNS lookup
+// so the connect() goes to the IP we already verified is public, closing the
+// DNS-rebind TOCTOU window between isInternalUrl()'s getaddrinfo and the HTTP
+// request. Hostname stays in CURLOPT_URL for SNI / TLS cert validation.
+static void executeAsyncPost(const std::string& url,
+                             const std::string& payload,
+                             const std::string& resolve_entry = "") {
     if (vms::core::shutting_down.load(std::memory_order_acquire)) {
         return;
     }
 
-    if (!webhookRunner().submit([url, payload]() {
+    if (!webhookRunner().submit([url, payload, resolve_entry]() {
         CURL* curl = curl_easy_init();
         if (!curl) return;
-        
+
         struct curl_slist* headers = NULL;
+        struct curl_slist* resolve_list = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
-        
+
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-        
+
+        if (!resolve_entry.empty()) {
+            resolve_list = curl_slist_append(nullptr, resolve_entry.c_str());
+            curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve_list);
+        }
+
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
             LOG_ERROR("[AlertRouter] HTTP post failed: {}", curl_easy_strerror(res));
         }
-        
+
         curl_slist_free_all(headers);
+        if (resolve_list) curl_slist_free_all(resolve_list);
         curl_easy_cleanup(curl);
     })) {
         LOG_THROTTLED_WARN(5000, "[AlertRouter] Webhook queue full, dropping async post");
@@ -731,20 +746,24 @@ void AlertRouter::sendWebhook(const CorrelatedEvent& event, const AlertRule& rul
         return;
     }
 
-    // [MUST-FIX] SSRF Protection: Blacklist private IP ranges
-    // This is a simplified check. In production, resolve the hostname and check the IP.
-    if (url.find("://localhost") != std::string::npos ||
-        url.find("://127.0.0.1") != std::string::npos ||
-        url.find("://192.168.") != std::string::npos ||
-        url.find("://10.") != std::string::npos ||
-        url.find("://172.16.") != std::string::npos ||
-        url.find("://169.254.169.254") != std::string::npos) {
-        LOG_ERROR("[AlertRouter] Webhook rejected: Internal/Private IP access denied (SSRF Protection): {}", url);
+    // SSRF protection — see utils/url_validator.h. Pre-fix this site did
+    // substring matching against literal IP prefixes which silently allowed
+    // IPv6 ([::1]), full RFC1918 /12 (172.17–172.31), 0.0.0.0, ULA, ANY
+    // hostname resolving to an internal IP, AWS-non-canonical metadata
+    // endpoints, and *.local mDNS. The validator now resolves the host via
+    // getaddrinfo and refuses if ANY answer record sits in a private/
+    // loopback/link-local/metadata range. The resolved IP is then pinned via
+    // CURLOPT_RESOLVE so the actual connect() can't be re-routed by a DNS
+    // flip between the validator and the HTTP request (TOCTOU closed).
+    auto v = vms::utils::isInternalUrl(url);
+    if (v.internal) {
+        LOG_ERROR("[AlertRouter] Webhook rejected (SSRF guard): host='{}' resolved='{}' reason={}",
+                  v.host, v.resolved_ip, v.reason);
         return;
     }
-    
+
     LOG_INFO("[AlertRouter] Webhook to {}: {}", rule.webhook_url, eventTypeToString(event.type));
-    executeAsyncPost(rule.webhook_url, event.toJSON().dump());
+    executeAsyncPost(rule.webhook_url, event.toJSON().dump(), vms::utils::buildResolveEntry(v));
 }
 
 void AlertRouter::sendMobilePush(const CorrelatedEvent& event, const AlertRule& rule) {
@@ -771,8 +790,19 @@ void AlertRouter::sendMobilePush(const CorrelatedEvent& event, const AlertRule& 
     payload["text"] = text;
     payload["parse_mode"] = "Markdown";
     
+    // Even though api.telegram.org is a hardcoded public destination, run it
+    // through the SSRF guard (+ pin via CURLOPT_RESOLVE) so an /etc/hosts or
+    // resolver-poisoning attack can't redirect bot-token-carrying POSTs at a
+    // LAN target. Validation cost is sub-ms.
+    auto v = vms::utils::isInternalUrl(url);
+    if (v.internal) {
+        LOG_ERROR("[AlertRouter] Telegram URL refused by SSRF guard: host='{}' resolved='{}' reason={}",
+                  v.host, v.resolved_ip, v.reason);
+        return;
+    }
+
     LOG_INFO("[AlertRouter] Sending Telegram notification to chat {}", chat_id);
-    executeAsyncPost(url, payload.dump());
+    executeAsyncPost(url, payload.dump(), vms::utils::buildResolveEntry(v));
 }
 
 // Most production deployments use a network-callable relay (HTTP/HTTPS) rather
