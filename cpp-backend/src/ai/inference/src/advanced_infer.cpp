@@ -33,15 +33,15 @@ static const char* COCO_CLASSES[] = {
 AdvancedInfer::AdvancedInfer(const InferConfig& config)
     : InferBase(config), config_(config)
 {
-    std::cout << "[AdvancedInfer] Created" << std::endl;
+    std::cerr << "[AdvancedInfer] Created" << std::endl;
 }
 
 AdvancedInfer::~AdvancedInfer() = default;
 
 bool AdvancedInfer::init() {
-    std::cout << "\n[AdvancedInfer] ========================================" << std::endl;
-    std::cout << "[AdvancedInfer] Initializing..." << std::endl;
-    std::cout << "[AdvancedInfer] ========================================" << std::endl;
+    std::cerr << "\n[AdvancedInfer] ========================================" << std::endl;
+    std::cerr << "[AdvancedInfer] Initializing..." << std::endl;
+    std::cerr << "[AdvancedInfer] ========================================" << std::endl;
     
     if (config_.model_path.empty()) {
         std::cerr << "[AdvancedInfer] ERROR: No model path provided!" << std::endl;
@@ -56,7 +56,7 @@ bool AdvancedInfer::init() {
     }
     file.close();
     
-    std::cout << "[AdvancedInfer] Loading YOLO engine: " << config_.model_path << std::endl;
+    std::cerr << "[AdvancedInfer] Loading YOLO engine: " << config_.model_path << std::endl;
     yolo_engine_ = std::make_unique<TrtEngine>(config_.model_path);
     
     if (!yolo_engine_->loadEngine()) {
@@ -65,10 +65,10 @@ bool AdvancedInfer::init() {
         return false;
     }
     
-    std::cout << "[AdvancedInfer] YOLO engine loaded successfully!" << std::endl;
+    std::cerr << "[AdvancedInfer] YOLO engine loaded successfully!" << std::endl;
     
     metrics_ = InferenceMetrics();
-    std::cout << "[AdvancedInfer] Initialization complete!" << std::endl;
+    std::cerr << "[AdvancedInfer] Initialization complete!" << std::endl;
     return true;
 }
 
@@ -590,7 +590,7 @@ bool AdvancedInfer::addFaceToDatabase(
     
     FaceIdentity identity(name, feature, 1.0f);
     face_database_.push_back(identity);
-    std::cout << "[AdvancedInfer] Added face to database: " << name << std::endl;
+    std::cerr << "[AdvancedInfer] Added face to database: " << name << std::endl;
     return true;
 }
 
@@ -600,7 +600,7 @@ bool AdvancedInfer::removeFaceFromDatabase(const std::string& name) {
     
     if (it != face_database_.end()) {
         face_database_.erase(it);
-        std::cout << "[AdvancedInfer] Removed face from database: " << name << std::endl;
+        std::cerr << "[AdvancedInfer] Removed face from database: " << name << std::endl;
         return true;
     }
     return false;
@@ -608,7 +608,7 @@ bool AdvancedInfer::removeFaceFromDatabase(const std::string& name) {
 
 void AdvancedInfer::clearDatabase() {
     face_database_.clear();
-    std::cout << "[AdvancedInfer] Cleared face database" << std::endl;
+    std::cerr << "[AdvancedInfer] Cleared face database" << std::endl;
 }
 
 size_t AdvancedInfer::getDatabaseSize() const {

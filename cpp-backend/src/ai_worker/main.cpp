@@ -14,7 +14,7 @@
 #include <csignal>
 #include <filesystem>
 #include <memory>
-#include <nlohmann/json.hpp> 
+#include <nlohmann/json.hpp>
 #include <sqlite3.h>
 #include <vector>
 #include <fstream>
@@ -22,6 +22,14 @@
 #include <zmq.hpp>
 #include <cctype>
 #include <stdexcept>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <dbghelp.h>
+#endif
 
 #include "../ai/ipc/shared_memory_manager.h"
 #include "../ai/inference/include/inference/multi_model_infer.h"
@@ -33,6 +41,88 @@ using json = nlohmann::json;
 
 // Global flag
 volatile std::sig_atomic_t g_running = 1;
+
+// ============================================================================
+// CRASH HANDLER — writes a full minidump on AV / heap corruption / SEH so the
+// caller (process_manager / camera_pipeline_manager) can post-mortem the
+// process instead of seeing only the bare exit code (-1073741819 = 0xC0000005
+// ACCESS_VIOLATION). Belt-and-suspenders with WER LocalDumps (set up by
+// scripts/setup_wer_aiworker_dumps.ps1): WER needs admin + registry; this
+// path needs neither and runs even on dev machines without HKLM access.
+// Output: logs/ai_worker_cam<id>_pid<pid>_<ts>.dmp next to vms_backend.exe.
+// ============================================================================
+#ifdef _WIN32
+static int g_crash_camera_id = 0;
+
+static LONG WINAPI ai_worker_crash_handler(EXCEPTION_POINTERS* eptr) {
+    DWORD code = eptr ? eptr->ExceptionRecord->ExceptionCode : 0;
+    void* addr  = eptr ? eptr->ExceptionRecord->ExceptionAddress : nullptr;
+
+    // STATUS_BREAKPOINT / STATUS_SINGLE_STEP — usually a debugger artifact or
+    // a CRT debug assertion. Terminating the worker on those would mask the
+    // real bug; mirror what backend main.cpp does and continue execution.
+    if (code == 0x80000003 || code == 0x80000004) {
+        std::cerr << "[AI-Worker-" << g_crash_camera_id
+                  << "] Breakpoint/single-step at 0x" << std::hex
+                  << reinterpret_cast<uintptr_t>(addr) << std::dec
+                  << " — continuing" << std::endl;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Best-effort dump path: <cwd>/logs/ai_worker_cam<id>_pid<pid>_<ts>.dmp.
+    // The worker's CWD is set by the spawning manager to the directory holding
+    // vms_backend.exe (build/Release/) so dumps land alongside cpp_backend.log.
+    CreateDirectoryA("logs", nullptr);
+    CreateDirectoryA("logs\\crashdumps", nullptr);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char dump_path[MAX_PATH];
+    _snprintf_s(dump_path, sizeof(dump_path), _TRUNCATE,
+                "logs\\crashdumps\\ai_worker_cam%d_pid%lu_%04d%02d%02d_%02d%02d%02d.dmp",
+                g_crash_camera_id,
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    HANDLE hFile = CreateFileA(dump_path, GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    bool wrote = false;
+    if (hFile != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei{};
+        mei.ThreadId          = GetCurrentThreadId();
+        mei.ExceptionPointers = eptr;
+        mei.ClientPointers    = FALSE;
+
+        // Full snapshot: data segments, threads, handles, unloaded modules.
+        // Heap is ~hundreds of MB at runtime (TRT engines hold it), but for
+        // bisecting a real AV that is exactly what we need; DumpCount in the
+        // WER reg gate at 10 keeps disk usage bounded over time.
+        const MINIDUMP_TYPE type = static_cast<MINIDUMP_TYPE>(
+            MiniDumpWithDataSegs | MiniDumpWithThreadInfo |
+            MiniDumpWithProcessThreadData | MiniDumpWithHandleData |
+            MiniDumpWithUnloadedModules);
+        wrote = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
+                                  hFile, type, &mei, nullptr, nullptr) != 0;
+        CloseHandle(hFile);
+    }
+
+    std::cerr << "[AI-Worker-" << g_crash_camera_id
+              << "] CRASH code=0x" << std::hex << code
+              << " addr=0x" << reinterpret_cast<uintptr_t>(addr)
+              << std::dec
+              << " minidump=" << (wrote ? dump_path : "FAILED")
+              << std::endl;
+
+    return EXCEPTION_EXECUTE_HANDLER; // process terminates after we return
+}
+
+static void install_ai_worker_crash_handler(int camera_id) {
+    g_crash_camera_id = camera_id;
+    SetUnhandledExceptionFilter(ai_worker_crash_handler);
+}
+#else
+static void install_ai_worker_crash_handler(int) {}
+#endif
 
 // Cap on the base64 image payload accepted by EXTRACT_EMBEDDING. Mirrors the
 // 10MB cap that face_controller.cpp:269 enforces before forwarding; the worker
@@ -372,7 +462,12 @@ int main(int argc, char** argv) {
     int camera_id = std::stoi(argv[1]);
     std::string model_path = argv[2];
     std::string db_path = (argc > 3) ? argv[3] : "data/events.db";
-    
+
+    // Install crash handler IMMEDIATELY after we know camera_id — before any
+    // model load, before SHM init. Anything that AVs from here on writes a
+    // minidump tagged with this camera id.
+    install_ai_worker_crash_handler(camera_id);
+
     std::cerr << "[AI-Worker-" << camera_id << "] Starting..." << std::endl;
     
     // ========================================
@@ -469,7 +564,34 @@ int main(int argc, char** argv) {
              std::cerr << "[AI-Worker-" << camera_id << "] Error parsing config: " << e.what() << std::endl;
         }
     }
-    
+
+    // Env-var bisect levers — applied AFTER JSON config so they always win.
+    // Use case: cmdline JSON escape is broken (the {"yolo":...} arg arrives as
+    // {\yolo\:...}) so JSON parse falls through to defaults; or operator wants
+    // to disable a specific model without touching the cameras.ai_config DB
+    // column. Each *_DISABLE flag forces the feature OFF unconditionally.
+    auto env_truthy = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && *v && std::atoi(v) != 0;
+    };
+    if (env_truthy("VMS_AI_DISABLE_YOLO")) {
+        ai_config.enable_yolo = false;
+        std::cerr << "[AI-Worker-" << camera_id << "] VMS_AI_DISABLE_YOLO=1 — yolo OFF" << std::endl;
+    }
+    if (env_truthy("VMS_AI_DISABLE_FACE")) {
+        ai_config.enable_face_detection   = false;
+        ai_config.enable_face_recognition = false;
+        std::cerr << "[AI-Worker-" << camera_id << "] VMS_AI_DISABLE_FACE=1 — face detect+recog OFF" << std::endl;
+    }
+    if (env_truthy("VMS_AI_DISABLE_LPR")) {
+        ai_config.enable_lpr = false;
+        std::cerr << "[AI-Worker-" << camera_id << "] VMS_AI_DISABLE_LPR=1 — lpr OFF" << std::endl;
+    }
+    if (env_truthy("VMS_AI_DISABLE_FIRE")) {
+        ai_config.enable_fire_detection = false;
+        std::cerr << "[AI-Worker-" << camera_id << "] VMS_AI_DISABLE_FIRE=1 — fire OFF" << std::endl;
+    }
+
     // ========================================
     // 3. Init AI Engine
     // ========================================
@@ -852,7 +974,27 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                auto tracked_faces = faceTracker.update(result.faces);
+                // BUG-AIW-FACETRACKER-CATCH (debug 2026-05-10): pre-fix this
+                // call had no exception guard, so a std::exception thrown from
+                // FaceTracker (e.g. on malformed result.faces with NaN coords)
+                // unwound straight through the loop's catch and lost the per-
+                // frame context. The objectTracker block above already has the
+                // same guard for the same reason. AV is still caught by the
+                // SetUnhandledExceptionFilter installed in main().
+                std::vector<inference::TrackedFace> tracked_faces;
+                try {
+                    tracked_faces = faceTracker.update(result.faces);
+                } catch (const std::exception& e) {
+                    std::cerr << "[AI-Worker-" << camera_id
+                              << "] FaceTracker.update EXCEPTION: " << e.what()
+                              << " — skipping face tracking this frame" << std::endl;
+                    tracked_faces.clear();
+                } catch (...) {
+                    std::cerr << "[AI-Worker-" << camera_id
+                              << "] FaceTracker.update UNKNOWN exception"
+                              << " — skipping face tracking this frame" << std::endl;
+                    tracked_faces.clear();
+                }
 
                 // Back-propagate stable identity into result.faces before SHM write.
                 // Per-frame recognition fluctuates; stable_person_id is accumulated over

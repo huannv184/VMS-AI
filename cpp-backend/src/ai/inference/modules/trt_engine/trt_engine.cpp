@@ -6,26 +6,83 @@
 #include "trt_engine.h"
 #include <fstream>
 #include <iostream>
+#include <sstream>
+#include <string>
 
 // ---- spdlog-compatible shim for ai_worker (no spdlog linkage) ----
-// Accepts fmt-style format string but only prints the format string + first arg
+//
+// BUG-AIW-LOGFMT-01 (P0 fix 2026-05-10): pre-fix the shim accepted a fmt-style
+// format string + variadic args but DROPPED every arg, only printing the raw
+// format text — so "[TrtEngine] Engine file size: {} bytes" was emitted with
+// the literal `{}` placeholder, every TRT diagnostic lost its values. With 4
+// AI workers this filled cpp_backend.log with hundreds of useless lines per
+// boot and made AV/perf debugging effectively blind. This implements a tiny
+// `{}`-substituting formatter — enough to make TrtEngine logs readable,
+// without dragging fmt or spdlog into the ai_worker link line.
 namespace spdlog {
-    template<typename... Args>
-    inline void info(const char* fmt, Args&&...) {
-        std::cerr << "[INFO] " << fmt << std::endl;
+
+namespace shim_detail {
+
+template<typename T>
+inline std::string to_log_string(T&& v) {
+    std::ostringstream os;
+    os << std::forward<T>(v);
+    return os.str();
+}
+inline std::string to_log_string(const char* s) {
+    return s ? std::string(s) : std::string("(null)");
+}
+inline std::string to_log_string(std::nullptr_t) { return "(null)"; }
+
+inline void format_into(std::ostringstream& out, const char* fmt) {
+    out << fmt; // remaining format text, no more args
+}
+
+template<typename T, typename... Rest>
+inline void format_into(std::ostringstream& out, const char* fmt, T&& v, Rest&&... rest) {
+    if (fmt == nullptr) return;
+    const char* p = fmt;
+    while (*p) {
+        if (p[0] == '{' && p[1] == '}') {
+            out.write(fmt, p - fmt);
+            out << to_log_string(std::forward<T>(v));
+            format_into(out, p + 2, std::forward<Rest>(rest)...);
+            return;
+        }
+        ++p;
     }
-    template<typename... Args>
-    inline void error(const char* fmt, Args&&...) {
-        std::cerr << "[ERROR] " << fmt << std::endl;
-    }
-    template<typename... Args>
-    inline void warn(const char* fmt, Args&&...) {
-        std::cerr << "[WARN] " << fmt << std::endl;
-    }
-    template<typename... Args>
-    inline void debug(const char* fmt, Args&&...) {
-        std::cerr << "[DEBUG] " << fmt << std::endl;
-    }
+    // No `{}` left → flush remaining literal; surplus args are silently
+    // discarded to mirror fmt::format's behaviour on argument overflow rather
+    // than throw at runtime.
+    out << fmt;
+}
+
+template<typename... Args>
+inline std::string format_message(const char* fmt, Args&&... args) {
+    std::ostringstream os;
+    format_into(os, fmt ? fmt : "", std::forward<Args>(args)...);
+    return os.str();
+}
+
+} // namespace shim_detail
+
+template<typename... Args>
+inline void info(const char* fmt, Args&&... args) {
+    std::cerr << "[INFO] " << shim_detail::format_message(fmt, std::forward<Args>(args)...) << std::endl;
+}
+template<typename... Args>
+inline void error(const char* fmt, Args&&... args) {
+    std::cerr << "[ERROR] " << shim_detail::format_message(fmt, std::forward<Args>(args)...) << std::endl;
+}
+template<typename... Args>
+inline void warn(const char* fmt, Args&&... args) {
+    std::cerr << "[WARN] " << shim_detail::format_message(fmt, std::forward<Args>(args)...) << std::endl;
+}
+template<typename... Args>
+inline void debug(const char* fmt, Args&&... args) {
+    std::cerr << "[DEBUG] " << shim_detail::format_message(fmt, std::forward<Args>(args)...) << std::endl;
+}
+
 } // namespace spdlog
 
 namespace inference {

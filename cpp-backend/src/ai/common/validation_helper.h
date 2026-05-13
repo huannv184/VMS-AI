@@ -157,20 +157,20 @@ struct ValidationStats {
     uint32_t invalid_face_bbox = 0;
     
     void print() const {
-        std::cout << "\n[Validation Stats]\n";
-        std::cout << "Objects: " << valid_objects << "/" << total_objects 
+        std::cerr << "\n[Validation Stats]\n";
+        std::cerr << "Objects: " << valid_objects << "/" << total_objects 
                  << " valid (" 
                  << (total_objects > 0 ? (100.0 * valid_objects / total_objects) : 0.0) 
                  << "%)\n";
-        std::cout << "  - Invalid confidence: " << invalid_conf << "\n";
-        std::cout << "  - Invalid bbox: " << invalid_bbox << "\n";
-        std::cout << "  - Below threshold: " << below_threshold << "\n";
-        std::cout << "Faces: " << valid_faces << "/" << total_faces 
+        std::cerr << "  - Invalid confidence: " << invalid_conf << "\n";
+        std::cerr << "  - Invalid bbox: " << invalid_bbox << "\n";
+        std::cerr << "  - Below threshold: " << below_threshold << "\n";
+        std::cerr << "Faces: " << valid_faces << "/" << total_faces 
                  << " valid (" 
                  << (total_faces > 0 ? (100.0 * valid_faces / total_faces) : 0.0) 
                  << "%)\n";
-        std::cout << "  - Invalid confidence: " << invalid_face_conf << "\n";
-        std::cout << "  - Invalid bbox: " << invalid_face_bbox << "\n";
+        std::cerr << "  - Invalid confidence: " << invalid_face_conf << "\n";
+        std::cerr << "  - Invalid bbox: " << invalid_face_bbox << "\n";
     }
 };
 

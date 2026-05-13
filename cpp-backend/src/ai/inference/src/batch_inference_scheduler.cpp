@@ -69,7 +69,7 @@ bool BatchInferenceScheduler::init() {
     running_ = true;
     infer_thread_ = std::thread(&BatchInferenceScheduler::inferenceLoop, this);
 
-    std::cout << "[BatchScheduler] Ready: max_batch=" << cfg_.max_batch_size
+    std::cerr << "[BatchScheduler] Ready: max_batch=" << cfg_.max_batch_size
               << " wait=" << cfg_.max_wait_ms << "ms"
               << " input=" << cfg_.input_w << "x" << cfg_.input_h
               << " per_frame_out=" << engine_->perFrameOutputElements() << "\n";

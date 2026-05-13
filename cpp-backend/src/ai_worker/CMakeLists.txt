@@ -77,11 +77,23 @@ target_link_libraries(ai_worker_v2 PRIVATE
     cppzmq
     ${OpenCV_LIBS}
     CUDA::cudart
+    # Dbghelp for MiniDumpWriteDump in the SetUnhandledExceptionFilter
+    # crash handler (main.cpp install_ai_worker_crash_handler).
+    $<$<PLATFORM_ID:Windows>:Dbghelp>
 )
 
 if(MSVC)
     target_compile_definitions(ai_worker_v2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_options(ai_worker_v2 PRIVATE /utf-8)
+    # Emit PDB + cross-reference to it in the EXE so the minidump consumer
+    # (WinDbg / VS) can resolve symbols without a separate sympath setup.
+    # /MAP also writes a textual symbol→VA map next to the EXE so we can
+    # symbolicate AV crash addresses without WinDbg installed (the in-house
+    # scripts/symbolize.py uses dbghelp.dll which needs full PDB symbols
+    # across all OBJs; /MAP works straight off the linker even when only
+    # this target is built with /Zi).
+    target_compile_options(ai_worker_v2 PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(ai_worker_v2 PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF /MAP /MAPINFO:EXPORTS>)
 endif()
 
 # Output next to vms_backend.exe for both single-config and multi-config generators

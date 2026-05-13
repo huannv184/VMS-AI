@@ -125,9 +125,17 @@ public:
     
     bool initialize() {
         std::lock_guard<std::mutex> lock(local_mutex);
-        
-        std::cout << "[SHM] Creating shared memory: " << shm_name << "\n";
-        std::cout << "[SHM] Size: " << shm_size << " bytes (" 
+
+        // BUG-AIW-IPC-POLLUTION-01 (P0 fix 2026-05-10): this header is shared
+        // between vms_backend.exe and ai_worker_v2.exe. The AI worker reserves
+        // stdout for the JSON IPC protocol consumed by camera_pipeline_manager
+        // (one JSON object per line). Any stray `std::cout` here injects log
+        // text into the IPC stream → manager parser drops the line. Backend
+        // side is unaffected (cout goes to its log forwarder), but a unified
+        // `cerr` is fine for both sides since these are diagnostic messages,
+        // not protocol output. Same change applied at the other 4 sites below.
+        std::cerr << "[SHM] Creating shared memory: " << shm_name << "\n";
+        std::cerr << "[SHM] Size: " << shm_size << " bytes ("
                   << std::fixed << std::setprecision(2) << (shm_size / 1024.0) << " KB)\n";
         
         if (shm_size == 0 || shm_size > 10 * 1024 * 1024) {
@@ -211,7 +219,7 @@ public:
         }
 #endif
 
-        std::cout << "[SHM] ✅ Initialization complete\n";
+        std::cerr << "[SHM] ✅ Initialization complete\n";
         return true;
     }
     
@@ -280,11 +288,12 @@ public:
             ipc::memory_barrier_write();
             shm_ptr->header.sequence = seq + 2; // Mark as complete (even number)
             
-            // Debug logging (every 100 frames)
+            // Debug logging (every 100 frames) — must be cerr in ai_worker
+            // (stdout is reserved for JSON IPC).
             static std::atomic<int> log_counter{0};
             if (log_counter.fetch_add(1) % 100 == 0) {
-                std::cout << "[SHM] ✅ Frame " << result.frame_id 
-                          << " | Objects: " << obj_count 
+                std::cerr << "[SHM] ✅ Frame " << result.frame_id
+                          << " | Objects: " << obj_count
                           << " | Camera: " << camera_id << "\n";
             }
             
@@ -388,9 +397,9 @@ public:
 
             uint32_t count = std::min(shm_ptr->header.object_count, (uint32_t)ipc::MAX_OBJECTS);
             
-            // Debug log if count > 0
+            // Debug log if count > 0 — cerr to keep stdout clean for IPC.
             if (count > 0 && shm_ptr->header.frame_id % 100 == 0) {
-                std::cout << "[SHM-Read] Frame " << shm_ptr->header.frame_id 
+                std::cerr << "[SHM-Read] Frame " << shm_ptr->header.frame_id
                           << " has " << count << " objects (Header Count: " << shm_ptr->header.object_count << ")\n";
             }
 

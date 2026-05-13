@@ -159,8 +159,21 @@ std::vector<TrackedObject> ObjectTracker::update(
     }
     
     // Mark unmatched trackers as lost
+    // BUG-AIW-OBJTRACK-AV-01 (debug 2026-05-10): pre-fix this loop was bounded
+    // by `trackers_.size()`, but `trackers_` may have grown above the size
+    // that was used to construct `trk_matched` — `initNewTrack` at line 157
+    // appends new trackers for unmatched detections. On the very first frame
+    // with any detection, `trackers_` starts empty, so `trk_matched` is built
+    // as `vector<bool>(0, false)` whose `_M_start` is NULL on MSVC. After
+    // `initNewTrack` runs, `trackers_.size()` jumps to N > 0, then reading
+    // `trk_matched[0]` dereferences NULL → ACCESS_VIOLATION 0xC0000005
+    // in the ai_worker_v2 process. Reproduced deterministically on cam 2 and
+    // cam 3 (7 minidumps all crashing at exe offset 0x36BC4 = bit-iter over
+    // vector<bool>). Fix: iterate over the ORIGINAL trk_matched range — the
+    // freshly created tracks at indices ≥ trk_matched.size() were built from
+    // detections in initNewTrack and are matched-by-definition, never lost.
     std::vector<int> unmatched_trackers;
-    for (size_t i = 0; i < trackers_.size(); i++) {
+    for (size_t i = 0; i < trk_matched.size(); i++) {
         if (!trk_matched[i]) {
             unmatched_trackers.push_back(i);
         }
@@ -391,7 +404,7 @@ void ObjectTracker::removeStaleTracks() {
     // SAFETY CAP: Prevent unbounded growth (Memory Leak Protection)
     const size_t MAX_TRACKS_LIMIT = 2000;
     if (trackers_.size() > MAX_TRACKS_LIMIT) {
-        std::cout << "[ObjectTracker] WARNING: Track limit reached (" << trackers_.size() 
+        std::cerr << "[ObjectTracker] WARNING: Track limit reached (" << trackers_.size() 
                   << "), removing oldest tracks.\n";
         
         // Remove oldest 10%

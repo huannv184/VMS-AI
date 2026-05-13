@@ -15,17 +15,17 @@ namespace inference {
 
 MultiModelInfer::MultiModelInfer(const Config& config)
     : config_(config), next_person_id_(0) {
-    std::cout << "[MultiModelInfer] Created" << std::endl;
+    std::cerr << "[MultiModelInfer] Created" << std::endl;
 }
 
 MultiModelInfer::~MultiModelInfer() {
-    std::cout << "[MultiModelInfer] Destroyed" << std::endl;
+    std::cerr << "[MultiModelInfer] Destroyed" << std::endl;
 }
 
 bool MultiModelInfer::init() {
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "[MultiModelInfer] Initializing Multi-Model System..." << std::endl;
-    std::cout << "========================================\n" << std::endl;
+    std::cerr << "\n========================================" << std::endl;
+    std::cerr << "[MultiModelInfer] Initializing Multi-Model System..." << std::endl;
+    std::cerr << "========================================\n" << std::endl;
     
     // YOLO INITIALIZATION
     if (config_.enable_yolo) {
@@ -42,7 +42,7 @@ bool MultiModelInfer::init() {
             } else {
                 yolo_file.close();
                 
-                std::cout << "[MultiModelInfer] Loading YOLO model..." << std::endl;
+                std::cerr << "[MultiModelInfer] Loading YOLO model..." << std::endl;
                 
                 InferConfig yolo_cfg;
                 yolo_cfg.model_path = config_.yolo_model_path;
@@ -57,7 +57,7 @@ bool MultiModelInfer::init() {
                     config_.enable_yolo = false;
                     yolo_infer_.reset();
                 } else {
-                    std::cout << "[MultiModelInfer] ✓ YOLO loaded" << std::endl;
+                    std::cerr << "[MultiModelInfer] ✓ YOLO loaded" << std::endl;
                 }
             }
         }
@@ -65,7 +65,7 @@ bool MultiModelInfer::init() {
 
     // FIRE/SMOKE INITIALIZATION
     if (config_.enable_fire_detection && !config_.fire_model_path.empty()) {
-        std::cout << "[MultiModelInfer] Loading Fire/Smoke model..." << std::endl;
+        std::cerr << "[MultiModelInfer] Loading Fire/Smoke model..." << std::endl;
         std::ifstream fire_file(config_.fire_model_path);
         if (!fire_file.good()) {
             std::cerr << "[MultiModelInfer] WARNING: Fire model not found: " << config_.fire_model_path << std::endl;
@@ -85,7 +85,7 @@ bool MultiModelInfer::init() {
                 config_.enable_fire_detection = false;
                 fire_infer_.reset();
             } else {
-                 std::cout << "[MultiModelInfer] ✓ Fire/Smoke model loaded" << std::endl;
+                 std::cerr << "[MultiModelInfer] ✓ Fire/Smoke model loaded" << std::endl;
             }
         }
     } else {
@@ -94,7 +94,7 @@ bool MultiModelInfer::init() {
     
     // SCRFD INITIALIZATION
     if (config_.enable_face_detection && !config_.scrfd_model_path.empty()) {
-        std::cout << "[MultiModelInfer] Loading SCRFD..." << std::endl;
+        std::cerr << "[MultiModelInfer] Loading SCRFD..." << std::endl;
         
         std::ifstream scrfd_file(config_.scrfd_model_path);
         if (!scrfd_file.good()) {
@@ -109,7 +109,7 @@ bool MultiModelInfer::init() {
                 config_.enable_face_detection = false;
                 scrfd_engine_.reset();
             } else {
-                std::cout << "[MultiModelInfer] ✓ SCRFD loaded" << std::endl;
+                std::cerr << "[MultiModelInfer] ✓ SCRFD loaded" << std::endl;
             }
         }
     } else {
@@ -118,7 +118,7 @@ bool MultiModelInfer::init() {
     
     // LPR INITIALIZATION
     if (config_.enable_lpr && !config_.plate_detect_model_path.empty() && !config_.lpr_model_path.empty()) {
-         std::cout << "[MultiModelInfer] Loading LPR Models..." << std::endl;
+         std::cerr << "[MultiModelInfer] Loading LPR Models..." << std::endl;
          
          // 1. Plate Detector (YOLO)
          InferConfig plate_cfg;
@@ -133,7 +133,7 @@ bool MultiModelInfer::init() {
              std::cerr << "[MultiModelInfer] Plate Detector init failed" << std::endl;
              config_.enable_lpr = false;
          } else {
-             std::cout << "[MultiModelInfer] ✓ Plate Detector loaded" << std::endl;
+             std::cerr << "[MultiModelInfer] ✓ Plate Detector loaded" << std::endl;
              
              // 2. LPRNet
              lpr_engine_ = std::make_unique<TrtEngine>(config_.lpr_model_path);
@@ -142,7 +142,7 @@ bool MultiModelInfer::init() {
                   config_.enable_lpr = false;
                   lpr_engine_.reset();
              } else {
-                  std::cout << "[MultiModelInfer] ✓ LPRNet loaded" << std::endl;
+                  std::cerr << "[MultiModelInfer] ✓ LPRNet loaded" << std::endl;
              }
          }
     } else {
@@ -152,10 +152,10 @@ bool MultiModelInfer::init() {
     // ARCFACE INITIALIZATION
     if (config_.enable_face_recognition && !config_.arcface_model_path.empty()) {
         if (!config_.enable_face_detection) {
-            std::cout << "[MultiModelInfer] Face recognition disabled (no face detection)" << std::endl;
+            std::cerr << "[MultiModelInfer] Face recognition disabled (no face detection)" << std::endl;
             config_.enable_face_recognition = false;
         } else {
-            std::cout << "[MultiModelInfer] Loading ArcFace..." << std::endl;
+            std::cerr << "[MultiModelInfer] Loading ArcFace..." << std::endl;
             
             std::ifstream arcface_file(config_.arcface_model_path);
             if (!arcface_file.good()) {
@@ -170,7 +170,7 @@ bool MultiModelInfer::init() {
                     config_.enable_face_recognition = false;
                     arcface_engine_.reset();
                 } else {
-                    std::cout << "[MultiModelInfer] ✓ ArcFace loaded" << std::endl;
+                    std::cerr << "[MultiModelInfer] ✓ ArcFace loaded" << std::endl;
                 }
             }
         }
@@ -180,17 +180,17 @@ bool MultiModelInfer::init() {
     
     metrics_ = {};
     
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "[MultiModelInfer] Initialization Complete!" << std::endl;
-    std::cout << "  " << (config_.enable_yolo ? "✓" : "✗") << " YOLO: " 
+    std::cerr << "\n========================================" << std::endl;
+    std::cerr << "[MultiModelInfer] Initialization Complete!" << std::endl;
+    std::cerr << "  " << (config_.enable_yolo ? "✓" : "✗") << " YOLO: " 
               << (config_.enable_yolo ? "ENABLED" : "DISABLED") << std::endl;
-    std::cout << "  " << (config_.enable_fire_detection ? "✓" : "✗") << " Fire/Smoke: " 
+    std::cerr << "  " << (config_.enable_fire_detection ? "✓" : "✗") << " Fire/Smoke: " 
               << (config_.enable_fire_detection ? "ENABLED" : "DISABLED") << std::endl;
-    std::cout << "  " << (config_.enable_face_detection ? "✓" : "✗") << " SCRFD: " 
+    std::cerr << "  " << (config_.enable_face_detection ? "✓" : "✗") << " SCRFD: " 
               << (config_.enable_face_detection ? "ENABLED" : "DISABLED") << std::endl;
-    std::cout << "  " << (config_.enable_face_recognition ? "✓" : "✗") << " ArcFace: " 
+    std::cerr << "  " << (config_.enable_face_recognition ? "✓" : "✗") << " ArcFace: " 
               << (config_.enable_face_recognition ? "ENABLED" : "DISABLED") << std::endl;
-    std::cout << "========================================\n" << std::endl;
+    std::cerr << "========================================\n" << std::endl;
     
     return true;
 }
@@ -845,13 +845,44 @@ float MultiModelInfer::calculateFaceIoU(const FaceDetectionResult& a, const Face
 
 bool MultiModelInfer::addPerson(int id, const std::string& name, const std::vector<float>& embedding) {
     if (embedding.size() != 512 || name.empty()) return false;
-    
+
+    // BUG-AIW-FACEDB-CAP-01 (P0 fix 2026-05-10): pre-fix face_database_ grew
+    // unbounded. Each PersonEntry holds a 512-float embedding (2 KB) + name
+    // string, so 1M faces ≈ 2.5 GB heap inside every per-camera AI worker.
+    // RELOAD_FACE_DB ZMQ command (BUG-AIW-FACEDB-01 wiring) replays the whole
+    // SQLite `persons` table on every CUD op, so a misconfigured DB or a
+    // future bulk-import endpoint could OOM the worker without a single
+    // log line. Cap at 100K by default (~250 MB resident, well under any
+    // reasonable face-recognition deployment) with env override for sites
+    // that genuinely need more. Hard-fail-loud at the cap so the operator
+    // sees the rejection in cpp_backend.log instead of silent partial load.
+    static const size_t kMaxFaceDbEntries = []() {
+        const char* e = std::getenv("VMS_MAX_FACE_DB_ENTRIES");
+        if (e && *e) {
+            try {
+                long v = std::stol(e);
+                if (v > 0 && v < 10'000'000) return static_cast<size_t>(v);
+            } catch (...) {}
+        }
+        return static_cast<size_t>(100'000);
+    }();
+    if (face_database_.size() >= kMaxFaceDbEntries) {
+        static thread_local int warned = 0;
+        if ((warned++ % 100) == 0) {
+            std::cerr << "[MultiModelInfer] face_database_ cap reached ("
+                      << kMaxFaceDbEntries << " entries) — rejecting addPerson id=" << id
+                      << " name='" << name << "'. Override via VMS_MAX_FACE_DB_ENTRIES."
+                      << std::endl;
+        }
+        return false;
+    }
+
     PersonEntry person;
     person.id = id;
     person.name = name;
     person.embedding = embedding;
     face_database_.push_back(person);
-    
+
     return true;
 }
 
