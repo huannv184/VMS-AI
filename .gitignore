@@ -36,6 +36,7 @@ node_modules/
 *.vcxproj
 *.vcxproj.filters
 *.sln
+*.obj
 cmake_install.cmake
 CMakeCache.txt
 CMakeFiles/
@@ -45,10 +46,17 @@ RUN_TESTS.cmake
 install_manifest.txt
 vcpkg_installed/
 
+# Frontend build output
+vms-frontend/dist/
+
+# OS / editor litter
+.DS_Store
+
 # External service binaries (large, downloaded at setup time)
 external_services/postgresql/bin/
 external_services/postgresql/lib/
 external_services/postgresql/pgAdmin 4/
+external_services/postgresql/symbols/
 external_services/minio.exe
 external_services/mediamtx/mediamtx.exe
 
