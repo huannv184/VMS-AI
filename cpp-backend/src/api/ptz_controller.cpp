@@ -35,11 +35,6 @@ std::optional<int> parsePresetIdentifier(const json& body) {
 
 } // namespace
 
-// PENDING-AUDIT-2026-05-09: 2 empty-capture handlers (presets list, capabilities GET).
-// C4 fix (2026-04-18) covered mutating PTZ ops but missed these read-side GETs.
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (ptz presets list)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (ptz capabilities)
 void PTZController::registerRoutes(vms::server::VmsApp& app) {
 
     // POST /api/ptz/<cam_id>/move — Continuous move
@@ -74,7 +69,7 @@ void PTZController::registerRoutes(vms::server::VmsApp& app) {
         } catch (const json::exception& e) {
             return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -115,7 +110,7 @@ void PTZController::registerRoutes(vms::server::VmsApp& app) {
             if (!ok) return ApiUtils::createErrorResponse("PTZ absolute move failed", 500, origin);
             return ApiUtils::createResponse(json::object(), 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -140,17 +135,19 @@ void PTZController::registerRoutes(vms::server::VmsApp& app) {
             if (!ok) return ApiUtils::createErrorResponse("PTZ relative move failed", 500, origin);
             return ApiUtils::createResponse(json::object(), 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET /api/ptz/<cam_id>/presets — List presets
     CROW_ROUTE(app, "/api/ptz/<int>/presets")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int camera_id) {
+    ([&app](const crow::request& req, int camera_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
-        if (req.method == crow::HTTPMethod::OPTIONS) 
+        if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::PTZ_CONTROL, origin)) return std::move(*err);
 
         auto& ptz = core::PTZManager::getInstance();
         auto presets = ptz.getPresets(camera_id);
@@ -192,7 +189,7 @@ void PTZController::registerRoutes(vms::server::VmsApp& app) {
                 {"preset_token", std::to_string(preset_id.value())}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -222,17 +219,19 @@ void PTZController::registerRoutes(vms::server::VmsApp& app) {
                 {"preset_token", std::to_string(preset_id.value())}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
-    // GET /api/ptz/<cam_id>/capabilities — Get PTZ capabilities 
+    // GET /api/ptz/<cam_id>/capabilities — Get PTZ capabilities
     CROW_ROUTE(app, "/api/ptz/<int>/capabilities")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int camera_id) {
+    ([&app](const crow::request& req, int camera_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
-        if (req.method == crow::HTTPMethod::OPTIONS) 
+        if (req.method == crow::HTTPMethod::OPTIONS)
             return ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::PTZ_CONTROL, origin)) return std::move(*err);
 
         auto& ptz = core::PTZManager::getInstance();
         auto caps = ptz.getCapabilities(camera_id);

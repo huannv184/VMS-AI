@@ -1,7 +1,10 @@
 #include "api/event_controller.h"
 #include "core/event_manager.h"
+#include "middleware/auth_middleware.h"
+#include "database/audit_repository.h"
 #include "utils/api_utils.h"
 #include "utils/camera_name_cache.h"
+#include "utils/logger.h"
 #include "utils/media_signer.h"
 #include "database/db_manager.h"
 #include "database/json_serialization.h"
@@ -216,25 +219,26 @@ static json enrichEvent(const Event& evt) {
                 media_scope
             );
         } catch (const std::exception& e) {
-            j["snapshot_error"] = e.what();
+            // P0 #2 fix: presigned URL helper failures used to put e.what()
+            // into the API response. Those messages can leak signing-key
+            // implementation hints; log server-side, surface a generic flag.
+            LOG_ERROR("[EventController] presignPath failed for snapshot: {}", e.what());
+            j["snapshot_error"] = "presign failed";
         }
     }
 
     return j;
 }
 
-// PENDING-AUDIT-2026-05-09: 7 empty-capture handlers (fire-test POST + 6 GETs:
-// events list, events stats, events analytics, events timeline, event video,
-// event GET/DELETE by id). LARGEST single-controller PENDING block in this audit.
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// fire-test POST is especially suspect — could trigger fake alarms unauth'd.
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (fire-test POST)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (events list)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (events stats)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (events analytics)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (events timeline)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (event video by id)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (event GET/DELETE by id)
+// BUG-EVENT-AUTH-01 (audit 2026-05-11, Batch C): pre-fix all 7 handlers
+// captured `[]` and bypassed AuthMiddleware. fire-test POST could be used to
+// spawn fake INTRUSION/FIRE/etc events unauth'd → SMTP/SMS/alarm-relay
+// fan-out (BUG-ALERT-02 followup is now actively wired). The 6 read-side
+// routes leak event PII (description text + metadata + snapshot paths).
+// Fix: gate fire-test on SYSTEM_ADMIN + audit log; events GET/list/stats/
+// timeline on EVENT_READ; analytics on ANALYTICS_READ (aggregate slice);
+// event video on RECORDING_READ (video content classification); DELETE on
+// EVENT_DELETE + audit log. Same shape as SEC-005 / BUG-ANPR-AUTH-01.
 void EventController::registerRoutes(vms::server::VmsApp& app) {
 
     // =========================================================================
@@ -244,11 +248,13 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
     // =========================================================================
     CROW_ROUTE(app, "/api/events/fire-test")
     .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::SYSTEM_ADMIN, origin)) return std::move(*err);
         try {
             json body = json::object();
             if (!req.body.empty()) {
@@ -266,22 +272,33 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
             evt.metadata_json = json{{"source", "fire-test"}, {"confidence", 0.95}}.dump();
 
             bool ok = vms::core::EventManager::getInstance().createEvent(evt);
+            if (ok && ctx.user) {
+                vms::database::AuditRepository audit;
+                audit.insertLog(ctx.user->id, "FIRE_TEST_EVENT",
+                                "fire-test event_id=" + evt.id +
+                                " camera=" + std::to_string(evt.camera_id) +
+                                " type=" + evt.event_type);
+                LOG_WARN("EventController: fire-test by user_id={} event_id={} type={}",
+                         ctx.user->id, evt.id, evt.event_type);
+            }
             return ApiUtils::createResponse(
                 json{{"fired", ok}, {"event_id", evt.id}, {"event_type", evt.event_type}},
                 ok ? 200 : 500, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET events with filters
     CROW_ROUTE(app, "/api/events")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::EVENT_READ, origin)) return std::move(*err);
 
         try {
             auto& event_mgr = vms::core::EventManager::getInstance();
@@ -337,18 +354,20 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
 
             return createEventsListResponse(event_list, total, page, limit, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET event stats
     CROW_ROUTE(app, "/api/events/stats")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::EVENT_READ, origin)) return std::move(*err);
 
         try {
             auto& event_mgr = vms::core::EventManager::getInstance();
@@ -360,18 +379,20 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
             int count = event_mgr.getEventCount(camera_id);
             return ApiUtils::createResponse({{"total_events", count}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET event analytics
     CROW_ROUTE(app, "/api/events/analytics")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
         try {
             auto& db = vms::database::DbManager::getInstance();
             QSqlDatabase conn = db.getThreadConnection();
@@ -407,18 +428,20 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"analytics", result}}, 200, origin);
         } catch (const std::exception& e) {
-             return ApiUtils::createErrorResponse(e.what(), 500, origin);
+             return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET event timeline
     CROW_ROUTE(app, "/api/events/timeline")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::EVENT_READ, origin)) return std::move(*err);
 
         try {
              auto& event_mgr = vms::core::EventManager::getInstance();
@@ -443,7 +466,7 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
 
              return ApiUtils::createResponse({{"events", timeline}}, 200, origin);
         } catch (const std::exception& e) {
-             return ApiUtils::createErrorResponse(e.what(), 500, origin);
+             return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -456,11 +479,13 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
     // GET event video clip
     CROW_ROUTE(app, "/api/events/<string>/video")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req, std::string id) {
+    ([&app](const crow::request& req, std::string id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
 
         try {
             auto& event_mgr = vms::core::EventManager::getInstance();
@@ -505,18 +530,22 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
             return res;
 
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // /api/events/<string> (GET, DELETE)
     CROW_ROUTE(app, "/api/events/<string>")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Delete, crow::HTTPMethod::Options)
-    ([](const crow::request& req, std::string id) {
+    ([&app](const crow::request& req, std::string id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        Permission needed = (req.method == crow::HTTPMethod::Delete)
+            ? Permission::EVENT_DELETE : Permission::EVENT_READ;
+        if (auto err = ApiUtils::requirePermission(ctx, needed, origin)) return std::move(*err);
 
         auto& event_mgr = vms::core::EventManager::getInstance();
 
@@ -530,7 +559,7 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return ApiUtils::createErrorResponse("Event not found", 404, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -538,11 +567,16 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Delete) {
             try {
                 if (event_mgr.deleteEvent(id)) {
+                    if (ctx.user) {
+                        vms::database::AuditRepository audit;
+                        audit.insertLog(ctx.user->id, "DELETE_EVENT",
+                                        "event_id=" + id);
+                    }
                     return ApiUtils::createResponse(json::object(), 200, origin);
                 }
                 return ApiUtils::createErrorResponse("Event not found or failed to delete", 404, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 

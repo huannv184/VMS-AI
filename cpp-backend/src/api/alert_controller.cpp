@@ -52,7 +52,7 @@ void AlertController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return ApiUtils::createResponse({{"rules", rules}}, 200, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         } else if (req.method == crow::HTTPMethod::POST) {
             try {
@@ -74,7 +74,7 @@ void AlertController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return ApiUtils::createErrorResponse(query.lastError().text().toStdString(), 500, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
         return ApiUtils::createErrorResponse("Method not allowed", 405, origin);
@@ -102,7 +102,7 @@ void AlertController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createErrorResponse(query.lastError().text().toStdString(), 500, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

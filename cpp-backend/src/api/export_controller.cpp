@@ -207,12 +207,17 @@ void ExportController::processExportJob(const ExportJob& job) {
             }
         }
     } catch (const std::exception& e) {
+        // P0 #2 fix: errorMessage is exposed via /api/export/{id}/status
+        // (line ~341) — never put raw e.what() in there. Log full stack
+        // server-side, store a generic phrase that's safe to ship to the
+        // client. Specific FFmpeg errors are already surfaced from the
+        // earlier `errorMessage = "FFmpeg processing failed"` site.
+        LOG_ERROR("Export job {} exception: {}", job.jobId, e.what());
         std::lock_guard<std::mutex> lock(jobsMutex);
         if (exportJobs.find(job.jobId) != exportJobs.end()) {
             exportJobs[job.jobId].status = "failed";
-            exportJobs[job.jobId].errorMessage = e.what();
+            exportJobs[job.jobId].errorMessage = "Export failed (see server log)";
         }
-        LOG_ERROR("Export job {} exception: {}", job.jobId, e.what());
     }
 }
 
@@ -311,7 +316,7 @@ void ExportController::registerRoutes(vms::server::VmsApp& app, vms::middleware:
         } catch (const json::exception& e) {
             return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what());
+            return ApiUtils::createSafeError(e);
         }
     });
 

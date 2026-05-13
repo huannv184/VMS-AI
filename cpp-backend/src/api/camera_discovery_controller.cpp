@@ -1,6 +1,8 @@
 #include "api/camera_discovery_controller.h"
 #include "core/network_scanner.h"
 #include "core/camera_discovery.hpp"
+#include "database/audit_repository.h"
+#include "middleware/auth_middleware.h"
 #include "utils/api_utils.h"
 #include "utils/logger.h"
 #include "server/vms_app.h"
@@ -11,12 +13,6 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
-// PENDING-AUDIT-2026-05-09: 3 empty-capture handlers (discover POST, status GET, results GET).
-// Discovery POST can scan internal LAN without auth (port-scan amplification).
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (discover POST)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (discover status by id)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (discover results by id)
 void CameraDiscoveryController::registerRoutes(vms::server::VmsApp& app) {
 
     // ═══════════════════════════════════════════════════════════════
@@ -26,11 +22,13 @@ void CameraDiscoveryController::registerRoutes(vms::server::VmsApp& app) {
     // ═══════════════════════════════════════════════════════════════
     CROW_ROUTE(app, "/api/cameras/discover")
     .methods(crow::HTTPMethod::POST, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = vms::api::ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS) {
             return vms::api::ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = vms::api::ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);
@@ -109,6 +107,15 @@ void CameraDiscoveryController::registerRoutes(vms::server::VmsApp& app) {
             LOG_INFO("=== DETECTION RESULT: {} | Model: {} | Channels: {} ===",
                      brand_str, result.model, result.channels);
 
+            // Audit log: LAN probe is admin-tier action. Log who triggered + target host.
+            if (ctx.user.has_value()) {
+                try {
+                    vms::database::AuditRepository audit;
+                    audit.insertLog(ctx.user->id, "CAMERA_DISCOVER",
+                                    "Probed host=" + host + ":" + std::to_string(http_port));
+                } catch (...) { /* never break the response on audit failure */ }
+            }
+
             return vms::api::ApiUtils::createResponse(response, 200, origin);
 
         } catch (const json::exception& e) {
@@ -116,9 +123,9 @@ void CameraDiscoveryController::registerRoutes(vms::server::VmsApp& app) {
             return vms::api::ApiUtils::createErrorResponse(
                 "Lỗi parse JSON: " + std::string(e.what()), 400, origin);
         } catch (const std::exception& e) {
-            LOG_ERROR("Error in /api/cameras/discover: {}", e.what());
-            return vms::api::ApiUtils::createErrorResponse(
-                "Lỗi server: " + std::string(e.what()), 500, origin);
+            // P0 #2 fix: don't echo e.what() at 500 — use createSafeError
+            // which logs server-side and returns a generic client message.
+            return vms::api::ApiUtils::createSafeError(e, 500, origin, "cameras/discover");
         }
     });
 
@@ -128,9 +135,11 @@ void CameraDiscoveryController::registerRoutes(vms::server::VmsApp& app) {
 
     CROW_ROUTE(app, "/api/cameras/discover/status/<string>")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, std::string scan_id) {
+    ([&app](const crow::request& req, std::string scan_id) {
         std::string origin = vms::api::ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS) return vms::api::ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = vms::api::ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
 
         auto& scanner = core::NetworkScanner::getInstance();
         return vms::api::ApiUtils::createResponse(scanner.getScanStatus(scan_id), 200, origin);
@@ -138,9 +147,11 @@ void CameraDiscoveryController::registerRoutes(vms::server::VmsApp& app) {
 
     CROW_ROUTE(app, "/api/cameras/discover/results/<string>")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, std::string scan_id) {
+    ([&app](const crow::request& req, std::string scan_id) {
         std::string origin = vms::api::ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS) return vms::api::ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = vms::api::ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
 
         auto& scanner = core::NetworkScanner::getInstance();
         return vms::api::ApiUtils::createResponse(scanner.getScanResults(scan_id), 200, origin);

@@ -193,7 +193,7 @@ void CounterController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(
                 {{"id", new_id}, {"camera_id", body.value("camera_id", 0)}}, 201, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -282,7 +282,7 @@ void CounterController::registerRoutes(vms::server::VmsApp& app) {
             vms::core::PeopleCountTracker::getInstance().reloadFromDb();
             return ApiUtils::createResponse({{"updated", true}, {"id", id}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 

@@ -265,7 +265,7 @@ void SynopsisController::registerRoutes(vms::server::VmsApp& app, vms::middlewar
             }, 200, origin);
         } catch (const std::exception& e) {
             LOG_ERROR("Error in /api/synopsis/create: {}", e.what());
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 

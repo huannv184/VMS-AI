@@ -161,12 +161,6 @@ std::optional<std::string> validateCameraPayload(vms::Camera& camera, const json
 
 }
 
-// PENDING-AUDIT-2026-05-09: this controller has 1 empty-capture handler
-// not yet RBAC-audited (GET /api/cameras/<int>/frame ~L475). Tracked in
-// .claude/memory/past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// Remove this LINT-ALLOW-NO-AUTH marker when that route gains [&app] +
-// requirePermission(CAMERA_READ).
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (cameras/<int>/frame)
 void CameraController::registerRoutes(vms::server::VmsApp& app) {
     LOG_INFO("Registering camera routes via controller...");
 
@@ -278,7 +272,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return response;
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
         
@@ -349,7 +343,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             } catch (const json::exception& e) {
                 return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -396,7 +390,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return ApiUtils::createErrorResponse("Camera not found", 404, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
         
@@ -443,7 +437,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 
                 return ApiUtils::createErrorResponse("Failed to update camera", 500, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
         // DELETE camera (requires auth)
@@ -465,7 +459,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createErrorResponse("Camera not found or failed to delete", 404, origin);
             } catch (const std::exception& e) {
                 LOG_ERROR("API: Exception deleting camera {}: {}", id, e.what());
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             } catch (...) {
                 LOG_ERROR("API: Unknown exception deleting camera {}", id);
                 return ApiUtils::createErrorResponse("Unknown Server Error", 500, origin);
@@ -478,12 +472,14 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/cameras/<int>/frame
     CROW_ROUTE(app, "/api/cameras/<int>/frame")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int id) {
+    ([&app](const crow::request& req, int id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS) {
             return ApiUtils::createResponse(nlohmann::json::object(), 204, origin);
         }
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
+
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
             auto camera_opt = camera_mgr.getCamera(id);
@@ -514,7 +510,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             return res;
         } catch (const std::exception& e) {
             LOG_ERROR("Error serving frame for camera {}: {}", id, e.what());
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -555,7 +551,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse(metadata, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -597,7 +593,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             res.body.assign(frame_opt->begin(), frame_opt->end());
             return res;
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -625,7 +621,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             
             return ApiUtils::createErrorResponse("Failed to start camera", 500, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -653,7 +649,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             
             return ApiUtils::createErrorResponse("Failed to stop camera", 500, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -678,7 +674,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             json response = {{"id", id}, {"is_active", is_active}, {"status", is_active ? "running" : "stopped"}};
             return ApiUtils::createResponse(response, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -703,7 +699,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createResponse(json::object(), 200, origin);
             }
             return ApiUtils::createErrorResponse("Failed to refresh advanced config.", 500, origin);
-        } catch (const std::exception& e) { return ApiUtils::createErrorResponse(e.what(), 500, origin); }
+        } catch (const std::exception& e) { return ApiUtils::createSafeError(e, 500, origin); }
     });
 
     // GET /api/cameras/:id/stats
@@ -747,7 +743,30 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             stats_json["id"] = id;
             stats_json["resolution"] = "1920x1080";
             return ApiUtils::createResponse(stats_json, 200, origin);
-        } catch (const std::exception& e) { return ApiUtils::createErrorResponse(e.what(), 500, origin); }
+        } catch (const std::exception& e) { return ApiUtils::createSafeError(e, 500, origin); }
+    });
+
+    // GET /api/cameras/:id/event_subscription_status — health snapshot of the
+    // hardware-event subscription (ONVIF PullPoint / Axis eventfeed / Dahua
+    // attach / Hanwha poll / Hikvision adapter). Returns state, last event
+    // timestamp, total events received, reconnect count, etc. so operators
+    // can distinguish "no events because scene is quiet" from "subscription
+    // wedged / brand stub / auth failed". Followup from brand_events sprint
+    // (2026-05-12).
+    CROW_ROUTE(app, "/api/cameras/<int>/event_subscription_status")
+    .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
+    ([&app](const crow::request& req, int id) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
+        try {
+            return ApiUtils::createResponse(
+                vms::core::CameraEventService::getInstance().getStatus(std::to_string(id)),
+                200, origin);
+        } catch (const std::exception& e) {
+            return ApiUtils::createSafeError(e, 500, origin);
+        }
     });
 
     // POST /api/cameras/import — batch import via JSON or CSV (Requirement 1.3)
@@ -798,7 +817,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             vms::database::AuditRepository audit;
             audit.insertLog(ctx.user->id, "BATCH_IMPORT", "Imported " + std::to_string(success) + " cameras");
             return ApiUtils::createResponse({{"imported", success}, {"failed", fail}, {"errors", errors}}, 200, origin);
-        } catch (const std::exception& e) { return ApiUtils::createErrorResponse(e.what(), 500, origin); }
+        } catch (const std::exception& e) { return ApiUtils::createSafeError(e, 500, origin); }
     });
 
     LOG_INFO("Camera controller routes registered - plus snapshot/ptz/stream/import");

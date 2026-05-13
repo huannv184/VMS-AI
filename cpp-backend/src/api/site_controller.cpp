@@ -68,7 +68,7 @@ void SiteController::registerRoutes(vms::server::VmsApp& app) {
         } catch (const nlohmann::json::exception& e) {
             return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
         return ApiUtils::createErrorResponse("Failed to create site", 500, origin);
     });
@@ -116,7 +116,7 @@ void SiteController::registerRoutes(vms::server::VmsApp& app) {
         } catch (const nlohmann::json::exception& e) {
             return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
         return ApiUtils::createErrorResponse("Failed to update site", 500, origin);
     });

@@ -145,7 +145,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
             
             return ApiUtils::createResponse(j, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -193,7 +193,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"devices", result}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -272,7 +272,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
 
                 return ApiUtils::createResponse(json::object(), 200, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -305,7 +305,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"logs", result}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -336,7 +336,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
             std::string scan_id = vms::core::NetworkScanner::getInstance().startScan(cfg);
             return ApiUtils::createResponse({{"scan_id", scan_id}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -371,7 +371,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
             
             return ApiUtils::createResponse(status_j, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -395,7 +395,7 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
             vms::core::NetworkScanner::getInstance().stopScan(scan_id);
             return ApiUtils::createResponse(json::object(), 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 

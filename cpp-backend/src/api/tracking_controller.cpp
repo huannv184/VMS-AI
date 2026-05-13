@@ -1,6 +1,8 @@
 #include "api/tracking_controller.h"
 #include "core/camera_manager.h"
 #include "core/camera_pipeline_manager.h"
+#include "middleware/auth_middleware.h"
+#include "database/audit_repository.h"
 #include "utils/api_utils.h"
 #include "utils/logger.h"
 #include "database/json_serialization.h"
@@ -14,23 +16,25 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
-// PENDING-AUDIT-2026-05-09: 4 empty-capture handlers (active tracks, stats, config, reset).
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (tracking active by camera)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (tracking stats)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (tracking config GET/PUT)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (tracking reset POST)
+// BUG-TRACK-AUTH-01 (audit 2026-05-11, Batch C): 4 tracking handlers
+// pre-fix captured `[]`. Live track stream + tracking config + pipeline-reset
+// were unauth'd. Config write changes detector behaviour persistently; reset
+// kills + respawns the ai_worker subprocess (operational impact). Fix:
+// reads on CAMERA_READ / ANALYTICS_READ; config write + reset on
+// SYSTEM_ADMIN with audit log.
 void TrackingController::registerRoutes(vms::server::VmsApp& app) {
     // GET active tracks
     CROW_ROUTE(app, "/api/tracking/cameras/<int>")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int camera_id) {
+    ([&app](const crow::request& req, int camera_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
 
         if (req.method == crow::HTTPMethod::OPTIONS) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_READ, origin)) return std::move(*err);
+
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
             auto camera_opt = camera_mgr.getCamera(camera_id);
@@ -63,20 +67,22 @@ void TrackingController::registerRoutes(vms::server::VmsApp& app) {
                 {"count", tracks.size()}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET tracking stats
     CROW_ROUTE(app, "/api/tracking/cameras/<int>/stats")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int camera_id) {
+    ([&app](const crow::request& req, int camera_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
 
         if (req.method == crow::HTTPMethod::OPTIONS) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
+
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
             auto camera_opt = camera_mgr.getCamera(camera_id);
@@ -108,20 +114,22 @@ void TrackingController::registerRoutes(vms::server::VmsApp& app) {
                 {"tracking_enabled", camera_opt.value().is_active}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // POST tracking config
     CROW_ROUTE(app, "/api/tracking/cameras/<int>/config")
     .methods(crow::HTTPMethod::Post, crow::HTTPMethod::Options)
-    ([](const crow::request& req, int camera_id) {
+    ([&app](const crow::request& req, int camera_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
 
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::SYSTEM_ADMIN, origin)) return std::move(*err);
+
         try {
             auto body = json::parse(req.body);
             
@@ -183,7 +191,7 @@ void TrackingController::registerRoutes(vms::server::VmsApp& app) {
             };
             return ApiUtils::createResponse(resp, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -192,12 +200,14 @@ void TrackingController::registerRoutes(vms::server::VmsApp& app) {
     // live inside the spawned ai_worker process and only fresh-start clears them.
     CROW_ROUTE(app, "/api/tracking/cameras/<int>/reset")
     .methods(crow::HTTPMethod::Delete, crow::HTTPMethod::Options)
-    ([](const crow::request& req, int camera_id) {
+    ([&app](const crow::request& req, int camera_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
 
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::CAMERA_WRITE, origin)) return std::move(*err);
 
         try {
             auto& camera_mgr = vms::core::CameraManager::getInstance();
@@ -229,7 +239,7 @@ void TrackingController::registerRoutes(vms::server::VmsApp& app) {
             };
             return ApiUtils::createResponse(resp, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

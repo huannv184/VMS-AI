@@ -14,26 +14,21 @@ using vms::api::Permission;
 namespace vms {
 namespace api {
 
-// PENDING-AUDIT-2026-05-09: 3 empty-capture handlers (rois list, by camera, stats).
-// Past audit BUG-ROI-01 (2026-05-02) fixed point-in-polygon logic but did NOT
-// touch RBAC — these GETs are still unauthenticated. C4 fix only covered mutations.
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rois list)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rois by camera)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rois stats)
 void ROIController::registerRoutes(vms::server::VmsApp& app) {
     // GET all ROIs
     CROW_ROUTE(app, "/api/rois")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ROI_READ, origin)) return std::move(*err);
+
         try {
             auto& roi_mgr = vms::core::ROIManager::getInstance();
-            auto rois = roi_mgr.getAllROIs(); 
+            auto rois = roi_mgr.getAllROIs();
             
             json rois_arr = json::array();
             for (const auto& roi : rois) {
@@ -42,18 +37,20 @@ void ROIController::registerRoutes(vms::server::VmsApp& app) {
 
             return ApiUtils::createResponse({{"rois", rois_arr}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET ROIs by camera
     CROW_ROUTE(app, "/api/roi/cameras/<int>")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
-    ([](const crow::request& req, int camera_id) {
+    ([&app](const crow::request& req, int camera_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ROI_READ, origin)) return std::move(*err);
 
         try {
             auto& roi_mgr = vms::core::ROIManager::getInstance();
@@ -66,7 +63,7 @@ void ROIController::registerRoutes(vms::server::VmsApp& app) {
 
             return ApiUtils::createResponse({{"rois", rois_arr}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -144,7 +141,7 @@ void ROIController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
         } catch (const std::exception& e) {
             LOG_ERROR("[ROIController] Exception: {}", e.what());
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     };
 
@@ -182,7 +179,7 @@ void ROIController::registerRoutes(vms::server::VmsApp& app) {
                 if (roi_opt) return ApiUtils::createResponse(roi_opt.value(), 200, origin);
                 return ApiUtils::createErrorResponse("ROI not found", 404, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -207,7 +204,7 @@ void ROIController::registerRoutes(vms::server::VmsApp& app) {
             } catch (const json::exception& e) {
                 return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -216,7 +213,7 @@ void ROIController::registerRoutes(vms::server::VmsApp& app) {
                 if (roi_mgr.deleteROI(id)) return ApiUtils::createResponse(json::object(), 200, origin);
                 return ApiUtils::createErrorResponse("ROI not found or failed to delete", 404, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -226,10 +223,12 @@ void ROIController::registerRoutes(vms::server::VmsApp& app) {
     // GET ROI stats
     CROW_ROUTE(app, "/api/roi/stats")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ROI_READ, origin)) return std::move(*err);
+
         try {
              auto& roi_mgr = vms::core::ROIManager::getInstance();
              auto rois = roi_mgr.getAllROIs();
@@ -240,7 +239,7 @@ void ROIController::registerRoutes(vms::server::VmsApp& app) {
              
              return ApiUtils::createResponse(response, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

@@ -222,6 +222,73 @@ public:
         return res;
     }
 
+    // ── Safe error wrapper for catch-blocks ───────────────────────
+    // Use this when you have a `std::exception&` from an internal failure
+    // (DB query, libcurl, image processing, etc.). It logs the full e.what()
+    // server-side and returns a *generic* message to the client.
+    //
+    // Why: pre-fix the codebase had ~100 sites doing
+    //   return ApiUtils::createErrorResponse(e.what(), 500, origin);
+    // which leaked SQL error text (exposing column / table names),
+    // libcurl messages (revealing internal upstream URLs and API keys
+    // when those failures stringified the URL), and stack-y phrases
+    // from third-party libs. None of those are useful to a legitimate
+    // API client; all of them are useful to an attacker enumerating
+    // backend internals. Audit ref: 2026-05-10 P0 #2.
+    //
+    // For 4xx errors that ARE user-actionable (bad input, validation),
+    // continue using createErrorResponse with a hand-crafted user-safe
+    // message — this helper is for 5xx-class catch-alls.
+    //
+    // Usage:
+    //   } catch (const std::exception& e) {
+    //       return ApiUtils::createSafeError(e, 500, origin, "list-events");
+    //   }
+    //
+    // The `context` tag goes only into the server log so operators can
+    // grep for the failure site without exposing it to the client.
+    static crow::response createSafeError(const std::exception& e,
+                                          int code = 500,
+                                          const std::string& origin = "*",
+                                          const std::string& context = "") {
+        // Best-effort log of the real exception. spdlog's macro tolerates
+        // brace-style formatting and falls through gracefully if logger is
+        // not initialised yet.
+        try {
+            // Late include to avoid pulling spdlog into every controller TU.
+            // (api_utils.h is included from most controllers; LOG_ERROR comes
+            // through utils/logger.h which most of them already include —
+            // we don't add the include here to keep this header lightweight.)
+        } catch (...) {}
+
+        // Generic client-facing messages. Code 5xx → never echo e.what();
+        // 4xx with this helper is rare but supported.
+        std::string client_msg;
+        if (code >= 500) {
+            client_msg = "Internal server error";
+        } else if (code == 503) {
+            client_msg = "Service temporarily unavailable";
+        } else if (code == 408) {
+            client_msg = "Request timed out";
+        } else {
+            // 4xx fallback — caller probably should have built a specific
+            // message instead, but at least don't leak e.what().
+            client_msg = "Request could not be completed";
+        }
+        // Server-side log line (callers can also log themselves with more
+        // context). We swallow any exception from the logger to never
+        // recurse. Using fprintf to stderr because spdlog isn't pulled in
+        // by this header — controllers that include logger.h get richer
+        // logging via LOG_ERROR before they call this helper.
+        std::fprintf(stderr,
+                     "[ApiUtils::createSafeError] code=%d ctx=%s exception=%s\n",
+                     code,
+                     context.empty() ? "-" : context.c_str(),
+                     e.what());
+        std::fflush(stderr);
+        return createErrorResponse(client_msg, code, origin);
+    }
+
     // ── Contract-enforced error response ──────────────────────────
     // error: { code: string, message: string }
     static crow::response createErrorResponse(const std::string& message, int code = 500, const std::string& origin = "*") {

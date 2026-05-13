@@ -95,7 +95,7 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
 
             return ApiUtils::createResponse({{"layouts", layouts}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -157,7 +157,7 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
                 {"grid_rows", rows}
             }, 201, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 
@@ -213,7 +213,7 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
             if (!ok) return ApiUtils::createErrorResponse("Update failed", 500, origin);
             return ApiUtils::createResponse(json::object(), 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 

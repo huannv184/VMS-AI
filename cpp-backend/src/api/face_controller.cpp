@@ -267,7 +267,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 {"count", faces.size()}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -299,7 +299,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 for (const auto& p : persons) response.push_back(p);
                 return ApiUtils::createResponse({{"persons", response}}, 200, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
         
@@ -367,8 +367,10 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                         }
 
                     } catch (const std::exception& e) {
-                        LOG_ERROR("Image processing error: {}", e.what());
-                        return ApiUtils::createErrorResponse("Image processing failed: " + std::string(e.what()), 500, origin);
+                        // P0 #2 fix: e.what() concatenated into 500 leaks
+                        // OpenCV / base64 / TensorRT-side error text. Log
+                        // server-side, return generic.
+                        return ApiUtils::createSafeError(e, 500, origin, "person/create-with-face image proc");
                     }
                 }
 
@@ -410,7 +412,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createErrorResponse("Failed to create person", 500, origin);
             } catch (const std::exception& e) {
                 LOG_ERROR("Exception in POST /api/faces/persons: {}", e.what());
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -442,7 +444,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 if (p) return ApiUtils::createResponse(p.value(), 200, origin);
                 return ApiUtils::createErrorResponse("Not found", 404, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -536,7 +538,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return ApiUtils::createErrorResponse("Update failed", 500, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -566,7 +568,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return ApiUtils::createResponse(json::object(), 200, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
 
@@ -599,7 +601,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                     : 0}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -662,7 +664,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
             
         } catch (const std::exception& e) {
             LOG_ERROR("Search exception: {}", e.what());
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

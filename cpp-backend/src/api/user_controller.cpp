@@ -288,7 +288,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
             vms::utils::RateLimiter::getInstance().recordLoginFailure(client_ip, username);
             return ApiUtils::createErrorResponse("Invalid credentials", 401, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 
@@ -305,7 +305,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
             if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
             return ApiUtils::createResponse({{"user", ctx.user->toJson()}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 
@@ -334,7 +334,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
                 {"expires_in", 30}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 
@@ -814,7 +814,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
             resp.set_header("Set-Cookie", buildSessionCookie(token, req));
             return resp;
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 }

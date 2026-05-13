@@ -38,7 +38,7 @@ void AnalyticsController::registerRoutes(vms::server::VmsApp& app) {
             
             return ApiUtils::createResponse(res, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -70,7 +70,7 @@ void AnalyticsController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"counts", counts_arr}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

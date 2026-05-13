@@ -1,6 +1,9 @@
 #include "api/recording_controller.h"
+#include "middleware/auth_middleware.h"
+#include "database/audit_repository.h"
 #include "utils/api_utils.h"
 #include "utils/camera_name_cache.h"
+#include "utils/logger.h"
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -28,25 +31,25 @@ static bool isValidRecordingId(const std::string& id) {
 namespace vms {
 namespace api {
 
-// PENDING-AUDIT-2026-05-09: 5 empty-capture handlers not yet RBAC-audited
-// (GET /api/recordings, GET /api/recordings/<id>/video, GET/DELETE /api/recordings/<id>,
-// GET /api/recordings/segments, GET /api/recordings/segments/<int>/video).
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// Remove markers as each route gains [&app] + requirePermission(RECORDING_READ/DELETE).
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (recordings list)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (recording video by id)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (recording GET/DELETE by id)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (segments list)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (segment video by id)
+// BUG-REC-AUTH-01 (audit 2026-05-11, Batch C): 5 recording read/delete routes
+// previously captured `[]` and bypassed AuthMiddleware. Video PII (recorded
+// camera footage) was streamable + deletable by any TCP client that could
+// reach the API. Fix: all reads gated on RECORDING_READ, DELETE on
+// RECORDING_DELETE + audit log. Same shape as SEC-005 / BUG-ANPR-AUTH-01 /
+// BUG-EVENT-AUTH-01. Snapshot/HLS/export controllers were closed in the
+// 2026-05-09 RBAC bundle commit; recording_controller was deferred because
+// the live HLS surface was the highest-priority leak.
 void RecordingController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/recordings - List all recordings (events with video files)
     CROW_ROUTE(app, "/api/recordings")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
 
         try {
             const auto& media_cfg = vms::Config::getInstance().getMediaSigningConfig();
@@ -145,18 +148,20 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
 
             return ApiUtils::createResponse(response, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET /api/recordings/:id/video - Get video file (proxied from MinIO or local)
     CROW_ROUTE(app, "/api/recordings/<string>/video")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req, std::string id) {
+    ([&app](const crow::request& req, std::string id) {
         std::string origin = req.get_header_value("Origin");
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
 
         if (!isValidRecordingId(id)) {
             return ApiUtils::createErrorResponse("Invalid recording ID", 400, origin);
@@ -263,18 +268,20 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
             res.set_header("Access-Control-Allow-Origin", allowed);
             return res;
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // DELETE /api/recordings/:id - Delete recording (both video file AND event from DB)
     CROW_ROUTE(app, "/api/recordings/<string>")
     .methods(crow::HTTPMethod::Delete, crow::HTTPMethod::Options)
-    ([](const crow::request& req, std::string id) {
+    ([&app](const crow::request& req, std::string id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_DELETE, origin)) return std::move(*err);
 
         if (!isValidRecordingId(id)) {
             return ApiUtils::createErrorResponse("Invalid recording ID", 400, origin);
@@ -323,10 +330,18 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
 
             // Delete the event from DB entirely
             event_repo.deleteEvent(id);
-            
+
+            if (ctx.user) {
+                vms::database::AuditRepository audit;
+                audit.insertLog(ctx.user->id, "DELETE_RECORDING",
+                                "recording_id=" + id);
+                LOG_WARN("RecordingController: DELETE by user_id={} recording_id={}",
+                         ctx.user->id, id);
+            }
+
             return ApiUtils::createResponse(json::object(), 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -337,11 +352,13 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/recordings/segments - List recording segments for a camera on a date
     CROW_ROUTE(app, "/api/recordings/segments")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
 
         try {
             const auto& media_cfg = vms::Config::getInstance().getMediaSigningConfig();
@@ -402,18 +419,20 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
 
             return ApiUtils::createResponse(response, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET /api/recordings/segments/<id>/video - Stream segment video
     CROW_ROUTE(app, "/api/recordings/segments/<int>/video")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req, int segment_id) {
+    ([&app](const crow::request& req, int segment_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::RECORDING_READ, origin)) return std::move(*err);
 
         try {
             vms::database::SegmentRepository seg_repo;
@@ -496,7 +515,7 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
             }
             return resp;
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

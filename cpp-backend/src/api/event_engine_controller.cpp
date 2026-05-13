@@ -94,12 +94,15 @@ void syncZoneROI(const json& body, const std::string& zone_name) {
 
 } // namespace
 
-// PENDING-AUDIT-2026-05-09: 4 empty-capture handlers (rules, zones, alerts/triggers, rules/stats).
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rules CRUD)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (zones CRUD)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (alerts triggers GET)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (rules stats GET)
+// BUG-EVENTENG-AUTH-01 (audit 2026-05-11, Batch C): 4 read-side GET handlers
+// previously captured `[]` and exposed rule + zone definitions + recent trigger
+// log + engine stats unauth'd. Rule shape is sensitive (zone polygons,
+// thresholds, sound/email recipients per BUG-23). Fix: rules list + rules
+// stats + alerts/triggers → ALERT_READ; zones list → ROI_READ. The GET
+// branches of /api/rules/<int> + /api/zones/<int> were also unauth (only
+// non-GET methods called requireRuleAdmin) — now gated the same way. Mutate
+// paths stay on requireRuleAdmin (SYSTEM_ADMIN) — broadening rules/zones
+// editing to operator would change behaviour and is out of scope here.
 void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
 
     // ============================================================================
@@ -109,10 +112,12 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
     // GET all rules
     CROW_ROUTE(app, "/api/rules")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ALERT_READ, origin)) return std::move(*err);
+
         try {
             auto rules = events::RuleEngine::getInstance().getAllRules();
             json rules_arr = json::array();
@@ -121,7 +126,7 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"rules", rules_arr}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
     
@@ -157,7 +162,7 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
         } catch (const json::exception& e) {
             return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -170,8 +175,12 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
 
         auto& engine = events::RuleEngine::getInstance();
 
-        // PUT/DELETE require admin; GET stays readable to any authenticated user.
-        if (req.method != crow::HTTPMethod::Get) {
+        // PUT/DELETE require admin; GET requires ALERT_READ (was completely
+        // unauth pre-Batch-C, rule shape is sensitive — see comment block above).
+        if (req.method == crow::HTTPMethod::Get) {
+            auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+            if (auto err = ApiUtils::requirePermission(ctx, Permission::ALERT_READ, origin)) return std::move(*err);
+        } else {
             if (auto err = requireRuleAdmin(app, req, origin)) return std::move(*err);
         }
 
@@ -201,7 +210,7 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
             } catch (const json::exception& e) {
                 return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
         
@@ -226,10 +235,12 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
     // GET all zones
     CROW_ROUTE(app, "/api/zones")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ROI_READ, origin)) return std::move(*err);
+
         try {
             auto zones = events::ZoneManager::getInstance().getAllZones();
             json zones_arr = json::array();
@@ -238,7 +249,7 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"zones", zones_arr}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -276,7 +287,7 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
         } catch (const json::exception& e) {
             return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -289,7 +300,10 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
 
         auto& mgr = events::ZoneManager::getInstance();
 
-        if (req.method != crow::HTTPMethod::Get) {
+        if (req.method == crow::HTTPMethod::Get) {
+            auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+            if (auto err = ApiUtils::requirePermission(ctx, Permission::ROI_READ, origin)) return std::move(*err);
+        } else {
             if (auto err = requireRuleAdmin(app, req, origin)) return std::move(*err);
         }
 
@@ -319,7 +333,7 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
             } catch (const json::exception& e) {
                 return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
         
@@ -338,10 +352,12 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
     // GET recent rule triggers
     CROW_ROUTE(app, "/api/alerts/triggers")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ALERT_READ, origin)) return std::move(*err);
+
         try {
             int limit = 100;
             if (req.url_params.get("limit") != nullptr) {
@@ -355,22 +371,24 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
             }
             return ApiUtils::createResponse({{"triggers", triggers_arr}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
     // GET rule engine statistics
     CROW_ROUTE(app, "/api/rules/stats")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ALERT_READ, origin)) return std::move(*err);
+
         try {
              return ApiUtils::createResponse(
                  events::RuleEngine::getInstance().getStatistics(), 200, origin);
         } catch (const std::exception& e) {
-             return ApiUtils::createErrorResponse(e.what(), 500, origin);
+             return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

@@ -88,7 +88,7 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
                 {"cameras_visited", points.size()}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -159,7 +159,7 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
                 {"producer_wired", engine.isProducerWired()}
             }, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -197,7 +197,7 @@ void ReIDController::registerRoutes(vms::server::VmsApp& app) {
             engine.setConfig(config);
             return ApiUtils::createResponse({{"config", config.toJSON()}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 

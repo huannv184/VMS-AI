@@ -1,4 +1,5 @@
 #include "api/traffic_controller.h"
+#include "database/audit_repository.h"
 #include "database/traffic_repository.h"
 #include "utils/api_utils.h"
 #include "utils/logger.h"
@@ -36,12 +37,6 @@ static json summaryToJson(const TrafficSummary& s) {
     };
 }
 
-// PENDING-AUDIT-2026-05-09: 3 empty-capture handlers (counts GET, counts POST, summary GET).
-// POST /api/traffic/counts can poison the traffic counter table without auth.
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (traffic counts GET)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (traffic counts POST)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (traffic summary GET)
 void TrafficController::registerRoutes(vms::server::VmsApp& app) {
 
     // ----------------------------------------------------------------
@@ -50,10 +45,12 @@ void TrafficController::registerRoutes(vms::server::VmsApp& app) {
     // ----------------------------------------------------------------
     CROW_ROUTE(app, "/api/traffic/counts")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options)
             return ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
 
         try {
             int camera_id = -1;
@@ -86,7 +83,7 @@ void TrafficController::registerRoutes(vms::server::VmsApp& app) {
 
             return ApiUtils::createResponse({{"counts", arr}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -94,11 +91,17 @@ void TrafficController::registerRoutes(vms::server::VmsApp& app) {
     // POST /api/traffic/counts
     // Body: { camera_id, roi_id?, direction, vehicle_type, count,
     //         period_start, period_end }
+    // Admin-only: this is a write into the analytics table that bypasses
+    // the AI pipeline. Zero existing callers (neither frontend nor any
+    // internal C++ writer); kept for operator manual-correction scenarios.
     // ----------------------------------------------------------------
     CROW_ROUTE(app, "/api/traffic/counts")
     .methods(crow::HTTPMethod::Post)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requireAdmin(ctx, origin)) return std::move(*err);
+
         try {
             auto body = json::parse(req.body);
 
@@ -127,15 +130,26 @@ void TrafficController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createErrorResponse("Invalid time period", 400, origin);
 
             database::TrafficRepository repo;
-            if (repo.insertCount(tc))
+            if (repo.insertCount(tc)) {
+                // Audit: manual write into analytics — log who, target camera, magnitude.
+                if (ctx.user.has_value()) {
+                    try {
+                        vms::database::AuditRepository audit;
+                        audit.insertLog(ctx.user->id, "TRAFFIC_COUNT_INSERT",
+                                        "camera_id=" + std::to_string(tc.camera_id)
+                                        + " count=" + std::to_string(tc.count)
+                                        + " vehicle=" + tc.vehicle_type);
+                    } catch (...) { /* never break on audit failure */ }
+                }
                 return ApiUtils::createResponse(json::object(), 201, origin);
+            }
 
             return ApiUtils::createErrorResponse("Failed to insert traffic count", 500, origin);
         } catch (const json::exception& e) {
             return ApiUtils::createErrorResponse(
                 std::string("Invalid JSON: ") + e.what(), 400, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 
@@ -144,10 +158,12 @@ void TrafficController::registerRoutes(vms::server::VmsApp& app) {
     // ----------------------------------------------------------------
     CROW_ROUTE(app, "/api/traffic/summary")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options)
             return ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
 
         try {
             int camera_id = -1;
@@ -163,7 +179,7 @@ void TrafficController::registerRoutes(vms::server::VmsApp& app) {
 
             return ApiUtils::createResponse(summaryToJson(summary), 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

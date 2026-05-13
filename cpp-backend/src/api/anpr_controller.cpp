@@ -68,7 +68,7 @@ void ANPRController::registerRoutes(vms::server::VmsApp& app) {
                 };
                 return ApiUtils::createResponse(response, 200, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         } else if (req.method == crow::HTTPMethod::Post) {
             try {
@@ -123,7 +123,7 @@ void ANPRController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return ApiUtils::createErrorResponse("Failed to insert plate", 500, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         } else if (req.method == crow::HTTPMethod::Delete) {
             try {
@@ -144,7 +144,7 @@ void ANPRController::registerRoutes(vms::server::VmsApp& app) {
                 }
                 return ApiUtils::createErrorResponse("Failed to delete plates", 500, origin);
             } catch (const std::exception& e) {
-                return ApiUtils::createErrorResponse(e.what(), 500, origin);
+                return ApiUtils::createSafeError(e, 500, origin);
             }
         }
         
@@ -175,7 +175,7 @@ void ANPRController::registerRoutes(vms::server::VmsApp& app) {
             for (const auto& p : plates) results.push_back(p);
             return ApiUtils::createResponse({{"plates", results}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

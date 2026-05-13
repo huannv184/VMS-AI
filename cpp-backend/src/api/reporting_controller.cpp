@@ -1,4 +1,5 @@
 #include "api/reporting_controller.h"
+#include "database/audit_repository.h"
 #include "database/db_manager.h"
 #include "utils/api_utils.h"
 #include "utils/logger.h"
@@ -11,23 +12,20 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
-// PENDING-AUDIT-2026-05-09: 2 empty-capture handlers (analytics export CSV, heatmap by camera).
-// CSV export especially sensitive — leaks aggregated event PII without auth.
-// Tracked in past-bugs.md → BUG-LINT-CONTROLLERS-PENDING-2026-05-09.
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (analytics export CSV)
-// LINT-ALLOW-NO-AUTH: PENDING-AUDIT-2026-05-09 (heatmap by camera)
 void ReportingController::registerRoutes(vms::server::VmsApp& app) {
 
     // GET /api/analytics/export
     CROW_ROUTE(app, "/api/analytics/export")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req) {
+    ([&app](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
-        
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
+
         std::string type = req.url_params.get("type") ? req.url_params.get("type") : "traffic";
         int camera_id = req.url_params.get("camera_id") ? std::stoi(req.url_params.get("camera_id")) : -1;
-        
+
         std::string csv_content;
         std::string filename = "report_" + type + ".csv";
 
@@ -43,6 +41,16 @@ void ReportingController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createErrorResponse("Invalid export type", 400, origin);
         }
 
+        // Audit: CSV export is a PII bulk-egress action — log who & what.
+        if (ctx.user.has_value()) {
+            try {
+                vms::database::AuditRepository audit;
+                audit.insertLog(ctx.user->id, "ANALYTICS_EXPORT_CSV",
+                                "type=" + type + " camera_id=" + std::to_string(camera_id)
+                                + " bytes=" + std::to_string(csv_content.size()));
+            } catch (...) { /* never break the download on audit failure */ }
+        }
+
         auto res = crow::response(csv_content);
         res.add_header("Content-Type", "text/csv; charset=utf-8");
         res.add_header("Content-Disposition", "attachment; filename=" + filename);
@@ -53,9 +61,11 @@ void ReportingController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/analytics/heatmap/<int>
     CROW_ROUTE(app, "/api/analytics/heatmap/<int>")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([](const crow::request& req, int cam_id) {
+    ([&app](const crow::request& req, int cam_id) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
+        auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
         
         try {
             vms::database::EventRepository repo;
@@ -80,7 +90,7 @@ void ReportingController::registerRoutes(vms::server::VmsApp& app) {
             
             return ApiUtils::createResponse({{"camera_id", cam_id}, {"points", points}}, 200, origin);
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 500, origin);
+            return ApiUtils::createSafeError(e, 500, origin);
         }
     });
 }

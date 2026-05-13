@@ -236,7 +236,7 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             }, 201, origin);
 
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 
@@ -348,7 +348,7 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(json::object(), 200, origin);
 
         } catch (const std::exception& e) {
-            return ApiUtils::createErrorResponse(e.what(), 400, origin);
+            return ApiUtils::createSafeError(e, 400, origin);
         }
     });
 
