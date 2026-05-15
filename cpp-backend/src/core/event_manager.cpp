@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include "database/db_manager.h"
-#include "core/alert_manager.h"
 #include "events/rule_engine.h"
 #include "events/event_types.h"
 #include "streaming/camera_stream_manager_qt.h"
@@ -81,11 +80,10 @@ bool EventManager::createEvent(const Event& event) {
             LOG_THROTTLED_ERROR(5000, "EventManager: WS broadcast failed: {}", e.what());
         }
 
-        try {
-            vms::core::AlertManager::getInstance().processEvent(ev);
-        } catch (const std::exception& e) {
-            LOG_ERROR("EventManager: AlertManager failed to process event: {}", e.what());
-        }
+        // 2026-05-14: removed AlertManager::processEvent dispatch (legacy
+        // alert_rules table). Legacy rows are migrated to composite rules on
+        // boot by RuleEngine::migrateLegacyAlertRules; delivery now flows
+        // exclusively through RuleEngine → vms::events::deliverAction.
 
         try {
             static std::atomic<uint64_t> raw_event_id_counter{1};

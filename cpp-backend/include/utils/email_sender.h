@@ -1,10 +1,11 @@
-// email_sender.h — shared SMTP send path used by both vms::events::AlertRouter
-// (RuleEngine-driven new path) and vms::core::AlertManager (legacy
-// alert_rules-table path). Both used to inline their own libcurl SMTP code;
-// the legacy path was a MOCK that only LOG_INFO'd. Centralising the actual
-// SMTP transport here:
+// email_sender.h — shared SMTP send path used by the alert delivery layer
+// (vms::events::deliverAction → EMAIL channel). Pre-2026-05-14 this helper
+// was shared between vms::events::AlertRouter and vms::core::AlertManager;
+// both have been retired in the AlertManager consolidation, leaving the
+// unified RuleEngine-driven dispatch as the only caller.
+//
 //   1. Closes BUG-ALERT-02 (legacy email rules silently logged instead of
-//      sending).
+//      sending) — the only path now is async, real SMTP.
 //   2. Removes a synchronous CURL call from EventManager's broadcast loop —
 //      the helper queues every send through a dedicated background runner
 //      with a bounded queue (drop-on-full).
@@ -45,8 +46,8 @@ std::string sanitizeMailHeader(const std::string& s, std::size_t max_len = 256);
 // flooding the queue.
 //
 // `source_label` appears in log lines as `[email_sender:<label>]` so we can
-// tell legacy AlertManager sends apart from new AlertRouter sends in
-// production logs.
+// distinguish callers in production logs (today there is only `alert_delivery`,
+// the post-consolidation unified path).
 bool sendEmailAsync(const std::string& subject,
                     const std::string& body,
                     const std::vector<std::string>& recipients,

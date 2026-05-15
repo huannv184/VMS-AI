@@ -40,7 +40,7 @@
 #include "core/reid_engine.h"
 #include "core/attendance_tracker.h"
 #include "core/counter_bucket_aggregator.h"
-#include "events/alert_router.h"
+#include "events/alert_delivery.h"
 #include "events/rule_engine.h"
 #include "events/zone_manager.h"
 #include "streaming/camera_stream_manager_qt.h"
@@ -364,6 +364,16 @@ int main(int argc, char* argv[]) {
             LOG_WARN("RuleEngine loadFromDatabase exception: {}", e.what());
         }
 
+        // One-shot migration from the legacy alert_rules table into the
+        // unified rules table. Idempotent via the `alert_rules_migrated`
+        // setting — only does real work on the first boot after the
+        // 2026-05-14 AlertManager retirement.
+        try {
+            vms::events::RuleEngine::getInstance().migrateLegacyAlertRules();
+        } catch (const std::exception& e) {
+            LOG_WARN("RuleEngine migrateLegacyAlertRules exception: {}", e.what());
+        }
+
         // Initialise ReIDEngine. Pre-fix this getInstance() was only called
         // from the REST controller, which doesn't call init(). The engine's
         // initialized_ flag stayed false forever → processDetection short-
@@ -491,7 +501,7 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Stopping background API workers...");
         vms::api::SynopsisController::shutdown();
         vms::api::ExportController::shutdown();
-        vms::events::AlertRouter::getInstance().shutdown();
+        vms::events::shutdownDelivery();
 
         LOG_INFO("Stopping tracked child processes...");
         vms::core::ProcessManager::getInstance().shutdownAll();

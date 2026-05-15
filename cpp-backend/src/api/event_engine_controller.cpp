@@ -6,7 +6,6 @@
 #include "api/event_engine_controller.h"
 #include "events/rule_engine.h"
 #include "events/zone_manager.h"
-#include "events/alert_router.h"
 #include "core/roi_manager.h"
 #include "middleware/auth_middleware.h"
 #include "server/vms_app.h"

@@ -22,7 +22,6 @@
 #include "api/reporting_controller.h"
 #include "api/videowall_controller.h"
 #include "api/reid_controller.h"
-#include "api/alert_controller.h"
 #include "api/attendance_controller.h"
 #include "api/counter_controller.h"
 #include "middleware/auth_middleware.h"
@@ -314,7 +313,10 @@ void HttpServer::registerRoutes() {
     api::AnalyticsController::registerRoutes(app_);
     api::VideoWallController::registerRoutes(app_);
     api::ReIDController::registerRoutes(app_);
-    api::AlertController::registerRoutes(app_);
+    // 2026-05-14: AlertController retired in AlertManager consolidation.
+    // /api/alerts/rules CRUD is gone; rule editing happens via /api/rules*.
+    // Legacy alert_rules rows are auto-migrated by
+    // RuleEngine::migrateLegacyAlertRules at boot.
     api::AttendanceController::registerRoutes(app_);
     api::CounterController::registerRoutes(app_);
 

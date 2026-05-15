@@ -4,6 +4,7 @@
 // ==============================================================
 
 #include "events/rule_engine.h"
+#include "events/alert_delivery.h"
 #include "utils/logger.h"
 #include "database/db_manager.h"
 #include "core/camera_pipeline_manager.h"
@@ -17,6 +18,32 @@
 #include <QString>
 
 namespace vms::events {
+
+// ============================================================================
+// ALERT CHANNEL helpers — moved from the deleted alert_router.cpp.
+// ============================================================================
+
+const char* alertChannelToString(AlertChannel channel) {
+    switch (channel) {
+        case AlertChannel::UI_NOTIFICATION: return "UI_NOTIFICATION";
+        case AlertChannel::EMAIL:           return "EMAIL";
+        case AlertChannel::SMS:             return "SMS";
+        case AlertChannel::WEBHOOK:         return "WEBHOOK";
+        case AlertChannel::MOBILE_PUSH:     return "MOBILE_PUSH";
+        case AlertChannel::ALARM_OUTPUT:    return "ALARM_OUTPUT";
+        default:                            return "NONE";
+    }
+}
+
+AlertChannel stringToAlertChannel(const std::string& str) {
+    if (str == "UI_NOTIFICATION") return AlertChannel::UI_NOTIFICATION;
+    if (str == "EMAIL")           return AlertChannel::EMAIL;
+    if (str == "SMS")             return AlertChannel::SMS;
+    if (str == "WEBHOOK")         return AlertChannel::WEBHOOK;
+    if (str == "MOBILE_PUSH")     return AlertChannel::MOBILE_PUSH;
+    if (str == "ALARM_OUTPUT")    return AlertChannel::ALARM_OUTPUT;
+    return AlertChannel::NONE;
+}
 
 // ============================================================================
 // SERIALIZATION â€” RuleCondition
@@ -293,6 +320,7 @@ bool RuleEngine::removeRule(int rule_id) {
     if (it == rules_.end()) return false;
     rules_.erase(it);
     noise_state_.erase(rule_id);
+    rate_window_.erase(rule_id);
     LOG_INFO("[RuleEngine] Removed rule {}", rule_id);
     return true;
 }
@@ -376,6 +404,9 @@ bool RuleEngine::evaluateEvent(const RawEvent& event) {
             auto now = std::chrono::system_clock::now();
             noise_state_[rule.rule_id].last_trigger = now;
             noise_state_[rule.rule_id].consecutive_count++;
+            // Record for max_alerts_per_hour rolling window (checkRateLimit
+            // reads this on the next evaluation; pruning happens lazily there).
+            rate_window_[rule.rule_id].push_back(now);
             
             RuleTriggerLog tlog;
             tlog.log_id = total_triggered_ + 1;
@@ -565,8 +596,28 @@ bool RuleEngine::checkAntiNoise(const CompositeRule& rule, const RawEvent& event
             return false;
         }
     }
-    
+
+    // Rate limit (max_alerts_per_hour). 0 / negative ⇒ unlimited.
+    if (an.max_alerts_per_hour > 0) {
+        if (!checkRateLimit(rule.rule_id, an.max_alerts_per_hour)) {
+            return false;
+        }
+    }
+
     return true;
+}
+
+bool RuleEngine::checkRateLimit(int rule_id, int max_per_hour) {
+    auto& window = rate_window_[rule_id];
+    const auto now = std::chrono::system_clock::now();
+    const auto one_hour_ago = now - std::chrono::hours(1);
+    // Prune; std::vector erase-from-front is O(n) but n is bounded by
+    // max_per_hour, so even at 1000 alerts/hr this is sub-microsecond and
+    // runs at most once per evaluated event (already under mutex_).
+    window.erase(std::remove_if(window.begin(), window.end(),
+                                [one_hour_ago](const auto& t) { return t < one_hour_ago; }),
+                 window.end());
+    return window.size() < static_cast<size_t>(max_per_hour);
 }
 
 bool RuleEngine::checkCooldown(int rule_id, int cooldown_sec) {
@@ -638,23 +689,14 @@ void RuleEngine::executeActions(const CompositeRule& rule, const RawEvent& event
     for (auto& action : rule.actions) {
         switch (action.type) {
             case ActionType::ALERT: {
-                // Forward to AlertRouter
-                CorrelatedEvent ce;
-                ce.correlation_id = event.event_id;
-                ce.type = event.type;
-                ce.severity = event.severity;
-                ce.primary_zone_id = event.zone_id;
-                ce.camera_ids = {event.camera_id};
-                ce.first_seen = event.timestamp;
-                ce.last_seen = event.timestamp;
-                ce.event_count = 1;
-                ce.avg_confidence = event.confidence;
-                ce.best_camera_id = event.camera_id;
-                ce.best_snapshot_path = event.snapshot_path;
-                ce.metadata["rule_name"] = rule.name;
-                ce.metadata["rule_id"] = rule.rule_id;
-                
-                AlertRouter::getInstance().routeEvent(ce);
+                // 2026-05-14 consolidation: pre-fix this called
+                // AlertRouter::routeEvent(CorrelatedEvent) which then matched
+                // against AlertRouter's in-memory rule list — that list was
+                // NEVER populated (addRule had zero callers), so every
+                // ALERT action silently dropped. Now delivers directly via
+                // the unified alert_delivery layer, reading per-channel
+                // recipients from action.metadata.
+                deliverAction(rule, action, event);
                 break;
             }
             case ActionType::RECORD_CLIP: {
@@ -694,29 +736,11 @@ void RuleEngine::executeActions(const CompositeRule& rule, const RawEvent& event
                 break;
             }
             case ActionType::WEBHOOK: {
-                if (!action.webhook_url.empty()) {
-                    LOG_INFO("[RuleEngine] Action: WEBHOOK to {}", action.webhook_url);
-                    // Build webhook payload and route as alert event
-                    CorrelatedEvent wh_ce;
-                    wh_ce.correlation_id = event.event_id;
-                    wh_ce.type = event.type;
-                    wh_ce.severity = event.severity;
-                    wh_ce.primary_zone_id = event.zone_id;
-                    wh_ce.camera_ids = {event.camera_id};
-                    wh_ce.first_seen = event.timestamp;
-                    wh_ce.last_seen = event.timestamp;
-                    wh_ce.event_count = 1;
-                    wh_ce.avg_confidence = event.confidence;
-                    wh_ce.best_camera_id = event.camera_id;
-                    wh_ce.best_snapshot_path = event.snapshot_path;
-                    wh_ce.metadata["rule_name"] = rule.name;
-                    wh_ce.metadata["rule_id"] = rule.rule_id;
-                    wh_ce.metadata["webhook_url"] = action.webhook_url;
-                    wh_ce.metadata["object_class"] = event.object_class;
-                    
-                    // Route through AlertRouter which handles async webhook delivery
-                    AlertRouter::getInstance().routeEvent(wh_ce);
-                }
+                // 2026-05-14 consolidation: identical no-op problem as ALERT
+                // pre-fix. Now goes through alert_delivery::deliverAction,
+                // which reads action.webhook_url and applies SSRF + DNS-pin
+                // before the async POST.
+                deliverAction(rule, action, event);
                 break;
             }
             case ActionType::LOG:
@@ -943,6 +967,140 @@ nlohmann::json RuleEngine::getStatistics() {
 void RuleEngine::onRuleFired(RuleFiredCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     callbacks_.push_back(cb);
+}
+
+// ============================================================================
+// LEGACY MIGRATION — `alert_rules` table → CompositeRule
+// One-shot, idempotent via the `alert_rules_migrated` setting. Called once
+// at boot in main.cpp after loadFromDatabase. The legacy AlertManager that
+// used to read this table is gone (2026-05-14 consolidation); without
+// migration, any rules an operator created via the legacy POST
+// /api/alerts/rules would silently stop delivering.
+// ============================================================================
+
+bool RuleEngine::migrateLegacyAlertRules() {
+    auto& db_mgr = database::DbManager::getInstance();
+    if (!db_mgr.isInitialized()) return false;
+
+    if (db_mgr.getSetting("alert_rules_migrated", "0") == "1") {
+        LOG_INFO("[RuleEngine] Legacy alert_rules migration already done; skipping.");
+        return true;
+    }
+
+    QSqlDatabase db = db_mgr.getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) {
+        LOG_WARN("[RuleEngine] Cannot migrate legacy alert_rules: no DB connection");
+        return false;
+    }
+
+    QSqlQuery query(db);
+    // Select even disabled rows so the migration preserves operator intent
+    // (they may toggle them back on after upgrading).
+    if (!query.exec("SELECT id, camera_id, event_type, severity, action_type, recipient, is_enabled "
+                    "FROM alert_rules")) {
+        // alert_rules table might not exist on a brand-new install; that's fine.
+        LOG_INFO("[RuleEngine] Legacy alert_rules table not readable ({}); marking migrated.",
+                 query.lastError().text().toStdString());
+        db_mgr.setSetting("alert_rules_migrated", "1");
+        return true;
+    }
+
+    int migrated_count = 0;
+    int skipped_count = 0;
+
+    while (query.next()) {
+        int legacy_id     = query.value(0).toInt();
+        int camera_id     = query.value(1).toInt();
+        std::string etype = query.value(2).toString().toStdString();
+        std::string sev   = query.value(3).toString().toStdString();
+        std::string atype = query.value(4).toString().toStdString();
+        std::string recip = query.value(5).toString().toStdString();
+        bool enabled      = query.value(6).toInt() != 0;
+
+        if (recip.empty()) {
+            LOG_WARN("[RuleEngine] Migration: skipping legacy alert_rule id={} (empty recipient)", legacy_id);
+            ++skipped_count;
+            continue;
+        }
+
+        CompositeRule r;
+        r.name = "Migrated: " + (etype.empty() ? std::string("*") : etype) +
+                 "@cam" + std::to_string(camera_id);
+        r.description = "Auto-migrated from alert_rules row #" + std::to_string(legacy_id) +
+                        " on 2026-05-14 consolidation.";
+        r.enabled = enabled;
+        r.logic = RuleLogic::AND;
+
+        // Camera scope: legacy "-1" = any camera → empty vector (matches all).
+        if (camera_id > 0) r.camera_ids = { camera_id };
+
+        // Event type condition unless legacy row was wildcard.
+        if (!etype.empty() && etype != "*") {
+            RuleCondition cond;
+            cond.type = ConditionType::EVENT_TYPE;
+            cond.event_types = { stringToEventType(etype) };
+            r.conditions.push_back(cond);
+        }
+
+        // Severity condition (legacy default 'high'). Only emit if non-trivial.
+        if (!sev.empty() && sev != "low") {
+            RuleCondition sev_cond;
+            sev_cond.type = ConditionType::SEVERITY;
+            // Legacy stored lowercase string; modern fromString expects uppercase.
+            std::string sev_upper = sev;
+            std::transform(sev_upper.begin(), sev_upper.end(), sev_upper.begin(), ::toupper);
+            sev_cond.min_severity = stringToEventSeverity(sev_upper);
+            r.conditions.push_back(sev_cond);
+        }
+
+        RuleAction action;
+        if (atype == "webhook") {
+            action.type = ActionType::WEBHOOK;
+            action.webhook_url = recip;
+        } else if (atype == "email") {
+            action.type = ActionType::ALERT;
+            action.channels = { AlertChannel::EMAIL };
+            action.metadata["email_addresses"] = nlohmann::json::array({ recip });
+        } else if (atype == "sms") {
+            action.type = ActionType::ALERT;
+            action.channels = { AlertChannel::SMS };
+            action.metadata["phone_numbers"] = nlohmann::json::array({ recip });
+        } else {
+            LOG_WARN("[RuleEngine] Migration: skipping legacy alert_rule id={} (unknown action_type='{}')",
+                     legacy_id, atype);
+            ++skipped_count;
+            continue;
+        }
+        r.actions.push_back(action);
+
+        // Preserve audit trail in metadata.
+        r.metadata["migrated_from_alert_rule_id"] = legacy_id;
+
+        // addRule + saveToDatabase. addRule locks mutex_ internally; we call
+        // it outside any other lock to avoid ordering issues.
+        int assigned = addRule(r);
+        if (assigned > 0) {
+            ++migrated_count;
+            LOG_INFO("[RuleEngine] Migrated legacy alert_rule #{} → composite rule #{}",
+                     legacy_id, assigned);
+        } else {
+            LOG_WARN("[RuleEngine] Migration failed to addRule for legacy id={}", legacy_id);
+            ++skipped_count;
+        }
+    }
+
+    if (migrated_count > 0) {
+        if (!saveToDatabase()) {
+            LOG_ERROR("[RuleEngine] Migration: addRule succeeded for {} rules but saveToDatabase failed. "
+                      "NOT marking migrated — will retry on next boot.", migrated_count);
+            return false;
+        }
+    }
+
+    db_mgr.setSetting("alert_rules_migrated", "1");
+    LOG_INFO("[RuleEngine] Legacy alert_rules migration complete: {} migrated, {} skipped.",
+             migrated_count, skipped_count);
+    return true;
 }
 
 } // namespace vms::events

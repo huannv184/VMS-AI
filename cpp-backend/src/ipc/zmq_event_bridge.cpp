@@ -316,9 +316,9 @@ void ZmqEventBridge::handleTrafficCount(const json& msg) {
 // handlers below previously called `DbManager::enqueueEvent` directly + did
 // their own WS broadcast inline. That path writes the row to the events table
 // but **completely skips** `EventManager::createEvent`, which is the gate
-// where `RuleEngine::evaluateEvent` + `AlertManager::processEvent` get
-// triggered. Net effect: operator-configured webhook/email/Telegram/alarm-relay
-// rules NEVER fired for ZMQ-driven INTRUSION/LOITERING/FIRE/SMOKE/PPE events.
+// where `RuleEngine::evaluateEvent` (the canonical dispatch) gets triggered.
+// Net effect: operator-configured webhook/email/Telegram/alarm-relay rules
+// NEVER fired for ZMQ-driven INTRUSION/LOITERING/FIRE/SMOKE/PPE events.
 // EventsView showed the row because the DB insert succeeded; alerting was
 // silently dead. Found during the AiEventProcessor + zmq_event_bridge race
 // deep-dive on 2026-05-12.
@@ -327,8 +327,8 @@ void ZmqEventBridge::handleTrafficCount(const json& msg) {
 //   1. auto-generates a UUID id (same UUID v4 generator pattern as enqueueEvent),
 //   2. calls `event_repo_->insertEvent` → batch writer → DB,
 //   3. broadcasts the WS payload to per-camera + global channels,
-//   4. fires `AlertManager::processEvent` (legacy alert_rules dispatch),
-//   5. fires `RuleEngine::evaluateEvent` (modern rules+zones dispatch).
+//   4. fires `RuleEngine::evaluateEvent` → vms::events::deliverAction
+//      (single dispatch path post 2026-05-14 AlertManager consolidation).
 //
 // The manual `streaming::CameraStreamManager::broadcastEvent(...)` blocks each
 // handler used to do are now removed — `EventManager::createEvent` performs
@@ -337,9 +337,8 @@ void ZmqEventBridge::handleTrafficCount(const json& msg) {
 // more information for the frontend (`useWebSocket.js` switches on
 // `event_type` so extra fields are ignored).
 //
-// RuleEngine + AlertManager are both thread-safe (lock_guard on rules_mutex_),
-// so fanning in from the ZMQ thread plus the AiEventProcessor worker pool is
-// safe.
+// RuleEngine is thread-safe (lock_guard on mutex_), so fanning in from the
+// ZMQ thread plus the AiEventProcessor worker pool is safe.
 namespace {
 // Helper: build a vms::Event from a ZMQ payload + dispatch through the canonical path.
 void dispatchHardwareEvent(int camera_id,

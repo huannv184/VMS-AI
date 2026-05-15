@@ -6,16 +6,37 @@
 #pragma once
 
 #include "events/event_types.h"
-#include "events/alert_router.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
 #include <functional>
+#include <atomic>
+#include <optional>
 #include <nlohmann/json.hpp>
 
 namespace vms::events {
+
+// ============================================================================
+// ALERT CHANNELS — recipients per RuleAction
+// Moved here from the deleted events/alert_router.h on 2026-05-14
+// (AlertManager/AlertRouter consolidation). RuleAction.channels is the
+// canonical place for these.
+// ============================================================================
+
+enum class AlertChannel {
+    NONE,
+    UI_NOTIFICATION,    // Web UI popup (WS broadcast)
+    EMAIL,              // SMTP via vms::utils::sendEmailAsync
+    SMS,                // Twilio HTTPS
+    WEBHOOK,            // HTTP POST to external system
+    MOBILE_PUSH,        // Telegram bot
+    ALARM_OUTPUT        // LAN relay HTTP POST
+};
+
+const char* alertChannelToString(AlertChannel channel);
+AlertChannel stringToAlertChannel(const std::string& str);
 
 // ============================================================================
 // RULE CONDITION — Single condition in a composite rule
@@ -208,6 +229,17 @@ public:
     // Persistence
     bool loadFromDatabase();
     bool saveToDatabase();
+
+    // One-shot migration from the legacy `alert_rules` table into composite
+    // `rules`. Gated by the `alert_rules_migrated` setting so it's safe to
+    // call on every boot. Each legacy row becomes one CompositeRule with a
+    // single EVENT_TYPE condition (or none if event_type='*') and one
+    // ALERT/WEBHOOK action carrying the recipient in metadata. After
+    // migration the legacy rows are left in place — operators can DROP
+    // TABLE alert_rules manually if desired (the table is no longer read
+    // by anything after this pass). Returns true if a migration ran (or
+    // was already done previously); false on hard DB error.
+    bool migrateLegacyAlertRules();
     
     // Statistics
     nlohmann::json getStatistics();
@@ -232,6 +264,11 @@ private:
     bool checkCooldown(int rule_id, int cooldown_sec);
     bool checkDebounce(int rule_id, int camera_id, int debounce_sec);
     bool checkMinDuration(const RawEvent& event, int min_duration_sec);
+    // Returns true if the rule has fewer than max_per_hour trigger entries
+    // recorded in the last hour. Read-only — actual recording happens in
+    // evaluateEvent when the rule fires, so per-rule window state survives
+    // alongside noise_state_ entry mutations.
+    bool checkRateLimit(int rule_id, int max_per_hour);
     
     // Data
     std::vector<CompositeRule> rules_;
@@ -246,6 +283,10 @@ private:
     };
     std::unordered_map<int, NoiseState> noise_state_;  // key = rule_id
     std::unordered_map<std::string, NoiseState> debounce_state_;  // key = "rule_id:camera_id"
+    // Rolling 1h window of trigger timestamps per rule for max_alerts_per_hour
+    // enforcement. Pre-2026-05-14 this field existed on the deleted AlertRouter
+    // but RuleEngine itself never enforced anti_noise.max_alerts_per_hour.
+    std::unordered_map<int, std::vector<std::chrono::system_clock::time_point>> rate_window_;
     
     // Stats
     std::atomic<uint64_t> total_evaluated_{0};
