@@ -1,5 +1,23 @@
 # Architectural Decisions — AI Camera System
 
+## 2026-05-15 PipelineStateStore — shared_ptr-published frame, defer per-camera sharding
+
+### Decision: Publish JPEG + objects as `shared_ptr<const vector<...>>`; copy outside the writer's unique_lock
+- **Choice**: `PipelineStateSnapshot` stores `latest_frame_jpeg` and `latest_objects` as `std::shared_ptr<const ...>`. Writer (`updateFrame`) builds the new buffers via `std::make_shared` BEFORE acquiring the unique_lock, then under-lock only assigns the pointers + scalar fields. Readers under shared_lock copy the refcounted handle then drop the lock before deep-copying out (legacy API) or just return the handle (new `latestFrameJpegShared()` accessor).
+- **Rationale**: pre-fix the unique_lock spanned the JPEG memcpy (200-500 KB) plus objects + metadata copy. At 30 fps × N cameras the write-side lock contention scaled linearly with camera count; every shared_lock reader on EVERY camera blocked behind a writer's memcpy on a SINGLE camera. The buffer copies are unavoidable — the writer's caller owns the source bytes only briefly, the store must take its own copy. But doing the copies UNDER the lock blocks unrelated work. Moving them out is a textbook fix.
+- **Trade-off**: each frame allocates a fresh `shared_ptr` control block + vector buffer. At 1500 fps system-wide that's ~3000 small allocations/sec — modern allocators (mimalloc/tcmalloc/MSVC's segment allocator) handle this without contention. If profiling shows this as a bottleneck, switch to a per-camera ring of pre-allocated buffers reused across frames. Out of scope this pass.
+- **Why not move the source buffer into the store**: the caller (`onFrameDecoded`) holds the JPEG bytes in a `vector<uchar>` local that's about to fall out of scope; if `updateFrame` took an rvalue we could avoid the copy entirely. But that signature change requires touching the call site + the QSignal-emitting NativeReaderWorker chain. The current "copy pre-lock" win captures most of the value without that ripple. Logged for a future zero-copy pass.
+
+### Decision: Keep one global `shared_mutex`; defer per-camera sharding
+- **Choice**: leave `PipelineStateStore::mutex_` as a single shared_mutex protecting all cameras' snapshots in one `unordered_map<int, PipelineStateSnapshot>`.
+- **Rationale**: after the shared_ptr swap above, the writer's critical section drops to nanoseconds (pointer assignments + scalar field stores). Shared_lock readers parallelise with each other, and the writer's window is too small to meaningfully block them under typical loads. At 50 cameras × 30 fps the aggregate writer lock acquisition rate is 1500/sec — each acquisition is ~50 ns of work; readers see <0.01% blocked time.
+- **Trade-off**: under extreme bursts (>200 cameras + write storms) the single mutex would still cap throughput. Real fix is per-camera sharding via `std::shared_ptr<PipelineStateSnapshot>` per entry with the map only guarding registry mutations. That's a bigger API rewrite — `snapshot()` becomes "look up the shared_ptr, drop the registry lock, dereference outside". Defer until the new `delivery` / `batch_writer` counters (landed same day in alert_delivery + DbManager audits) show pipeline updates contending.
+- **Why not bucket-shard by `camera_id % N`?**: would work and is smaller surgery. But it leaks "we expected sharding to matter" into a struct that may not need it after the shared_ptr fix. Measure first.
+
+### Decision: `latestFrameJpegShared()` is a NEW additive API; keep `latestFrameJpeg()` unchanged
+- **Choice**: existing callers of `latestFrameJpeg(camera_id) → std::optional<std::vector<char>>` continue to work and continue to deep-copy on return. Add `latestFrameJpegShared(camera_id) → std::shared_ptr<const std::vector<char>>` as the zero-copy path for hot read sites (HTTP snapshot endpoint, WebSocket H.264 keyframe broadcast that bundles objects).
+- **Rationale**: don't ripple this audit across every consumer right now. The big win is on the writer side; the read-side copy is a smaller cost that callers can opt into removing per-endpoint. Migrating callers also requires touching CameraPipelineManager's downstream API (it currently wraps the optional<vector> and returns it from `getLatestFrame()`). One pass per concern.
+
 ## 2026-05-15 DbManager hot-path — SAVEPOINT poison-row isolation, observability counters, defer transaction-mutex removal
 
 ### Decision: SAVEPOINT around per-row INSERT inside batched transaction (Postgres only)

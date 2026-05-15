@@ -27,12 +27,26 @@ void PipelineStateStore::updateFrame(int camera_id,
                                      const std::vector<inference::TrackedObject>& objects,
                                      const nlohmann::json& metadata,
                                      uint64_t timestamp_ms) {
+    // 2026-05-15 hot-path audit: build the immutable copies OUTSIDE the
+    // unique_lock. At 30 fps × N cameras the JPEG memcpy (200-500 KB) and
+    // objects vector copy dominate updateFrame's cost; doing them unlocked
+    // lets readers and other cameras' writers proceed in parallel. Lock hold
+    // becomes a pointer assignment + small json assign + scalar updates.
+    std::shared_ptr<const std::vector<char>> new_jpeg;
+    if (!jpeg_data.empty()) {
+        new_jpeg = std::make_shared<const std::vector<char>>(jpeg_data.begin(),
+                                                              jpeg_data.end());
+    }
+    auto new_objects = std::make_shared<const std::vector<inference::TrackedObject>>(objects);
+
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& snapshot = getOrCreateLocked(camera_id);
-    if (!jpeg_data.empty()) {
-        snapshot.latest_frame_jpeg.assign(jpeg_data.begin(), jpeg_data.end());
+    if (new_jpeg) {
+        // Preserve "don't clobber the last good frame with an empty one" —
+        // the original code's `if (!jpeg_data.empty())` guard intent.
+        snapshot.latest_frame_jpeg = std::move(new_jpeg);
     }
-    snapshot.latest_objects = objects;
+    snapshot.latest_objects = std::move(new_objects);
     snapshot.latest_metadata = metadata;
     snapshot.last_frame_ts = static_cast<long long>(timestamp_ms);
 }
@@ -80,21 +94,42 @@ void PipelineStateStore::setState(int camera_id, CameraState state, const std::s
 }
 
 std::optional<std::vector<char>> PipelineStateStore::latestFrameJpeg(int camera_id) const {
+    // Acquire the refcounted handle under shared_lock, deep-copy outside.
+    // Keeps the lock hold tiny (pointer copy) and lets the existing API
+    // shape — return-by-value vector<char> — stay backward-compatible.
+    // Callers that want zero-copy can use latestFrameJpegShared() instead.
+    std::shared_ptr<const std::vector<char>> handle;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto it = snapshots_.find(camera_id);
+        if (it == snapshots_.end() || !it->second.latest_frame_jpeg ||
+            it->second.latest_frame_jpeg->empty()) {
+            return std::nullopt;
+        }
+        handle = it->second.latest_frame_jpeg;
+    }
+    return *handle;
+}
+
+std::shared_ptr<const std::vector<char>>
+PipelineStateStore::latestFrameJpegShared(int camera_id) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = snapshots_.find(camera_id);
-    if (it == snapshots_.end() || it->second.latest_frame_jpeg.empty()) {
-        return std::nullopt;
-    }
+    if (it == snapshots_.end()) return nullptr;
     return it->second.latest_frame_jpeg;
 }
 
 std::vector<inference::TrackedObject> PipelineStateStore::latestObjects(int camera_id) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    auto it = snapshots_.find(camera_id);
-    if (it == snapshots_.end()) {
-        return {};
+    std::shared_ptr<const std::vector<inference::TrackedObject>> handle;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto it = snapshots_.find(camera_id);
+        if (it == snapshots_.end() || !it->second.latest_objects) {
+            return {};
+        }
+        handle = it->second.latest_objects;
     }
-    return it->second.latest_objects;
+    return *handle;
 }
 
 nlohmann::json PipelineStateStore::latestMetadata(int camera_id) const {
