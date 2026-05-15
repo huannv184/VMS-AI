@@ -1,5 +1,30 @@
 # Architectural Decisions — AI Camera System
 
+## 2026-05-15 DbManager hot-path — SAVEPOINT poison-row isolation, observability counters, defer transaction-mutex removal
+
+### Decision: SAVEPOINT around per-row INSERT inside batched transaction (Postgres only)
+- **Choice**: `flushEventBatch` now executes `SAVEPOINT vms_row_sp` before each `INSERT`, then either `RELEASE` on success or `ROLLBACK TO` on failure. SQLite path unchanged (per-statement errors don't abort the transaction). On Postgres, this isolates one bad row to that single statement so the rest of the batch still commits.
+- **Rationale**: pre-fix the loop logged-and-continued on per-row exec failure, but Postgres MVCC marks the tx as aborted on first error and every subsequent INSERT fails. Commit then fails → the whole batch re-enqueues at front → infinite retry loop on the poisoned row. The "tolerant" code shape was correct for SQLite and silently broken for Postgres — this is exactly the dialect mismatch class that `.claude/rules/security.md` calls out as "states the new risk explicitly".
+- **Trade-off**: the poisoned row is now DROPPED (not retried). Operators see `row_failures_total` increment + a WARN log per failure. Acceptable: a row that fails NOT NULL / type / CHECK violations is not data that future retry will heal — the schema or the producer is the problem. Re-enqueueing it is exactly the loop we're avoiding. If operators want failed-event archival, a "dead-letter table" is the right add (out of scope this pass).
+- **Alternative considered**: switch to single-row tx-per-event (no batching). Rejected — multiplies SQLite WAL flush count by ~50× and Postgres tx overhead similarly. Batching is correct; per-row isolation is the missing piece.
+- **Why not single shared savepoint name across all rows?**: a savepoint name is scoped to a transaction. Using `vms_row_sp` per-iteration is identical to using `vms_row_sp_<i>` per-iteration — Postgres's stack is bounded by the RELEASE/ROLLBACK at each iteration. Cleaner to keep one name.
+
+### Decision: Six atomic counters + wait-free `batchWriterStats()` accessor
+- **Choice**: `DbManager` gains `std::atomic<std::uint64_t>` for `enqueued_total / dropped_total / flushed_total / flush_failures_total / row_failures_total / peak_queue_depth`. `dropped_total` covers BOTH queue-full drops AND not-accepting-events drops (so the operator can distinguish backpressure from shutdown-race). `batchWriterStats()` is `const`, returns a POD snapshot, never blocks the producer.
+- **Rationale**: same shape and rationale as the alert_delivery `BackgroundJobRunner` counters landed the same day. Event ingestion is the dominant write workload; if we can't quantify drops, we can't size queue/batch parameters or detect ingestion regressions. The cost is one relaxed atomic increment per event on a hot path already under `batch_queue_mutex_`.
+- **Trade-off**: `batch_queue_mutex_` is now `mutable` so the `const` accessor can `try_to_lock` for `current_queue_depth`. We lose strict const-by-mutex but gain wait-free reads — the operator dashboard can poll every 5s without ever blocking event ingestion.
+
+### Decision: Defer `transaction_mutex_` removal — document, don't touch
+- **Choice**: keep the global `transaction_mutex_` that serializes `beginTransaction()` / `commit()` / `rollback()` across the 3 callers (zone save, rule save, ReID 60s flush) for now.
+- **Rationale**: the mutex is named "DB-004 FIX: prevent interleaving" but with the current per-thread connection model (each thread gets its own `QSqlDatabase` via `getThreadConnection()` keyed on `std::this_thread::get_id()`), no two transactions share a connection — interleaving at the SQL level is already impossible. The mutex serializes them at the application level, which is unnecessary for both Postgres MVCC and SQLite WAL.
+- **Trade-off**: actual production contention is near-zero (ReID flush every 60s × ~tens of ms hold, vs occasional rule/zone CRUD). Removing the mutex is the right cleanup but needs a careful pass: confirm no caller relies on the mutex for ordering (e.g. "I want my rule save to be visible before yours"), no DDL operation needs exclusive access, etc. The visibility counters landed this session let us measure the actual contention first; if it's nil, the removal is low-risk.
+- **Why not remove now**: scope. The audit found the higher-priority bug (BUG-DB-PG-BATCH-ABORT-01 — actual data-loss risk on Postgres) and the visibility gap. Touching a global serializer is the kind of change that needs its own commit with its own bisect window.
+
+### Decision: Defer SQLite WAL truncate policy — operator tuning > code change
+- **Choice**: rely on SQLite's auto-checkpoint (1000 pages, PASSIVE) for now. Don't add an explicit `wal_checkpoint(TRUNCATE)` call.
+- **Rationale**: under steady-state load with periodic reader gaps, auto-checkpoint completes and the WAL stays bounded. Problems arise only under sustained writes + constantly-active readers — at that point an operator-tunable PRAGMA settings block (size threshold + cadence) is more useful than a hardcoded cadence. Adding `wal_checkpoint(TRUNCATE)` in the batch writer idle path is a 5-line change but picks one policy for all deployments.
+- **Trade-off**: WAL file may grow on a deployment that fits the bad profile. Memo flagged in past-bugs.md so operators see it during the next outage post-mortem; the right fix is a dedicated config knob.
+
 ## 2026-05-15 alert_delivery hot-path — push DNS + DB into workers; keep one shared pool (defer per-channel pool split)
 
 ### Decision: SSRF check (getaddrinfo) and DB settings reads move inside the worker job

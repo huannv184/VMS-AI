@@ -1393,6 +1393,10 @@ std::map<std::string, std::string> DbManager::getAllSettings() {
 bool DbManager::enqueueEvent(const Event& event) {
     // B-3 FIX: Reject events when not accepting (shutdown or not initialized)
     if (!accepting_events_.load(std::memory_order_acquire)) {
+        // 2026-05-15 DB hot-path audit: count not-accepting drops alongside
+        // queue-full drops so the operator can attribute "we lost X events"
+        // to either backpressure (queue-full) or shutdown race (not-accepting).
+        dropped_total_.fetch_add(1, std::memory_order_relaxed);
         LOG_WARN("EventBatchWriter: not accepting events, rejecting event {}", event.id);
         return false;
     }
@@ -1422,16 +1426,35 @@ bool DbManager::enqueueEvent(const Event& event) {
     }
 
     bool should_notify = false;
+    std::size_t depth_after_push = 0;
     {
         std::lock_guard<std::mutex> lock(batch_queue_mutex_);
-        // B-6 FIX: Cap queue at kMaxQueueSize, drop oldest with warning
+        // B-6 FIX: Cap queue at kMaxQueueSize, drop oldest with warning.
+        // Drop-oldest is a deliberate choice for event telemetry: a backed-up
+        // queue means the batch writer can't keep up; older events have been
+        // waiting longest, are most likely to be already-stale-for-operator
+        // (the user has moved on from yesterday's intrusion alert). Burst-
+        // mode operators care about the present.
         if (event_queue_.size() >= kMaxQueueSize) {
+            dropped_total_.fetch_add(1, std::memory_order_relaxed);
             LOG_THROTTLED_WARN(5000, "EventBatchWriter: queue full ({} events), dropping oldest event",
                      kMaxQueueSize);
             event_queue_.pop_front();
         }
         event_queue_.push_back(ev);
-        should_notify = (event_queue_.size() >= kBatchFlushSize);
+        depth_after_push = event_queue_.size();
+        should_notify = (depth_after_push >= kBatchFlushSize);
+    }
+    enqueued_total_.fetch_add(1, std::memory_order_relaxed);
+    // Peak-depth CAS retry, same shape as BackgroundJobRunner. Best-effort
+    // max without holding the queue mutex past the push.
+    {
+        std::uint64_t prev_peak = peak_queue_depth_.load(std::memory_order_relaxed);
+        while (depth_after_push > prev_peak &&
+               !peak_queue_depth_.compare_exchange_weak(prev_peak, depth_after_push,
+                                                        std::memory_order_relaxed)) {
+            // retry with refreshed prev_peak
+        }
     }
     if (should_notify) {
         batch_cv_.notify_one();
@@ -1580,12 +1603,15 @@ bool DbManager::flushEventBatch(std::deque<Event>& batch) {
     if (!db.transaction()) {
         LOG_ERROR("EventBatchWriter: BEGIN TRANSACTION failed: {}",
                   db.lastError().text().toStdString());
+        flush_failures_total_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
+    const bool is_postgres = (config_.driver == "postgresql");
+
     QSqlQuery query(db);
     QString insert_sql;
-    if (config_.driver == "postgresql") {
+    if (is_postgres) {
         insert_sql = "INSERT INTO events "
                      "(id, camera_id, event_type, description, snapshot_path, "
                      "metadata_json, timestamp, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
@@ -1599,11 +1625,29 @@ bool DbManager::flushEventBatch(std::deque<Event>& batch) {
     if (!query.prepare(insert_sql)) {
         LOG_ERROR("EventBatchWriter: prepare failed: {}", query.lastError().text().toStdString());
         db.rollback();
+        flush_failures_total_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
     int inserted = 0;
+    std::uint64_t row_failures_this_batch = 0;
     for (const auto& event : batch) {
+        // 2026-05-15 DB hot-path audit: SAVEPOINT around each insert on
+        // Postgres so one poisoned row (NOT NULL violation / type mismatch
+        // / CHECK violation) doesn't abort the whole transaction. Without
+        // this, Postgres MVCC marks the tx as aborted on the first error
+        // and every subsequent INSERT fails with "current transaction is
+        // aborted, commands ignored until end". Commit then fails →
+        // re-enqueue the WHOLE batch → infinite retry of the poison.
+        // SQLite already tolerates per-statement errors mid-transaction.
+        QSqlQuery savepoint(db);
+        if (is_postgres) {
+            if (!savepoint.exec("SAVEPOINT vms_row_sp")) {
+                LOG_THROTTLED_WARN(5000, "EventBatchWriter: SAVEPOINT failed: {}",
+                                   savepoint.lastError().text().toStdString());
+            }
+        }
+
         query.bindValue(0, QString::fromStdString(event.id));
         query.bindValue(1, event.camera_id);
         query.bindValue(2, QString::fromStdString(event.event_type));
@@ -1615,10 +1659,30 @@ bool DbManager::flushEventBatch(std::deque<Event>& batch) {
 
         if (query.exec()) {
             ++inserted;
+            if (is_postgres) {
+                // Release savepoint to drop the per-row marker; keeps tx
+                // savepoint stack bounded across the batch.
+                savepoint.exec("RELEASE SAVEPOINT vms_row_sp");
+            }
         } else {
+            ++row_failures_this_batch;
             LOG_WARN("EventBatchWriter: insert failed for event {}: {}",
                      event.id, query.lastError().text().toStdString());
+            if (is_postgres) {
+                // Roll back the per-row savepoint so the outer transaction
+                // remains usable. The poisoned event is dropped (will not
+                // retry); this is intentional — re-enqueueing a poison
+                // row is precisely the infinite-retry loop we're avoiding.
+                if (!savepoint.exec("ROLLBACK TO SAVEPOINT vms_row_sp")) {
+                    LOG_ERROR("EventBatchWriter: ROLLBACK TO SAVEPOINT failed: {}",
+                              savepoint.lastError().text().toStdString());
+                }
+                savepoint.exec("RELEASE SAVEPOINT vms_row_sp");
+            }
         }
+    }
+    if (row_failures_this_batch > 0) {
+        row_failures_total_.fetch_add(row_failures_this_batch, std::memory_order_relaxed);
     }
 
     // B-7 FIX: On COMMIT failure, ROLLBACK and return false so caller re-enqueues
@@ -1626,14 +1690,39 @@ bool DbManager::flushEventBatch(std::deque<Event>& batch) {
         LOG_ERROR("EventBatchWriter: COMMIT failed: {} — rolling back",
                   db.lastError().text().toStdString());
         db.rollback();
+        flush_failures_total_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
     if (inserted > 0) {
+        flushed_total_.fetch_add(static_cast<std::uint64_t>(inserted), std::memory_order_relaxed);
         LOG_DEBUG("EventBatchWriter: flushed {}/{} events",
                   inserted, static_cast<int>(batch.size()));
     }
     return true;
+}
+
+DbManager::BatchWriterStats DbManager::batchWriterStats() const {
+    BatchWriterStats s;
+    s.max_queue_size           = kMaxQueueSize;
+    s.batch_flush_size         = kBatchFlushSize;
+    s.enqueued_total           = enqueued_total_.load(std::memory_order_relaxed);
+    s.dropped_total            = dropped_total_.load(std::memory_order_relaxed);
+    s.flushed_total            = flushed_total_.load(std::memory_order_relaxed);
+    s.flush_failures_total     = flush_failures_total_.load(std::memory_order_relaxed);
+    s.row_failures_total       = row_failures_total_.load(std::memory_order_relaxed);
+    s.peak_queue_depth         = peak_queue_depth_.load(std::memory_order_relaxed);
+    s.running                  = batch_writer_running_.load(std::memory_order_relaxed);
+    s.accepting                = accepting_events_.load(std::memory_order_relaxed);
+    // Try-lock for queue depth so stats never contends the producer hot path.
+    // If contended we leave current_queue_depth=0; the next poll typically
+    // succeeds. Operators rely on enqueued_total - flushed_total for the real
+    // backlog estimate, not this point-in-time number.
+    std::unique_lock<std::mutex> lk(batch_queue_mutex_, std::try_to_lock);
+    if (lk.owns_lock()) {
+        s.current_queue_depth = event_queue_.size();
+    }
+    return s;
 }
 
 } // namespace database

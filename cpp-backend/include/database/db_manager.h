@@ -117,6 +117,36 @@ public:
      */
     bool isInitialized() const { return initialized_.load(std::memory_order_acquire); }
 
+    /**
+     * @brief Snapshot of event batch writer counters.
+     *
+     * Returned by batchWriterStats(). Exposed externally on
+     * GET /api/rules/stats (admin RBAC) so operators can answer
+     * "did we lose events during last night's burst?" — previously the
+     * only signal was a throttled WARN log line.
+     *
+     * All counters are monotonic uint64_t atomic loads; the struct is a
+     * point-in-time snapshot and may be inconsistent across fields for a
+     * few ns but is wait-free w.r.t. the producer hot path.
+     */
+    struct BatchWriterStats {
+        std::size_t  current_queue_depth{0};
+        std::size_t  max_queue_size{0};
+        std::size_t  batch_flush_size{0};
+        std::uint64_t enqueued_total{0};
+        std::uint64_t dropped_total{0};         // queue-full + not-accepting drops
+        std::uint64_t flushed_total{0};         // successful row insertions
+        std::uint64_t flush_failures_total{0};  // commit failures, transaction aborts
+        std::uint64_t row_failures_total{0};    // per-row insert exec failures (poisoned events)
+        std::uint64_t peak_queue_depth{0};
+        bool running{false};
+        bool accepting{false};
+    };
+
+    /// Wait-free read of the batch writer state. Safe to call from any
+    /// HTTP handler thread.
+    BatchWriterStats batchWriterStats() const;
+
     // Returns true when connected to PostgreSQL (vs SQLite).
     // Use to select SQL dialect for non-portable functions.
     bool isPostgres() const { return config_.driver == "postgresql"; }
@@ -186,11 +216,24 @@ private:
     bool flushEventBatch(std::deque<Event>& batch);
 
     std::thread batch_writer_thread_;
-    std::mutex batch_queue_mutex_;
+    // mutable so batchWriterStats() can take it via try_to_lock without
+    // affecting the const-correctness of the accessor.
+    mutable std::mutex batch_queue_mutex_;
     std::condition_variable batch_cv_;
     std::deque<Event> event_queue_;
     std::atomic<bool> batch_writer_running_{false};
     std::atomic<bool> accepting_events_{false};
+
+    // 2026-05-15 DB hot-path audit: batch writer observability counters.
+    // Producer increments enqueued_total / dropped_total under batch_queue_mutex_;
+    // batch writer thread updates flushed_total / flush_failures_total / row_failures_total.
+    // peak_queue_depth uses a CAS retry loop in enqueueEvent.
+    std::atomic<std::uint64_t> enqueued_total_{0};
+    std::atomic<std::uint64_t> dropped_total_{0};
+    std::atomic<std::uint64_t> flushed_total_{0};
+    std::atomic<std::uint64_t> flush_failures_total_{0};
+    std::atomic<std::uint64_t> row_failures_total_{0};
+    std::atomic<std::uint64_t> peak_queue_depth_{0};
 
     static constexpr size_t kBatchFlushSize = 50;
     static constexpr int kBatchFlushIntervalMs = 100;

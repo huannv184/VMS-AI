@@ -7,6 +7,7 @@
 #include "events/rule_engine.h"
 #include "events/alert_delivery.h"
 #include "events/zone_manager.h"
+#include "database/db_manager.h"
 #include "core/roi_manager.h"
 #include "middleware/auth_middleware.h"
 #include "server/vms_app.h"
@@ -391,6 +392,26 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
              // is dropping during a burst. Same RBAC scope (ALERT_READ) as the
              // rule stats it sits alongside.
              out["delivery"] = events::deliveryStats();
+             // Merge event-batch-writer counters (2026-05-15 DB hot-path
+             // audit). Same observability shape: did we drop events? Are
+             // commits failing? How big has the queue been? Lets operators
+             // attribute "missing events in dashboard" to either ingestion
+             // (queue full / not accepting) or persistence (commit fail /
+             // poisoned row).
+             const auto bw = database::DbManager::getInstance().batchWriterStats();
+             out["batch_writer"] = {
+                 {"current_queue_depth",  bw.current_queue_depth},
+                 {"max_queue_size",       bw.max_queue_size},
+                 {"batch_flush_size",     bw.batch_flush_size},
+                 {"enqueued_total",       bw.enqueued_total},
+                 {"dropped_total",        bw.dropped_total},
+                 {"flushed_total",        bw.flushed_total},
+                 {"flush_failures_total", bw.flush_failures_total},
+                 {"row_failures_total",   bw.row_failures_total},
+                 {"peak_queue_depth",     bw.peak_queue_depth},
+                 {"running",              bw.running},
+                 {"accepting",            bw.accepting}
+             };
              return ApiUtils::createResponse(out, 200, origin);
         } catch (const std::exception& e) {
              return ApiUtils::createSafeError(e, 500, origin);
