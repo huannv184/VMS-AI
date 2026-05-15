@@ -98,6 +98,77 @@ const RULE_ACTIONS = [
   { value: 'LOG', label: 'Ghi nhật ký' },
 ];
 
+// ALERT action channels — values MUST match backend AlertChannel enum strings
+// in events/rule_engine.cpp (alertChannelToString). Pre-2026-05-14 the editor
+// stored 'UI' which the backend mapped to NONE and silently dropped — see
+// memory/alert_manager_consolidation_2026_05_14.md.
+const RULE_ALERT_CHANNELS = [
+  { value: 'UI_NOTIFICATION', label: 'UI / Bảng cảnh báo' },
+  { value: 'EMAIL',           label: 'Email' },
+  { value: 'SMS',             label: 'SMS (Twilio)' },
+  { value: 'WEBHOOK',         label: 'Webhook' },
+  { value: 'MOBILE_PUSH',     label: 'Telegram' },
+  { value: 'ALARM_OUTPUT',    label: 'Còi báo / Relay' },
+];
+
+// Normalize legacy 'UI' → 'UI_NOTIFICATION' so rules saved by the pre-fix
+// editor round-trip correctly. Backend rejects 'UI' as NONE on save; this
+// lets the user edit and re-save without losing their channel list.
+const normalizeChannel = (c) => (c === 'UI' ? 'UI_NOTIFICATION' : c);
+
+// Split a free-text textarea (one entry per line OR comma-separated) into a
+// trimmed string array. Empty entries are dropped so the backend doesn't
+// see " " as a recipient.
+const splitMultiline = (s) => (s || '')
+  .split(/[\n,]/)
+  .map(x => x.trim())
+  .filter(Boolean);
+
+// Composable RuleCondition types — the editor pre-2026-05-14 only emitted
+// a single EVENT_TYPE condition; backend RuleEngine accepts 9 types. We
+// expose 5 useful-for-operator types here; OBJECT/BEHAVIOR/RULE_TRIGGERED
+// are advanced and stay hand-JSON-only for now.
+const CONDITION_TYPES = [
+  { value: 'EVENT_TYPE', label: 'Loại sự kiện' },
+  { value: 'TIME',       label: 'Khung giờ' },
+  { value: 'ZONE',       label: 'Vùng ROI' },
+  { value: 'SEVERITY',   label: 'Mức độ tối thiểu' },
+  { value: 'CONFIDENCE', label: 'Ngưỡng tin cậy' },
+];
+
+const SEVERITY_LEVELS = [
+  { value: 'LOW',      label: 'Thấp' },
+  { value: 'MEDIUM',   label: 'Trung bình' },
+  { value: 'HIGH',     label: 'Cao' },
+  { value: 'CRITICAL', label: 'Khẩn cấp' },
+];
+
+// 0=Sunday … 6=Saturday — matches backend RuleCondition.days_of_week +
+// JS `Date.getDay()` convention.
+const DAYS_OF_WEEK = [
+  { value: 0, label: 'CN' },
+  { value: 1, label: 'T2' },
+  { value: 2, label: 'T3' },
+  { value: 3, label: 'T4' },
+  { value: 4, label: 'T5' },
+  { value: 5, label: 'T6' },
+  { value: 6, label: 'T7' },
+];
+
+// Defaults per condition type — kept in one place so add-condition spawns
+// the same shape the backend expects. Field names match RuleCondition
+// JSON keys in rule_engine.cpp.
+const conditionDefaults = (type) => {
+  switch (type) {
+    case 'EVENT_TYPE': return { type, event_types: ['PERSON_DETECTED'] };
+    case 'TIME':       return { type, start_hour: 0, end_hour: 23, days_of_week: [] };
+    case 'ZONE':       return { type, zone_id: -1, zone_action: 'enter' };
+    case 'SEVERITY':   return { type, min_severity: 'MEDIUM' };
+    case 'CONFIDENCE': return { type, min_confidence: 0.5 };
+    default:           return { type };
+  }
+};
+
 const defaultRuleForm = () => ({
   name: 'Quy tắc mới',
   description: '',
@@ -105,11 +176,20 @@ const defaultRuleForm = () => ({
   logic: 'AND',
   camera_ids: [],
   conditions: [{ type: 'EVENT_TYPE', event_types: ['PERSON_DETECTED'] }],
-  actions: [{ type: 'ALERT', channels: ['UI'] }],
+  actions: [{ type: 'ALERT', channels: ['UI_NOTIFICATION'], metadata: {} }],
   anti_noise: { cooldown_sec: 60, debounce_sec: 3, confidence_threshold: 0.5, max_alerts_per_hour: 60 },
 });
 
-const RuleEditorModal = ({ rule, cameras, onSave, onClose }) => {
+// Read-side normalization: legacy rules saved before 2026-05-14 may carry
+// 'UI' channels and missing metadata. Lift them to the canonical shape so
+// the editor and the save round-trip don't drop fields.
+const normalizeAction = (a) => ({
+  ...a,
+  channels: (a.channels || []).map(normalizeChannel),
+  metadata: a.metadata || {},
+});
+
+const RuleEditorModal = ({ rule, cameras, zones = [], onSave, onClose }) => {
   const isNew = !rule.rule_id;
   const [form, setForm] = useState(() => {
     if (isNew) return defaultRuleForm();
@@ -123,8 +203,8 @@ const RuleEditorModal = ({ rule, cameras, onSave, onClose }) => {
         ? rule.conditions
         : [{ type: 'EVENT_TYPE', event_types: ['PERSON_DETECTED'] }],
       actions: rule.actions?.length
-        ? rule.actions
-        : [{ type: 'ALERT', channels: ['UI'] }],
+        ? rule.actions.map(normalizeAction)
+        : [{ type: 'ALERT', channels: ['UI_NOTIFICATION'], metadata: {} }],
       anti_noise: rule.anti_noise || { cooldown_sec: 60, debounce_sec: 3, confidence_threshold: 0.5, max_alerts_per_hour: 60 },
     };
   });
@@ -139,11 +219,62 @@ const RuleEditorModal = ({ rule, cameras, onSave, onClose }) => {
     }));
   };
 
-  const toggleEventType = (et) => {
-    const cond = form.conditions[0] || { type: 'EVENT_TYPE', event_types: [] };
-    const cur = cond.event_types || [];
-    const updated = cur.includes(et) ? cur.filter(x => x !== et) : [...cur, et];
-    setForm(f => ({ ...f, conditions: [{ ...cond, type: 'EVENT_TYPE', event_types: updated }] }));
+  // ── Multi-condition handlers ──────────────────────────────────────────
+  // Each condition is identified by its position in the array. Add/remove/
+  // patch-by-index keeps the data shape clean (no synthetic ids).
+  const patchCondition = (idx, patch) => {
+    setForm(f => ({
+      ...f,
+      conditions: f.conditions.map((c, i) => i === idx ? { ...c, ...patch } : c),
+    }));
+  };
+
+  const removeCondition = (idx) => {
+    setForm(f => ({
+      ...f,
+      conditions: f.conditions.filter((_, i) => i !== idx),
+    }));
+  };
+
+  const addCondition = (type) => {
+    setForm(f => ({
+      ...f,
+      conditions: [...f.conditions, conditionDefaults(type)],
+    }));
+  };
+
+  const changeConditionType = (idx, newType) => {
+    setForm(f => ({
+      ...f,
+      conditions: f.conditions.map((c, i) => i === idx ? conditionDefaults(newType) : c),
+    }));
+  };
+
+  // EVENT_TYPE-specific chip toggle — operates on a specific row, not the
+  // hardcoded conditions[0] anymore.
+  const toggleEventTypeOnCondition = (idx, et) => {
+    setForm(f => ({
+      ...f,
+      conditions: f.conditions.map((c, i) => {
+        if (i !== idx) return c;
+        const cur = c.event_types || [];
+        const updated = cur.includes(et) ? cur.filter(x => x !== et) : [...cur, et];
+        return { ...c, event_types: updated };
+      }),
+    }));
+  };
+
+  // Toggle one day-of-week on a TIME condition.
+  const toggleDayOnCondition = (idx, day) => {
+    setForm(f => ({
+      ...f,
+      conditions: f.conditions.map((c, i) => {
+        if (i !== idx) return c;
+        const cur = c.days_of_week || [];
+        const updated = cur.includes(day) ? cur.filter(x => x !== day) : [...cur, day];
+        return { ...c, days_of_week: updated };
+      }),
+    }));
   };
 
   const toggleAction = (act) => {
@@ -151,7 +282,11 @@ const RuleEditorModal = ({ rule, cameras, onSave, onClose }) => {
     if (has) {
       setForm(f => ({ ...f, actions: f.actions.filter(a => a.type !== act) }));
     } else {
-      setForm(f => ({ ...f, actions: [...f.actions, { type: act, channels: act === 'ALERT' ? ['UI'] : [] }] }));
+      setForm(f => ({ ...f, actions: [...f.actions, {
+        type: act,
+        channels: act === 'ALERT' ? ['UI_NOTIFICATION'] : [],
+        metadata: {},
+      }] }));
     }
   };
 
@@ -163,7 +298,37 @@ const RuleEditorModal = ({ rule, cameras, onSave, onClose }) => {
     }));
   };
 
-  const selectedEventTypes = form.conditions[0]?.event_types || [];
+  // Multi-channel + recipient editing applies to the ALERT action — that's
+  // the action.type the backend's deliverAction fans out via
+  // RuleAction.channels. WEBHOOK has its own webhook_url input above.
+  const alertAction = form.actions.find(a => a.type === 'ALERT');
+  const alertChannels = alertAction?.channels || [];
+  const alertMetadata = alertAction?.metadata || {};
+
+  const toggleAlertChannel = (channel) => {
+    setForm(f => ({
+      ...f,
+      actions: f.actions.map(a => {
+        if (a.type !== 'ALERT') return a;
+        const chans = a.channels || [];
+        return {
+          ...a,
+          channels: chans.includes(channel)
+            ? chans.filter(c => c !== channel)
+            : [...chans, channel],
+        };
+      }),
+    }));
+  };
+
+  const setAlertMetadata = (patch) => {
+    setForm(f => ({
+      ...f,
+      actions: f.actions.map(a => a.type === 'ALERT'
+        ? { ...a, metadata: { ...(a.metadata || {}), ...patch } }
+        : a),
+    }));
+  };
 
   const handleSave = async () => {
     if (!form.name.trim()) return;
@@ -221,27 +386,184 @@ const RuleEditorModal = ({ rule, cameras, onSave, onClose }) => {
             )}
           </div>
 
-          {/* Event Types */}
-          <div style={sectionStyle}>
-            <label style={labelStyle}>LOẠI SỰ KIỆN KÍ HOẠT</label>
-            <div style={{ display:'flex', flexWrap:'wrap', gap:'6px' }}>
-              {RULE_EVENT_TYPES.map(et => {
-                const sel = selectedEventTypes.includes(et.value);
-                return (
-                  <div key={et.value} onClick={() => toggleEventType(et.value)} style={sel ? chipActive : chipInactive}>
-                    {et.label}
-                  </div>
-                );
-              })}
+          {/* Conditions — multi-row composable.
+              Pre-2026-05-14 this block was hardcoded to a single EVENT_TYPE
+              row. Backend RuleEngine evaluates each entry against the
+              chosen AND/OR logic; we expose 5 useful condition types here
+              (advanced types like RULE_TRIGGERED stay JSON-only). */}
+          <div style={{ ...sectionStyle, background:'var(--bg)', border:'1px solid var(--border)', borderRadius:'6px', padding:'12px' }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'10px' }}>
+              <label style={{ ...labelStyle, marginBottom:0 }}>ĐIỀU KIỆN KÍCH HOẠT</label>
+              <div style={{ display:'flex', gap:'8px', alignItems:'center' }}>
+                <span style={{ fontSize:'10px', color:'var(--text-dim)' }}>LOGIC:</span>
+                {['AND', 'OR'].map(l => (
+                  <div key={l} onClick={() => setForm(f => ({ ...f, logic: l }))} style={form.logic === l ? chipActive : chipInactive}>{l}</div>
+                ))}
+              </div>
             </div>
-          </div>
 
-          {/* Logic */}
-          <div style={{ ...sectionStyle, display:'flex', gap:'12px', alignItems:'center' }}>
-            <label style={{ ...labelStyle, marginBottom:0 }}>LOGIC ĐIỀU KIỆN:</label>
-            {['AND', 'OR'].map(l => (
-              <div key={l} onClick={() => setForm(f => ({ ...f, logic: l }))} style={form.logic === l ? chipActive : chipInactive}>{l}</div>
+            {form.conditions.length === 0 && (
+              <div style={{ fontSize:'11px', color:'var(--warn)', padding:'8px 0' }}>
+                Chưa có điều kiện nào — quy tắc sẽ khớp MỌI sự kiện. Thêm điều kiện để giới hạn.
+              </div>
+            )}
+
+            {form.conditions.map((cond, idx) => (
+              <div key={idx} style={{ marginBottom:'10px', padding:'10px', background:'var(--bg-panel)', border:'1px solid var(--border)', borderRadius:'4px' }}>
+                <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'8px' }}>
+                  <select
+                    style={{ ...inputStyle, width:'auto', minWidth:'140px' }}
+                    value={cond.type}
+                    onChange={e => changeConditionType(idx, e.target.value)}
+                  >
+                    {CONDITION_TYPES.map(t => (
+                      <option key={t.value} value={t.value}>{t.label}</option>
+                    ))}
+                  </select>
+                  <div onClick={() => removeCondition(idx)} style={{ cursor:'pointer', color:'var(--danger)', fontSize:'12px', padding:'4px 8px' }} title="Xóa điều kiện">✕</div>
+                </div>
+
+                {/* Per-type body */}
+                {cond.type === 'EVENT_TYPE' && (
+                  <div style={{ display:'flex', flexWrap:'wrap', gap:'6px' }}>
+                    {RULE_EVENT_TYPES.map(et => {
+                      const sel = (cond.event_types || []).includes(et.value);
+                      return (
+                        <div key={et.value} onClick={() => toggleEventTypeOnCondition(idx, et.value)} style={sel ? chipActive : chipInactive}>
+                          {et.label}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {cond.type === 'TIME' && (
+                  <div>
+                    <div style={{ display:'flex', gap:'10px', marginBottom:'8px' }}>
+                      <div style={{ flex:1 }}>
+                        <label style={labelStyle}>Giờ bắt đầu (0-23)</label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={23}
+                          style={inputStyle}
+                          value={cond.start_hour ?? 0}
+                          onChange={e => patchCondition(idx, { start_hour: Math.max(0, Math.min(23, +e.target.value || 0)) })}
+                        />
+                      </div>
+                      <div style={{ flex:1 }}>
+                        <label style={labelStyle}>Giờ kết thúc (0-23)</label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={23}
+                          style={inputStyle}
+                          value={cond.end_hour ?? 23}
+                          onChange={e => patchCondition(idx, { end_hour: Math.max(0, Math.min(23, +e.target.value || 0)) })}
+                        />
+                      </div>
+                    </div>
+                    {cond.start_hour > cond.end_hour && (
+                      <div style={{ fontSize:'10px', color:'var(--accent)', marginBottom:'8px' }}>
+                        Ca đêm: từ {cond.start_hour}:00 hôm nay đến {cond.end_hour}:00 hôm sau.
+                      </div>
+                    )}
+                    <label style={labelStyle}>Ngày trong tuần (để trống = mọi ngày)</label>
+                    <div style={{ display:'flex', flexWrap:'wrap', gap:'4px' }}>
+                      {DAYS_OF_WEEK.map(d => {
+                        const sel = (cond.days_of_week || []).includes(d.value);
+                        return (
+                          <div key={d.value} onClick={() => toggleDayOnCondition(idx, d.value)} style={sel ? chipActive : chipInactive}>
+                            {d.label}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {cond.type === 'ZONE' && (
+                  <div>
+                    <div style={{ display:'flex', gap:'10px' }}>
+                      <div style={{ flex:1 }}>
+                        <label style={labelStyle}>Vùng ROI</label>
+                        <select
+                          style={inputStyle}
+                          value={cond.zone_id ?? -1}
+                          onChange={e => patchCondition(idx, { zone_id: +e.target.value })}
+                        >
+                          <option value={-1}>— Chọn vùng —</option>
+                          {zones.map(z => (
+                            <option key={z.zone_id} value={z.zone_id}>{z.name || `Vùng #${z.zone_id}`}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div style={{ flex:1 }}>
+                        <label style={labelStyle}>Hành động</label>
+                        <select
+                          style={inputStyle}
+                          value={cond.zone_action || 'enter'}
+                          onChange={e => patchCondition(idx, { zone_action: e.target.value })}
+                        >
+                          <option value="enter">Vào vùng</option>
+                          <option value="exit">Rời vùng</option>
+                          <option value="stay">Ở trong vùng</option>
+                        </select>
+                      </div>
+                    </div>
+                    {zones.length === 0 && (
+                      <div style={{ fontSize:'10px', color:'var(--warn)', marginTop:'4px' }}>
+                        Chưa có vùng ROI nào — tạo vùng ở tab "Vùng ROI" trước.
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {cond.type === 'SEVERITY' && (
+                  <div>
+                    <label style={labelStyle}>Mức độ tối thiểu</label>
+                    <select
+                      style={inputStyle}
+                      value={cond.min_severity || 'LOW'}
+                      onChange={e => patchCondition(idx, { min_severity: e.target.value })}
+                    >
+                      {SEVERITY_LEVELS.map(s => (
+                        <option key={s.value} value={s.value}>{s.label}</option>
+                      ))}
+                    </select>
+                    <div style={{ fontSize:'10px', color:'var(--text-dim)', marginTop:'4px' }}>
+                      Bỏ qua sự kiện có mức độ thấp hơn lựa chọn này.
+                    </div>
+                  </div>
+                )}
+
+                {cond.type === 'CONFIDENCE' && (
+                  <div>
+                    <label style={labelStyle}>Ngưỡng tin cậy AI (0.0 - 1.0)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      style={inputStyle}
+                      value={cond.min_confidence ?? 0.5}
+                      onChange={e => patchCondition(idx, { min_confidence: Math.max(0, Math.min(1, +e.target.value || 0)) })}
+                    />
+                    <div style={{ fontSize:'10px', color:'var(--text-dim)', marginTop:'4px' }}>
+                      Lưu ý: anti-noise.confidence_threshold ở dưới chạy độc lập — điều kiện này lọc trước khi tính anti-noise.
+                    </div>
+                  </div>
+                )}
+              </div>
             ))}
+
+            <div style={{ display:'flex', gap:'6px', flexWrap:'wrap', marginTop:'6px' }}>
+              {CONDITION_TYPES.map(t => (
+                <div key={t.value} onClick={() => addCondition(t.value)} style={{ ...chipInactive, borderStyle:'dashed' }}>
+                  + {t.label}
+                </div>
+              ))}
+            </div>
           </div>
 
           {/* Actions */}
@@ -259,6 +581,93 @@ const RuleEditorModal = ({ rule, cameras, onSave, onClose }) => {
             </div>
             {webhookAction && (
               <input style={{ ...inputStyle, marginTop:'6px' }} placeholder="Webhook URL: https://..." value={webhookAction.webhook_url || ''} onChange={e => setWebhookUrl(e.target.value)} />
+            )}
+
+            {/* ALERT channel multi-select + per-channel recipient fields.
+                Backend (vms::events::deliverAction) dispatches each selected
+                channel against action.metadata recipients. Pre-2026-05-14
+                this UI didn't exist → operator-created rules never sent
+                email/SMS/Telegram even when EMAIL channel was selected by
+                hand-edited JSON. */}
+            {alertAction && (
+              <div style={{ marginTop:'10px', padding:'10px', background:'var(--bg)', border:'1px solid var(--border)', borderRadius:'4px' }}>
+                <div style={{ ...labelStyle, marginBottom:'6px' }}>KÊNH GỬI CẢNH BÁO</div>
+                <div style={{ display:'flex', flexWrap:'wrap', gap:'6px', marginBottom:'10px' }}>
+                  {RULE_ALERT_CHANNELS.map(ch => {
+                    const sel = alertChannels.includes(ch.value);
+                    return (
+                      <div key={ch.value} onClick={() => toggleAlertChannel(ch.value)} style={sel ? chipActive : chipInactive}>
+                        {ch.label}
+                      </div>
+                    );
+                  })}
+                </div>
+                {alertChannels.length === 0 && (
+                  <div style={{ fontSize:'10px', color:'var(--warn)', marginBottom:'8px' }}>
+                    Chưa chọn kênh — cảnh báo sẽ không được gửi (chỉ được ghi vào DB).
+                  </div>
+                )}
+
+                {alertChannels.includes('EMAIL') && (
+                  <div style={{ marginBottom:'8px' }}>
+                    <label style={labelStyle}>Email nhận (mỗi dòng một địa chỉ)</label>
+                    <textarea
+                      style={{ ...inputStyle, minHeight:'52px', resize:'vertical', fontFamily:'inherit' }}
+                      value={(alertMetadata.email_addresses || []).join('\n')}
+                      onChange={e => setAlertMetadata({ email_addresses: splitMultiline(e.target.value) })}
+                      placeholder={'ops@vms.com\nsecurity@vms.com'}
+                    />
+                  </div>
+                )}
+
+                {alertChannels.includes('SMS') && (
+                  <div style={{ marginBottom:'8px' }}>
+                    <label style={labelStyle}>Số điện thoại (mỗi dòng một số, định dạng +84…)</label>
+                    <textarea
+                      style={{ ...inputStyle, minHeight:'52px', resize:'vertical', fontFamily:'inherit' }}
+                      value={(alertMetadata.phone_numbers || []).join('\n')}
+                      onChange={e => setAlertMetadata({ phone_numbers: splitMultiline(e.target.value) })}
+                      placeholder={'+84901234567\n+84987654321'}
+                    />
+                    <div style={{ fontSize:'10px', color:'var(--text-dim)', marginTop:'2px' }}>
+                      Yêu cầu cấu hình Twilio ở Cài đặt hệ thống.
+                    </div>
+                  </div>
+                )}
+
+                {alertChannels.includes('WEBHOOK') && (
+                  <div style={{ marginBottom:'8px' }}>
+                    <label style={labelStyle}>Webhook URL (tùy chọn — bỏ trống để dùng URL của action WEBHOOK)</label>
+                    <input
+                      style={inputStyle}
+                      value={alertMetadata.webhook_url || ''}
+                      onChange={e => setAlertMetadata({ webhook_url: e.target.value })}
+                      placeholder="https://hooks.example.com/..."
+                    />
+                  </div>
+                )}
+
+                {alertChannels.includes('MOBILE_PUSH') && (
+                  <div style={{ marginBottom:'8px' }}>
+                    <label style={labelStyle}>Telegram chat_id (tùy chọn — bỏ trống để dùng chat_id mặc định)</label>
+                    <input
+                      style={inputStyle}
+                      value={alertMetadata.telegram_chat_id || ''}
+                      onChange={e => setAlertMetadata({ telegram_chat_id: e.target.value })}
+                      placeholder="-100123456789"
+                    />
+                    <div style={{ fontSize:'10px', color:'var(--text-dim)', marginTop:'2px' }}>
+                      Yêu cầu cấu hình telegram_bot_token + telegram_chat_id mặc định ở Cài đặt hệ thống.
+                    </div>
+                  </div>
+                )}
+
+                {alertChannels.includes('ALARM_OUTPUT') && (
+                  <div style={{ fontSize:'10px', color:'var(--text-dim)' }}>
+                    Đầu ra báo động dùng URL relay cấu hình toàn cục (<code>alarm_output_url</code>).
+                  </div>
+                )}
+              </div>
             )}
           </div>
 
@@ -1603,6 +2012,7 @@ const SettingsView = () => {
         <RuleEditorModal
           rule={editingRule}
           cameras={cameras}
+          zones={zones}
           onClose={() => setEditingRule(null)}
           onSave={async (ruleData) => {
             let res;
