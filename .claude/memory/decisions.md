@@ -1,5 +1,25 @@
 # Architectural Decisions — AI Camera System
 
+## 2026-05-15 WS subscribe RBAC — per-socket cache populated at AUTH; admin + camera-0 bypass
+
+### Decision: Cache the allowed-camera set on the socket at AUTH time, not on every subscribe
+- **Choice**: After successful WS AUTH (ticket validated, JTI not replayed), for non-admin users, call `CameraRepository::getFilteredCameras(user.id)` once and cache the resulting camera IDs in a file-scope `std::unordered_map<QWebSocket*, std::unordered_set<int>> g_allowed_cameras` guarded by a mutex. Subscribe-path lookup is `O(1)` against this map; no DB hit per subscribe.
+- **Rationale**: AUTH is once-per-WS-connection (and the connection lives minutes to hours), but a single client may subscribe + unsubscribe many times during a session (camera-switcher UI, videowall mosaic). Doing the DB query at subscribe time would multiply DB load by the subscribe rate; caching at AUTH time amortises it across the whole connection. The cache is per-socket so different concurrent users with different scopes don't share state.
+- **Trade-off**: cache is stale if admin updates the user's `allowed_cameras` while the WS is open. The user keeps their pre-update scope until they reconnect (logout/login, or browser tab close + reopen). Acceptable for a Phase 1 RBAC pass — the alternative (cache invalidation pub-sub from PermissionRepository to live sockets) is a much bigger surface change. Logged as a follow-up: "permission change should bump a notify signal that sockets re-load their cache".
+- **Alternative considered**: lookup on every subscribe with a hot-path DB query. Rejected — even at 1 query per subscribe per session, the cumulative DB load adds noise to the batch writer's working set, and `getFilteredCameras` already does 1 SELECT cameras + 1 SELECT permissions internally.
+- **Alternative considered**: encode the allowed_cameras list directly in the WS ticket JWT claim. Rejected because (a) the ticket is 30s TTL and operator might revoke camera access in that window, (b) the list could be 50+ cameras = large JWT, (c) the JWT signing key would need to be rotatable independent of the camera list.
+
+### Decision: Admin (role_id == 1) and camera_id == 0 bypass the cache
+- **Choice**: admins skip the cache entirely via a `vms_is_admin` Qt property set at AUTH success. Camera 0 (global broadcast channel) is allowed for any authed user.
+- **Rationale**: admins by definition have all-cameras access (consistent with `CameraRepository::getFilteredCameras` line 252-255 admin-bypass). Camera 0 is the global event channel — config changes, audit log notifications, system alerts — that's not camera-specific data; viewers legitimately need it.
+- **Trade-off (documented for follow-up)**: the per-camera EventManager dispatch ALSO broadcasts to camera 0. So a viewer subscribed to camera 0 still receives every event from every camera. The fix is broadcast-side filtering: when fanning a non-zero camera_id event out to camera 0 subscribers, check each recipient's allowed-set. Not in this pass because it touches the broadcast loop's complexity; logged as `BUG-WS-GLOBAL-FANOUT-01`.
+- **Why not deny camera 0 for non-admins**: would break the "viewer subscribes to camera 0 for system notifications" pattern the frontend relies on. Better to fix the leak at broadcast time than to deny the legitimate use case.
+
+### Decision: Side-map keyed by raw `QWebSocket*` instead of Qt property
+- **Choice**: `std::unordered_map<QWebSocket*, std::unordered_set<int>>` at file-scope (anonymous namespace), guarded by `std::mutex`.
+- **Rationale**: Qt's property system stores `QVariant`, which would require registering `std::unordered_set<int>` as a meta-type or wrapping in `QSet<int>` — extra ceremony for no benefit. A side-map is explicit, easy to reason about, and the mutex makes the threading model obvious (Qt main + socket-disconnect slot can both touch it).
+- **Trade-off**: another singleton-ish piece of state. Mitigated by: scoped within the `streaming` namespace, never exposed publicly, lifetime gated by socketDisconnected. The raw `QWebSocket*` key is stable because Qt::deleteLater fires AFTER the disconnect slot returns, so the erase always runs before the socket is destroyed.
+
 ## 2026-05-15 WebSocket auth/session — pre-auth timeout now, RBAC + proxy + caps deferred
 
 ### Decision: 10s pre-auth socket timeout (close-after-no-AUTH)

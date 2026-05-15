@@ -3,6 +3,7 @@
 #include "utils/logger.h"
 #include "utils/config.h"
 #include "utils/jwt_utils.h"
+#include "database/camera_repository.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <vector>
@@ -21,6 +22,27 @@
 
 namespace vms {
 namespace streaming {
+
+namespace {
+
+// 2026-05-15 WS RBAC enforcement: per-socket allowed-camera cache, populated
+// at AUTH success. Admins (role_id == 1) and auth-disabled mode bypass this
+// map entirely via the vms_is_admin Qt property. Non-admins:
+//   - Empty allowed set → only camera_id=0 (global) subscribe permitted.
+//   - Non-empty allowed set → subscribe to camera_id in the set OR =0 only.
+// Camera 0 (global) is intentionally allowed for any authed user — events
+// broadcast to camera 0 still contain camera_id metadata; subscriber-side
+// filtering on that field is a separate pass (BUG-WS-GLOBAL-FANOUT-01,
+// see decisions.md). This pass closes the direct-subscribe-and-stream
+// data leak; the indirect global-event leak remains documented.
+//
+// Cleanup: socketDisconnected removes the entry. The map is keyed by raw
+// QWebSocket* — the pointer is stable for the socket's lifetime, never
+// reused while alive (Qt::deleteLater fires after we erase).
+std::unordered_map<QWebSocket*, std::unordered_set<int>> g_allowed_cameras;
+std::mutex g_allowed_cameras_mutex;
+
+} // namespace
 
 // Protocol Constants
 constexpr uint32_t MAGIC_BYTES = 0x564D5331; // 'VMS1'
@@ -180,6 +202,15 @@ void CameraStreamManager::socketDisconnected() {
         LOG_THROTTLED_INFO(5000, "WS client disconnected: {}", socket->peerAddress().toString().toStdString());
 
         removeClient(socket);
+
+        // 2026-05-15 WS RBAC cleanup: erase the per-socket allowed-camera
+        // entry. deleteLater fires AFTER this slot returns, so the raw
+        // pointer is still valid here for map lookup.
+        {
+            std::lock_guard<std::mutex> alock(g_allowed_cameras_mutex);
+            g_allowed_cameras.erase(socket.data());
+        }
+
         socket->deleteLater();
     }
 }
@@ -208,7 +239,11 @@ void CameraStreamManager::processTextMessage(const QString& message) {
         // AUTH handshake: client should send {type:"AUTH", token:"..."} once after onopen
         if (j.contains("type") && j["type"].is_string() && j["type"] == "AUTH") {
             if (!auth_enabled) {
+                // Auth-disabled mode treats every socket as admin so subscribe
+                // RBAC below short-circuits. Matches the existing "no auth means
+                // no filter" semantics elsewhere in the codebase.
                 socket->setProperty("vms_authed", true);
+                socket->setProperty("vms_is_admin", true);
                 sendText(socket, QStringLiteral("{\"type\":\"AUTH_OK\"}"));
                 return;
             }
@@ -220,7 +255,7 @@ void CameraStreamManager::processTextMessage(const QString& message) {
             vms::core::User user;
             std::string jti;
             std::string client_ip = socket->peerAddress().toString().toStdString();
-            
+
             if (vms::utils::decodeWsTicketJwt(j["token"].get<std::string>(), user, jti, client_ip)) {
                 // One-time-use ticket enforcement with bounded TTL eviction.
                 // deque front = oldest; entries older than 30s are evicted on each auth,
@@ -248,6 +283,33 @@ void CameraStreamManager::processTextMessage(const QString& message) {
                 ticket_queue.push_back({jti, now + kTicketTTL});
 
                 socket->setProperty("vms_authed", true);
+                // 2026-05-15 BUG-WS-CAMERA-NO-RBAC-01: populate the per-socket
+                // allowed-camera set so processTextMessage's subscribe branch
+                // can reject out-of-scope camera_ids without an extra DB hit.
+                // Admins (role_id == 1) bypass the map entirely; we set the
+                // property so subscribe doesn't even consult g_allowed_cameras.
+                const bool is_admin = (user.role_id == 1);
+                socket->setProperty("vms_is_admin", is_admin);
+                socket->setProperty("vms_user_id", user.id);
+                if (!is_admin) {
+                    // getFilteredCameras already merges allowed_camera_ids +
+                    // cameras-in-allowed_sites, and respects "both empty = no
+                    // cameras" semantics for non-admins. One DB query per
+                    // AUTH (not per subscribe), so this is not a hot path.
+                    std::unordered_set<int> allowed_ids;
+                    try {
+                        vms::database::CameraRepository repo;
+                        auto cams = repo.getFilteredCameras(user.id);
+                        for (const auto& cam : cams) allowed_ids.insert(cam.id);
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("WS AUTH: failed to load allowed cameras for user {}: {} — denying all subscribe",
+                                  user.id, e.what());
+                        // Fall through with an empty set; subscribe will reject.
+                    }
+                    std::lock_guard<std::mutex> alock(g_allowed_cameras_mutex);
+                    g_allowed_cameras[socket.data()] = std::move(allowed_ids);
+                }
+
                 sendText(socket, QStringLiteral("{\"type\":\"AUTH_OK\"}"));
             } else {
                 sendText(socket, QStringLiteral("{\"type\":\"AUTH_ERR\",\"error\":\"invalid, expired, or stolen ticket\"}"));
@@ -266,9 +328,44 @@ void CameraStreamManager::processTextMessage(const QString& message) {
         // Stream subscription (backward compatibility)
         if (j.contains("camera_id")) {
             int cam_id = j["camera_id"].get<int>();
+
+            // 2026-05-15 BUG-WS-CAMERA-NO-RBAC-01: enforce allowed_cameras.
+            // Admins (vms_is_admin=true) and the global broadcast channel
+            // (cam_id == 0) bypass. For non-admin specific-camera subscribe,
+            // consult the per-socket cache populated at AUTH success.
+            //
+            // Camera 0 is allowed for any authed user because events
+            // broadcast to camera 0 sometimes carry system-level state
+            // (config changes, audit log entries) the operator needs.
+            // Per-event camera_id filtering on the camera-0 fan-out is
+            // a separate pass (documented as BUG-WS-GLOBAL-FANOUT-01).
+            const bool is_admin = socket->property("vms_is_admin").toBool();
+            if (!is_admin && cam_id != 0) {
+                bool allowed = false;
+                {
+                    std::lock_guard<std::mutex> alock(g_allowed_cameras_mutex);
+                    auto it = g_allowed_cameras.find(socket.data());
+                    if (it != g_allowed_cameras.end()) {
+                        allowed = (it->second.count(cam_id) > 0);
+                    }
+                }
+                if (!allowed) {
+                    LOG_THROTTLED_WARN(5000,
+                        "WS subscribe denied for user_id={} camera_id={} (not in allowed_cameras)",
+                        socket->property("vms_user_id").toInt(), cam_id);
+                    nlohmann::json deny = {
+                        {"type", "subscribe_denied"},
+                        {"camera_id", cam_id},
+                        {"reason", "camera_not_in_user_scope"}
+                    };
+                    sendText(socket, QString::fromStdString(deny.dump()));
+                    return;
+                }
+            }
+
             removeClient(socket); // Unsubscribe from previous
             addClient(cam_id, socket);
-            
+
             // Send ack
             nlohmann::json ack = {
                 {"type", "subscribed"},

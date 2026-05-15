@@ -1,5 +1,21 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-15 BUG-WS-CAMERA-NO-RBAC-01 closed — WS subscribe now enforces allowed_cameras
+
+- **Files**: `cpp-backend/src/streaming/camera_stream_manager.cpp` (+`<database/camera_repository.h>` include, +file-scope per-socket allowed_cameras map + mutex, populate at AUTH success via `CameraRepository::getFilteredCameras`, check at subscribe, cleanup at socketDisconnected).
+- **Bug**: WS subscribe accepted any `camera_id` from any authed client and called `addClient(cam_id, socket)`. The `permissions` table HAS `allowed_cameras` column and `PermissionRepository::getPermissions` returns it; `CameraRepository::getFilteredCameras(userId)` does the admin-bypass + camera+site merge. But the WS layer had ZERO calls into either. A logged-in viewer-role user subscribed via WS to any camera_id and received its frame stream (raw JPEG / H.264 NALs / fmp4 fragments / AI events / rule-fire alerts). Real PII / authorisation leak in multi-tenant deployments where operators had configured per-user camera scopes.
+- **Detection**: documented HIGH in the 2026-05-15 WS audit memo (`BUG-WS-CAMERA-NO-RBAC-01`), then fixed in this commit as the Tier 1 priority item per the project-wide review.
+- **Fix**:
+  1. Per-socket allowed-camera cache in `camera_stream_manager.cpp` namespace scope: `std::unordered_map<QWebSocket*, std::unordered_set<int>>` + `std::mutex`. Keyed by raw `QWebSocket*` — pointer is stable for the socket's lifetime (Qt::deleteLater fires after socketDisconnected returns, so the pointer is valid for the map erase).
+  2. At AUTH success: if `user.role_id == 1` (admin) → set `vms_is_admin=true` Qt property, skip the map. Else: call `CameraRepository::getFilteredCameras(user.id)` (admin-bypass + allowed_cameras + allowed_sites merge already implemented there for HTTP `/api/cameras` filtering), extract camera IDs into the set, store under the mutex. One DB query per AUTH, NOT per subscribe.
+  3. At subscribe: `vms_is_admin=true` OR `camera_id == 0` (global) bypass. Else look up the set, reject if camera_id ∉ set with a structured `{type:"subscribe_denied", reason:"camera_not_in_user_scope"}` message + throttled WARN log carrying user_id and camera_id for operator visibility.
+  4. Auth-disabled mode (`config.auth.enabled=false`) treats the socket as admin so subscribe RBAC short-circuits — matches existing "no auth means no filter" semantics elsewhere in the codebase.
+  5. At socketDisconnected: erase the map entry before `deleteLater`.
+- **Concurrency notes**: the map mutex is held only briefly (one insert/erase/lookup). AUTH path does the DB query OUTSIDE the mutex (one DB hit per WS connection — once-per-session, not hot). Subscribe path's lookup is `O(1)` average via unordered_set. Operator visibility WARN is throttled at 5s to prevent log floods from a probing client.
+- **What's NOT closed in this pass** (documented as BUG-WS-GLOBAL-FANOUT-01):
+  - Camera 0 (global) is allowed for any authed user. The `EventManager::createEvent` path broadcasts every event to both `broadcastEvent(camera_id, …)` AND `broadcastEvent(0, …)`. A viewer subscribed to camera 0 still receives events whose camera_id is outside their scope. The fix is broadcast-side filtering: when fanning a non-zero camera_id event out to camera-0 subscribers, check each recipient's allowed-set and skip if the event's camera_id isn't there. That touches `broadcastEvent` / `broadcastH264Frame` / `broadcastFmp4Fragment` / `broadcastRawFrame` and needs the same map lookup. Out of scope here because it changes the broadcast loop's complexity; can land as a follow-up once we confirm operators do use the global channel.
+- **Detection lesson**: when a DB schema column exists with a clear policy intent (`allowed_cameras`), grep for its consumers BEFORE assuming the policy is enforced. Schema is documentation of intent, not evidence of enforcement. Pair this with the 2026-05-14 "facade with zero callers" pattern — any DB column with a single producer (admin UI POST) and zero readers in enforcement code is a latent leak.
+
 ## 2026-05-15 BUG-WS-PREAUTH-NOTIMEOUT-01 + WS-CAMERA-NO-RBAC-01 — WebSocket auth/session audit
 
 - **Files**: `cpp-backend/src/streaming/camera_stream_manager.cpp` (+`<QTimer>` include, 10s pre-auth timeout in `onNewConnection`).
