@@ -127,6 +127,26 @@ public:
         int max_wait_ms = 5;
     };
     
+    // 2026-05-15 Tier 1 RBAC sweep: trusted proxies for X-Forwarded-For.
+    //
+    // Pre-fix `req.get_header_value("X-Forwarded-For")` was honoured
+    // unconditionally → attacker with direct backend access could spoof
+    // client IP for /api/login rate-limiter bypass and /api/ws/ticket
+    // IP-binding poisoning. With `trusted_proxies` configured, XFF is
+    // honoured ONLY when the immediate peer (req.remote_ip_address) is in
+    // the list — i.e. the request came through a trusted reverse proxy.
+    //
+    // Default empty list → XFF always ignored, peer IP always wins. This
+    // is the safe default for deployments WITHOUT a reverse proxy. When
+    // operators put nginx/HAProxy/caddy in front, they list its IPs here
+    // (e.g. ["127.0.0.1", "::1"] for sidecar; "10.0.0.5" for separate-host).
+    //
+    // CIDR not yet supported — operators list each proxy IP explicitly.
+    // "loopback" is a convenience alias expanded to 127.0.0.1 + ::1.
+    struct SecurityConfig {
+        std::vector<std::string> trusted_proxies;
+    };
+
     // Logging configuration
     struct LoggingConfig {
         std::string level = "info";
@@ -201,6 +221,11 @@ public:
      * @brief Get storage configuration
      */
     const StorageConfig& getStorageConfig() const { return storage_; }
+
+    /**
+     * @brief Get security configuration (trusted proxies, etc.)
+     */
+    const SecurityConfig& getSecurityConfig() const { return security_; }
     
     /**
      * @brief Print configuration to console
@@ -229,6 +254,7 @@ private:
     BatchInferenceConfig batch_inference_;
     LoggingConfig logging_;
     StorageConfig storage_;
+    SecurityConfig security_;
     
     // YAML root node
     YAML::Node config_;

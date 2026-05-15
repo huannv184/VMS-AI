@@ -155,11 +155,12 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createErrorResponse("Password too long", 400, origin);
             }
 
-            // H4: Rate limiting — per-IP (5 failures/60s) and per-username (10 failures/300s)
-            const std::string client_ip = req.get_header_value("X-Forwarded-For").empty()
-                ? req.remote_ip_address
-                : req.get_header_value("X-Forwarded-For").substr(
-                      0, req.get_header_value("X-Forwarded-For").find(','));
+            // H4: Rate limiting — per-IP (5 failures/60s) and per-username (10 failures/300s).
+            // 2026-05-15 Tier 1: client_ip now goes through ApiUtils::resolveClientIp
+            // which honours X-Forwarded-For ONLY when the immediate peer is in
+            // `config.security.trusted_proxies`. Pre-fix any direct-to-backend caller
+            // could spoof their IP via XFF and bypass per-IP login throttling.
+            const std::string client_ip = ApiUtils::resolveClientIp(req);
             if (auto msg = vms::utils::RateLimiter::getInstance().checkLogin(client_ip, username); !msg.empty()) {
                 return ApiUtils::createErrorResponse(msg, 429, origin);
             }
@@ -321,10 +322,11 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
             auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
             if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
             
-            std::string client_ip = req.get_header_value("X-Forwarded-For").empty()
-                ? req.remote_ip_address
-                : req.get_header_value("X-Forwarded-For").substr(
-                      0, req.get_header_value("X-Forwarded-For").find(','));
+            // 2026-05-15 Tier 1: same hardening — XFF honoured only if peer is
+            // listed in `config.security.trusted_proxies`. Pre-fix an attacker
+            // with direct backend access could mint tickets bound to arbitrary
+            // IPs by setting the header.
+            const std::string client_ip = ApiUtils::resolveClientIp(req);
 
             // Generate a 30-second single-use stateless JWT ticket bound to IP
             std::string ticket = vms::utils::createWsTicketJwt(*ctx.user, client_ip);

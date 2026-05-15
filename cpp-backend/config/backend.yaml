@@ -52,6 +52,29 @@ cors:
   credentials: true
 
 # ============================================================================
+# SECURITY CONFIGURATION
+# ============================================================================
+# trusted_proxies — list of IPs (one per reverse proxy in front of the backend)
+#   whose X-Forwarded-For header is honoured for resolving client IP.
+#   Used by:
+#     - /api/login rate limiter (per-IP login throttle)
+#     - /api/ws/ticket IP-binding claim
+#   Empty list (default) = XFF always ignored, peer IP wins. This is the
+#   safe default for deployments WITHOUT a reverse proxy. When you put
+#   nginx / HAProxy / caddy / Cloudflare-Tunnel / IIS in front, list its
+#   IPs here. "loopback" is a convenience alias = [127.0.0.1, ::1].
+# CIDR not yet supported — list each proxy IP explicitly.
+security:
+  trusted_proxies: []
+  # Example (sidecar reverse proxy on same host):
+  # trusted_proxies:
+  #   - "loopback"
+  # Example (separate-host proxy):
+  # trusted_proxies:
+  #   - "10.0.0.5"
+  #   - "10.0.0.6"
+
+# ============================================================================
 # WEBSOCKET CONFIGURATION
 # ============================================================================
 websocket:

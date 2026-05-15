@@ -148,6 +148,48 @@ public:
         };
     }
 
+    // ── Client IP resolution honouring trusted_proxies ───────────────
+    //
+    // 2026-05-15 Tier 1: returns the request's effective client IP.
+    //
+    //   - If `req.remote_ip_address` (direct peer) is listed in
+    //     `config.security.trusted_proxies`, the leftmost entry of
+    //     `X-Forwarded-For` is returned (trimmed; first IP before any
+    //     comma). This is the real client IP delivered by the proxy.
+    //   - Otherwise, returns the peer IP and ignores XFF entirely.
+    //
+    // Pre-fix the codebase honoured XFF unconditionally, so an attacker
+    // with direct backend access could spoof their IP by setting the
+    // header — bypassing the /api/login rate limiter and poisoning the
+    // /api/ws/ticket IP-binding claim. With `trusted_proxies` empty
+    // (default), XFF is always ignored and the peer IP wins.
+    //
+    // Use this helper anywhere you'd otherwise read XFF or
+    // `req.remote_ip_address` to identify the client.
+    static std::string resolveClientIp(const crow::request& req) {
+        const std::string peer = req.remote_ip_address;
+        const auto& trusted = vms::Config::getInstance().getSecurityConfig().trusted_proxies;
+        if (trusted.empty()) return peer;
+
+        bool peer_is_trusted = false;
+        for (const auto& t : trusted) {
+            if (t == peer) { peer_is_trusted = true; break; }
+        }
+        if (!peer_is_trusted) return peer;
+
+        // Trust XFF from this peer. Take leftmost entry (original client).
+        std::string xff = req.get_header_value("X-Forwarded-For");
+        if (xff.empty()) return peer;
+
+        auto comma = xff.find(',');
+        std::string client = (comma == std::string::npos) ? xff : xff.substr(0, comma);
+        // Trim surrounding whitespace (RFC 7239 §5.2 / RFC 2616 §4.2).
+        auto lstart = client.find_first_not_of(" \t");
+        auto lend   = client.find_last_not_of(" \t");
+        if (lstart == std::string::npos) return peer;
+        return client.substr(lstart, lend - lstart + 1);
+    }
+
     // ── CORS ──────────────────────────────────────────────────────
     static std::string resolveCorsOrigin(const crow::request& req) {
         std::string origin = req.get_header_value("Origin");

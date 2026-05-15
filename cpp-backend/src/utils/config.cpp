@@ -258,6 +258,26 @@ bool Config::loadFromFile(const std::string& filepath) {
             batch_inference_.max_wait_ms = bi["max_wait_ms"].as<int>(batch_inference_.max_wait_ms);
         }
 
+        // Parse security configuration (2026-05-15 Tier 1: trusted_proxies).
+        // Empty list = XFF always ignored (safe default). Expand "loopback"
+        // alias to both IPv4 + IPv6 loopback so operators on Windows sidecar
+        // proxies don't have to remember "::1".
+        if (config_["security"]) {
+            auto sec = config_["security"];
+            if (sec["trusted_proxies"]) {
+                security_.trusted_proxies.clear();
+                for (const auto& p : sec["trusted_proxies"]) {
+                    std::string ip = p.as<std::string>();
+                    if (ip == "loopback") {
+                        security_.trusted_proxies.push_back("127.0.0.1");
+                        security_.trusted_proxies.push_back("::1");
+                    } else if (!ip.empty()) {
+                        security_.trusted_proxies.push_back(std::move(ip));
+                    }
+                }
+            }
+        }
+
         // Parse logging configuration
         if (config_["logging"]) {
             auto log = config_["logging"];

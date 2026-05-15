@@ -1,5 +1,31 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-15 BUG-WS-PROXY-IPBIND-BYPASS-01 closed — trusted_proxies config gate XFF on HTTP
+
+- **Files**: `cpp-backend/include/utils/config.h` (+`SecurityConfig` struct + getter + private field), `cpp-backend/src/utils/config.cpp` (parse `security.trusted_proxies` block, "loopback" alias expansion), `cpp-backend/include/utils/api_utils.h` (+`ApiUtils::resolveClientIp(const crow::request&)` static), `cpp-backend/src/api/user_controller.cpp` (replace 2 inline XFF-or-remote-ip duplicates with `ApiUtils::resolveClientIp`), `cpp-backend/config/backend.yaml` (+`security:` section with documented example).
+- **Bug**: two HTTP routes (`/api/login` rate-limiter check and `/api/ws/ticket` JWT issuance) honoured `X-Forwarded-For` unconditionally:
+  ```cpp
+  const std::string client_ip = req.get_header_value("X-Forwarded-For").empty()
+      ? req.remote_ip_address
+      : req.get_header_value("X-Forwarded-For").substr(
+            0, req.get_header_value("X-Forwarded-For").find(','));
+  ```
+  An attacker with direct network access to the backend port (i.e. bypassing any reverse proxy) could set `X-Forwarded-For: <anything>` and:
+  - On `/api/login`: spoof IP per request → per-IP login rate limiter (5 failures/60s) bypassable by rotating spoofed IPs.
+  - On `/api/ws/ticket`: poison the IP-binding claim on the issued ticket. Combined with `decodeWsTicketJwt`'s localhost-bypass (skips IP check if WS client_ip == 127.0.0.1 / ::1), an attacker could (a) request a ticket with `X-Forwarded-For: 1.2.3.4`, then (b) connect WS from localhost (or via a sidecar reverse proxy that masks the source as localhost), with the IP claim ignored.
+- **Detection**: documented as `BUG-WS-PROXY-IPBIND-BYPASS-01` in the 2026-05-15 WS auth audit memo; called out by the project review as a Tier 1 priority. Tier 1 was BUG-WS-CAMERA-NO-RBAC-01 (closed earlier in this session) followed by this.
+- **Fix**: introduce `config.security.trusted_proxies` (vector<string>). New helper `ApiUtils::resolveClientIp(const crow::request&)`:
+  1. Read `req.remote_ip_address` (the direct peer — the backend's view of who connected to the socket).
+  2. If empty trusted_proxies list (default) → return peer IP, IGNORE XFF entirely. This is the safe-by-default behaviour for deployments without a reverse proxy.
+  3. If peer IP exact-matches a trusted_proxies entry → take leftmost comma-separated entry of XFF, trim whitespace, return that. This is the original client behind the trusted proxy.
+  4. Else (peer IP is not in the trusted list, but XFF is present) → still return peer IP. XFF is operator-supplied and only trusted from declared proxies.
+
+  Convenience: `"loopback"` in trusted_proxies expands to `127.0.0.1` + `::1` so operators on Windows don't have to remember the v6 form.
+- **What's NOT closed in this pass** (deferred follow-ups):
+  - **BUG-WS-HANDSHAKE-XFF-01 (MED)**: the QWebSocketServer side reads `socket->peerAddress()` directly — when WS goes through a reverse proxy, the peer is localhost and the original client IP is in the upgrade headers. The IP-binding check at `decodeWsTicketJwt` still loses the real client IP context on the WS handshake when behind a proxy. Fixing this requires reading XFF from `QWebSocket`'s upgrade headers (if Qt exposes them — verify against Qt 6.x API) and passing it through. The HTTP ticket-issuance now binds to a more-trustworthy IP, but the WS-side check still applies the localhost-bypass when peer is literal localhost.
+  - **CIDR support**: current matcher is exact-string equality. Listing `10.0.0.0/8` doesn't work — operators must enumerate proxy IPs. Acceptable: most deployments have 1-3 proxies.
+- **Detection lesson**: anywhere code reads `X-Forwarded-For` (or any client-controllable header) and trusts it without an authentication step on the immediate peer, treat that as a trust-boundary violation. Same shape as the 2026-05-14 "facade with zero callers" pattern but inverted — single client-supplied input with no gate. Grep for every `get_header_value("X-Forwarded-For")` AND every `req.remote_ip_address` use; the former needs a trust gate, the latter is fine to use as-is for "log who hit me".
+
 ## 2026-05-15 BUG-WS-CAMERA-NO-RBAC-01 closed — WS subscribe now enforces allowed_cameras
 
 - **Files**: `cpp-backend/src/streaming/camera_stream_manager.cpp` (+`<database/camera_repository.h>` include, +file-scope per-socket allowed_cameras map + mutex, populate at AUTH success via `CameraRepository::getFilteredCameras`, check at subscribe, cleanup at socketDisconnected).
