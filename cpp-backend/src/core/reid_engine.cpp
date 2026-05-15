@@ -4,9 +4,17 @@
 // ==============================================================
 
 #include "core/reid_engine.h"
+#include "core/runtime_state.h"
+#include "database/db_manager.h"
 #include "utils/logger.h"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QVariant>
+#include <QByteArray>
+#include <QString>
+#include <chrono>
 #include <filesystem>
 #include <algorithm>
 #include <cmath>
@@ -127,11 +135,250 @@ bool ReIDEngine::init(const std::string& model_path) {
     
     // Create thumbnails directory
     std::filesystem::create_directories("storage/reid_thumbnails");
-    
+
     initialized_ = true;
-    LOG_INFO("ReIDEngine initialized (gallery_ttl={}s, threshold={:.2f})", 
+    LOG_INFO("ReIDEngine initialized (gallery_ttl={}s, threshold={:.2f})",
              config_.gallery_ttl_sec, config_.match_threshold);
     return true;
+}
+
+// Boot-time gallery load + persistence-flush thread launch. Separated from
+// init() because the test fixtures stub the engine without a DB present,
+// and we don't want to require a DbManager dependency for those. main.cpp
+// is expected to call init() THEN loadFromDatabase() (which also starts
+// the periodic flush). Safe to call multiple times — re-entry is a no-op.
+bool ReIDEngine::loadFromDatabase() {
+    auto& db_mgr = database::DbManager::getInstance();
+    if (!db_mgr.isInitialized()) {
+        LOG_WARN("ReIDEngine::loadFromDatabase: DbManager not initialized; skipping load.");
+        return false;
+    }
+    QSqlDatabase db = db_mgr.getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) {
+        LOG_WARN("ReIDEngine::loadFromDatabase: no DB connection; skipping load.");
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // TTL filter at load: if last_seen + ttl < now, the entry would be
+    // pruned on the next pruneExpired() anyway. Filtering on load avoids
+    // re-loading stale gallery rows from a long-downtime restart only to
+    // wipe them out a second later.
+    const auto now = std::chrono::system_clock::now();
+    const auto ttl_sec = config_.gallery_ttl_sec;
+    const int64_t cutoff = std::chrono::duration_cast<std::chrono::seconds>(
+        now.time_since_epoch()).count() - ttl_sec;
+
+    QSqlQuery query(db);
+    query.prepare("SELECT global_id, camera_id, track_id, embedding, embedding_dim, "
+                  "thumbnail_path, first_seen, last_seen FROM reid_gallery "
+                  "WHERE last_seen >= ?");
+    query.bindValue(0, static_cast<qint64>(cutoff));
+    if (!query.exec()) {
+        LOG_ERROR("ReIDEngine::loadFromDatabase: query failed: {}",
+                  query.lastError().text().toStdString());
+        return false;
+    }
+
+    int loaded = 0;
+    int max_gid = 0;
+    while (query.next()) {
+        ReIDEntry entry;
+        entry.global_id = query.value(0).toInt();
+        entry.camera_id = query.value(1).toInt();
+        entry.track_id  = query.value(2).toInt();
+
+        QByteArray blob = query.value(3).toByteArray();
+        int dim = query.value(4).toInt();
+        if (dim > 0 && blob.size() == static_cast<int>(dim * sizeof(float))) {
+            entry.embedding.resize(dim);
+            std::memcpy(entry.embedding.data(), blob.constData(), blob.size());
+        } else {
+            LOG_WARN("ReIDEngine: row global_id={} has malformed embedding (dim={}, blob={}); skipping.",
+                     entry.global_id, dim, blob.size());
+            continue;
+        }
+        entry.thumbnail_path = query.value(5).toString().toStdString();
+        entry.first_seen = std::chrono::system_clock::from_time_t(query.value(6).toLongLong());
+        entry.last_seen  = std::chrono::system_clock::from_time_t(query.value(7).toLongLong());
+
+        gallery_[entry.global_id] = entry;
+        if (entry.global_id > max_gid) max_gid = entry.global_id;
+        ++loaded;
+    }
+    if (max_gid >= next_global_id_.load()) {
+        next_global_id_.store(max_gid + 1);
+    }
+
+    // Load trails.
+    QSqlQuery tquery(db);
+    if (tquery.exec("SELECT global_id, camera_id, thumbnail_path, enter_time, exit_time "
+                    "FROM reid_trails ORDER BY enter_time ASC")) {
+        int trails_loaded = 0;
+        while (tquery.next()) {
+            int gid = tquery.value(0).toInt();
+            if (!gallery_.count(gid)) continue; // skip trails for pruned entries
+            ReIDTrailPoint p;
+            p.camera_id = tquery.value(1).toInt();
+            p.thumbnail_path = tquery.value(2).toString().toStdString();
+            p.enter_time = std::chrono::system_clock::from_time_t(tquery.value(3).toLongLong());
+            p.exit_time  = std::chrono::system_clock::from_time_t(tquery.value(4).toLongLong());
+            trails_[gid].push_back(p);
+            ++trails_loaded;
+        }
+        LOG_INFO("ReIDEngine: Loaded {} gallery entries + {} trail points (next_global_id={}, cutoff={}s ago)",
+                 loaded, trails_loaded, next_global_id_.load(), ttl_sec);
+    } else {
+        LOG_WARN("ReIDEngine: trails query failed: {}", tquery.lastError().text().toStdString());
+    }
+
+    // Start the periodic flush thread once. Idempotent.
+    bool expected = false;
+    if (persistence_running_.compare_exchange_strong(expected, true)) {
+        persistence_thread_ = std::thread([this]() {
+            // Flush every 60s OR when explicitly notified (shutdown path).
+            // The thread holds NO ReIDEngine mutex between iterations —
+            // saveToDatabase takes the mutex only while copying state out.
+            const auto interval = std::chrono::seconds(60);
+            while (persistence_running_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(persistence_cv_mutex_);
+                persistence_cv_.wait_for(lk, interval, [this]() {
+                    return !persistence_running_.load(std::memory_order_acquire);
+                });
+                if (!persistence_running_.load(std::memory_order_acquire)) break;
+                if (vms::core::shutting_down.load(std::memory_order_acquire)) break;
+                if (persistence_dirty_.exchange(false)) {
+                    saveToDatabase();
+                }
+            }
+        });
+        LOG_INFO("ReIDEngine: persistence flush thread started (60s interval)");
+    }
+    return true;
+}
+
+// Snapshot-then-write pattern: copy gallery + trails out of the mutex
+// before doing per-row SQL. Keeps the lock window short even with N=500
+// entries × 2 KB embedding (1 MB memcpy under the lock).
+bool ReIDEngine::saveToDatabase() {
+    auto& db_mgr = database::DbManager::getInstance();
+    if (!db_mgr.isInitialized()) return false;
+    QSqlDatabase db = db_mgr.getThreadConnection();
+    if (!db.isValid() || !db.isOpen()) return false;
+
+    std::vector<ReIDEntry> snapshot;
+    std::vector<std::pair<int, std::vector<ReIDTrailPoint>>> trail_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot.reserve(gallery_.size());
+        for (const auto& [_, entry] : gallery_) snapshot.push_back(entry);
+        trail_snapshot.reserve(trails_.size());
+        for (const auto& [gid, pts] : trails_) trail_snapshot.push_back({gid, pts});
+    }
+
+    db_mgr.beginTransaction();
+
+    // Gallery: full rewrite on each flush. With max_gallery_size=500 this
+    // is bounded at 500 rows / flush. UPSERT semantics needed: PG ON CONFLICT
+    // by global_id; SQLite INSERT OR REPLACE.
+    const QString gallery_sql = db_mgr.isPostgres()
+        ? "INSERT INTO reid_gallery (global_id, camera_id, track_id, embedding, embedding_dim, "
+          "thumbnail_path, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+          "ON CONFLICT (global_id) DO UPDATE SET camera_id=EXCLUDED.camera_id, "
+          "track_id=EXCLUDED.track_id, embedding=EXCLUDED.embedding, "
+          "embedding_dim=EXCLUDED.embedding_dim, thumbnail_path=EXCLUDED.thumbnail_path, "
+          "last_seen=EXCLUDED.last_seen"
+        : "INSERT OR REPLACE INTO reid_gallery (global_id, camera_id, track_id, embedding, "
+          "embedding_dim, thumbnail_path, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+
+    QSqlQuery query(db);
+    if (!query.prepare(gallery_sql)) {
+        LOG_ERROR("ReIDEngine::saveToDatabase: prepare gallery failed: {}",
+                  query.lastError().text().toStdString());
+        db_mgr.rollback();
+        return false;
+    }
+
+    int written = 0;
+    for (const auto& e : snapshot) {
+        QByteArray blob(reinterpret_cast<const char*>(e.embedding.data()),
+                        static_cast<int>(e.embedding.size() * sizeof(float)));
+        query.bindValue(0, e.global_id);
+        query.bindValue(1, e.camera_id);
+        query.bindValue(2, e.track_id);
+        query.bindValue(3, blob);
+        query.bindValue(4, static_cast<int>(e.embedding.size()));
+        query.bindValue(5, QString::fromStdString(e.thumbnail_path));
+        query.bindValue(6, static_cast<qint64>(std::chrono::system_clock::to_time_t(e.first_seen)));
+        query.bindValue(7, static_cast<qint64>(std::chrono::system_clock::to_time_t(e.last_seen)));
+        if (query.exec()) ++written;
+        else LOG_WARN("ReIDEngine: failed to upsert gallery row {}: {}",
+                      e.global_id, query.lastError().text().toStdString());
+    }
+
+    // Trails: simpler — DELETE-then-INSERT keyed by global_id keeps the
+    // table in sync with in-memory state (avoiding the trail dedup we'd
+    // need with UPSERT, since there's no natural unique key per point).
+    // Bounded by gallery size * average trail length (~10 cameras), still
+    // small.
+    {
+        QString active_ids = "0";
+        for (const auto& kv : trail_snapshot) active_ids += "," + QString::number(kv.first);
+        QSqlQuery del(db);
+        if (!del.exec("DELETE FROM reid_trails WHERE global_id IN (" + active_ids + ")")) {
+            LOG_WARN("ReIDEngine: trail prune failed: {}", del.lastError().text().toStdString());
+        }
+    }
+
+    const QString trail_sql =
+        "INSERT INTO reid_trails (global_id, camera_id, thumbnail_path, enter_time, exit_time) "
+        "VALUES (?, ?, ?, ?, ?)";
+    QSqlQuery tquery(db);
+    if (tquery.prepare(trail_sql)) {
+        for (const auto& [gid, pts] : trail_snapshot) {
+            for (const auto& p : pts) {
+                tquery.bindValue(0, gid);
+                tquery.bindValue(1, p.camera_id);
+                tquery.bindValue(2, QString::fromStdString(p.thumbnail_path));
+                tquery.bindValue(3, static_cast<qint64>(std::chrono::system_clock::to_time_t(p.enter_time)));
+                tquery.bindValue(4, static_cast<qint64>(std::chrono::system_clock::to_time_t(p.exit_time)));
+                tquery.exec();
+            }
+        }
+    }
+
+    // Garbage-collect rows for gids no longer in memory (pruned).
+    {
+        QString active_ids = "0";
+        for (const auto& e : snapshot) active_ids += "," + QString::number(e.global_id);
+        QSqlQuery gc(db);
+        if (!gc.exec("DELETE FROM reid_gallery WHERE global_id NOT IN (" + active_ids + ")")) {
+            LOG_WARN("ReIDEngine: gallery GC failed: {}", gc.lastError().text().toStdString());
+        }
+    }
+
+    db_mgr.commit();
+    last_flush_epoch_.store(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(),
+        std::memory_order_release);
+    last_flush_rows_.store(written, std::memory_order_release);
+    LOG_DEBUG("ReIDEngine: persisted {} gallery rows", written);
+    return true;
+}
+
+void ReIDEngine::shutdown() {
+    // Stop the periodic flush thread first, then do one final synchronous
+    // flush so anything mutated since the last tick lands in the DB.
+    if (persistence_running_.exchange(false)) {
+        persistence_cv_.notify_all();
+        if (persistence_thread_.joinable()) {
+            persistence_thread_.join();
+        }
+    }
+    if (persistence_dirty_.exchange(false)) {
+        saveToDatabase();
+    }
 }
 
 // ============================================================================
@@ -309,12 +556,16 @@ int ReIDEngine::processDetection(int camera_id, int track_id, const cv::Mat& per
     
     // Map this track to global
     track_to_global_[track_key] = global_id;
-    
+
+    // Mark dirty for the next periodic flush. We don't fire a write here —
+    // per-detection IO would be ~30/s at peak; the 60s flush batches.
+    persistence_dirty_.store(true, std::memory_order_release);
+
     // Prune if gallery too large
     if ((int)gallery_.size() > config_.max_gallery_size) {
         pruneExpired();
     }
-    
+
     return global_id;
 }
 
@@ -415,6 +666,7 @@ void ReIDEngine::clearGallery() {
     gallery_.clear();
     trails_.clear();
     track_to_global_.clear();
+    persistence_dirty_.store(true, std::memory_order_release);
     LOG_INFO("ReID gallery cleared");
 }
 
@@ -441,6 +693,7 @@ void ReIDEngine::pruneExpired() {
     }
     
     if (!to_remove.empty()) {
+        persistence_dirty_.store(true, std::memory_order_release);
         LOG_DEBUG("ReID: Pruned {} expired entries", to_remove.size());
     }
 }
@@ -476,6 +729,15 @@ nlohmann::json ReIDEngine::getStatistics() const {
     // gallery/trail/search results are empty because no detection producer is
     // calling processDetection — not because the scene is empty. UI / ops
     // dashboards must check this flag before interpreting an empty gallery.
+    const int64_t now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t last_flush = last_flush_epoch_.load(std::memory_order_acquire);
+    // 0 = no flush yet (booted, nothing has triggered a write); otherwise
+    // expose seconds-since-last-flush so a stale value (e.g. >120s for a
+    // 60s interval thread) makes a dead worker visible to ops without a
+    // separate logfile dive.
+    const int64_t seconds_since_flush = (last_flush > 0) ? (now_epoch - last_flush) : -1;
+
     return {
         {"total_processed", total_processed_.load()},
         {"total_matched", total_matched_.load()},
@@ -484,7 +746,12 @@ nlohmann::json ReIDEngine::getStatistics() const {
         {"trails_count", trails_.size()},
         {"model_loaded", !net_.empty()},
         {"initialized", initialized_.load()},
-        {"producer_wired", producer_wired_.load()}
+        {"producer_wired", producer_wired_.load()},
+        {"persistence_running", persistence_running_.load()},
+        {"persistence_dirty",   persistence_dirty_.load()},
+        {"last_flush_epoch",    last_flush},
+        {"last_flush_rows",     last_flush_rows_.load(std::memory_order_acquire)},
+        {"seconds_since_flush", seconds_since_flush}
     };
 }
 

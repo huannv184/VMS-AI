@@ -384,6 +384,11 @@ int main(int argc, char* argv[]) {
         // embedding if the ONNX model is missing (logged at WARN, not fatal).
         try {
             vms::core::ReIDEngine::getInstance().init();
+            // Rehydrate cross-camera gallery from DB + start the 60s flush
+            // thread. Without this the gallery cold-starts every restart;
+            // operator-built identities and last-30min cross-camera mappings
+            // are lost. Idempotent: skips silently if DB not yet ready.
+            vms::core::ReIDEngine::getInstance().loadFromDatabase();
         } catch (const std::exception& e) {
             LOG_WARN("ReIDEngine init exception: {}", e.what());
         }
@@ -502,6 +507,14 @@ int main(int argc, char* argv[]) {
         vms::api::SynopsisController::shutdown();
         vms::api::ExportController::shutdown();
         vms::events::shutdownDelivery();
+
+        // Final ReID gallery flush — must happen while DbManager is still
+        // open. Joins the persistence thread and writes any pending state.
+        try {
+            vms::core::ReIDEngine::getInstance().shutdown();
+        } catch (const std::exception& e) {
+            LOG_WARN("ReIDEngine shutdown exception: {}", e.what());
+        }
 
         LOG_INFO("Stopping tracked child processes...");
         vms::core::ProcessManager::getInstance().shutdownAll();

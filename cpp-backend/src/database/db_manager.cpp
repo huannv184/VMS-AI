@@ -1036,6 +1036,64 @@ void DbManager::initializeTables(QSqlDatabase& primary) {
     executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_buckets_ts ON counter_buckets_1m(ts_minute)");
     executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_buckets_src ON counter_buckets_1m(camera_id, source_kind, source_id, ts_minute)");
 
+    // =========================================================
+    // 22. REID_GALLERY (Cross-camera person Re-ID gallery — persistence)
+    //
+    // Pre-2026-05-14 the ReIDEngine gallery was in-memory only — every
+    // backend restart wiped operator-built person identities. Persist the
+    // gallery + per-person trail rows so a process bounce or NSSM service
+    // restart doesn't cold-start identity assignment.
+    // Embedding is stored as raw float32 BLOB (4 bytes per dim × embedding_dim).
+    // =========================================================
+    const std::string sql_reid_gallery = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS reid_gallery (
+            global_id INTEGER PRIMARY KEY,
+            camera_id INTEGER NOT NULL,
+            track_id INTEGER NOT NULL,
+            embedding BYTEA NOT NULL,
+            embedding_dim INTEGER NOT NULL,
+            thumbnail_path TEXT,
+            first_seen BIGINT NOT NULL,
+            last_seen BIGINT NOT NULL
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS reid_gallery (
+            global_id INTEGER PRIMARY KEY,
+            camera_id INTEGER NOT NULL,
+            track_id INTEGER NOT NULL,
+            embedding BLOB NOT NULL,
+            embedding_dim INTEGER NOT NULL,
+            thumbnail_path TEXT,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL
+        );
+    )";
+    if (!executeOnConnection(primary, sql_reid_gallery)) LOG_ERROR("Failed to create reid_gallery table");
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_reid_last_seen ON reid_gallery(last_seen)");
+
+    const std::string sql_reid_trails = (config_.driver == "postgresql") ? R"(
+        CREATE TABLE IF NOT EXISTS reid_trails (
+            id BIGSERIAL PRIMARY KEY,
+            global_id INTEGER NOT NULL,
+            camera_id INTEGER NOT NULL,
+            thumbnail_path TEXT,
+            enter_time BIGINT NOT NULL,
+            exit_time BIGINT NOT NULL
+        );
+    )" : R"(
+        CREATE TABLE IF NOT EXISTS reid_trails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            global_id INTEGER NOT NULL,
+            camera_id INTEGER NOT NULL,
+            thumbnail_path TEXT,
+            enter_time INTEGER NOT NULL,
+            exit_time INTEGER NOT NULL
+        );
+    )";
+    if (!executeOnConnection(primary, sql_reid_trails)) LOG_ERROR("Failed to create reid_trails table");
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_reid_trails_gid ON reid_trails(global_id)");
+    executeOnConnection(primary, "CREATE INDEX IF NOT EXISTS idx_reid_trails_enter ON reid_trails(enter_time)");
+
     LOG_INFO("All database tables initialized successfully");
 }
 

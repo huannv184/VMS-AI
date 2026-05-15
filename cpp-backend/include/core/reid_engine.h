@@ -11,6 +11,8 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <thread>
+#include <condition_variable>
 #include <opencv2/core.hpp>
 #include <opencv2/dnn.hpp>
 #include <nlohmann/json.hpp>
@@ -109,6 +111,18 @@ public:
     // Gallery management
     void clearGallery();
     void pruneExpired();
+
+    // Persistence (added 2026-05-14): without this the cross-camera gallery
+    // resets on every backend restart and operator-built identities are
+    // lost. loadFromDatabase is called once from init(); saveToDatabase is
+    // driven by a 60s flush timer started in init() and one final flush in
+    // shutdown(). Entries past gallery_ttl_sec are silently dropped on
+    // load so a long downtime doesn't repopulate a stale gallery.
+    bool loadFromDatabase();
+    bool saveToDatabase();
+    // Final flush + stop the persistence timer. Idempotent. Call from main
+    // shutdown sequence before DbManager::close().
+    void shutdown();
     
     // Configuration
     ReIDConfig getConfig() const;
@@ -167,6 +181,23 @@ private:
     
     // Thread safety
     mutable std::mutex mutex_;
+
+    // Persistence — dirty flag set whenever gallery_/trails_/track_to_global_
+    // mutates. Periodic flush thread observes it, writes to DB, clears it.
+    // Avoids per-detection DB writes (would be ~30/s under load) while
+    // bounding worst-case data loss to one flush interval.
+    std::atomic<bool> persistence_dirty_{false};
+    std::atomic<bool> persistence_running_{false};
+    std::thread persistence_thread_;
+    std::condition_variable persistence_cv_;
+    std::mutex persistence_cv_mutex_;
+
+    // Heartbeat — surfaced in getStatistics so an operator (or a future
+    // healthcheck endpoint) can tell whether the flush thread is alive.
+    // A stale last_flush_epoch (older than 2× flush interval) indicates
+    // the thread has silently stopped. Zero = no flush has happened yet.
+    std::atomic<int64_t> last_flush_epoch_{0};
+    std::atomic<int> last_flush_rows_{0};
 };
 
 } // namespace core

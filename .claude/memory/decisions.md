@@ -1,5 +1,28 @@
 # Architectural Decisions — AI Camera System
 
+## 2026-05-14 ReID gallery persistence — periodic flush, not per-mutation write
+
+### Decision: 60s dirty-flag flush thread, not per-mutation SQL writes
+- **Choice**: ReIDEngine::loadFromDatabase starts a background `std::thread` that wakes every 60s (or earlier via `condition_variable` on shutdown). It calls `saveToDatabase()` only when `persistence_dirty_` (`std::atomic<bool>`) is true; that flag is set by `processDetection` / `clearGallery` / `pruneExpired`. Worst-case data loss is 60s of identities + trail updates.
+- **Rationale**: Per-detection persistence at peak load (~30 detections/s across cameras) would be ~30 SQL transactions/s writing 2 KB of embedding BLOB each — measurable disk pressure and lock contention with the existing event batch writer. Dirty-flag + periodic flush is the same shape as `CounterBucketAggregator` (60s rollup) and `EventManager` (batch writer) — consistent with the codebase's "no synchronous DB write on the hot path" rule.
+- **Trade-off**: A process kill -9 between flushes loses up to 60s of mutations. Crash detection scenario is real (NSSM auto-respawn from BUG-PM-RESTART-01 sequence) but the lost data is recoverable on the next observation: the same person walks past the same camera and gets a new global_id — operationally similar to the pre-fix state of every restart, just bounded to 60s window. If we ever care about graceful-shutdown loss only (kill -9 acceptable), bump flush to 5 minutes and document operator expectation.
+- **Alternative considered**: write-on-mutate with a debouncer (e.g. 250ms grace before flushing). Rejected because (a) implementing debounce correctly requires the same thread + cv + dirty-flag plumbing, just with shorter interval, and (b) the 250ms grace would still be fully busy under burst load and lose the batch benefit.
+
+### Decision: TTL filter at load time, not load-then-prune
+- **Choice**: `loadFromDatabase` runs `SELECT … WHERE last_seen >= ?` with cutoff = `now() - gallery_ttl_sec`. Stale rows never enter memory.
+- **Rationale**: A multi-hour downtime (NSSM stopped over weekend) restarting with the previous gallery would briefly produce wrong cross-camera matches before the next `pruneExpired()` fired — even if just 1-2 stale identities, the operator confidence cost is real. Filter at load is one SQL parameter; filter at memory-load-then-prune is two operations + a window of wrong behavior.
+- **Trade-off**: SQL needs an index on `last_seen` to keep the filter fast at scale. Added (`idx_reid_last_seen`).
+
+### Decision: Embeddings stored as raw float32 BLOB, not JSON array or base64
+- **Choice**: `INSERT INTO reid_gallery (... embedding ...)` binds a `QByteArray` containing the raw `sizeof(float) * embedding_dim` bytes. Sidecar `embedding_dim` column lets the reader validate the BLOB size matches what's expected before reinterpret_cast.
+- **Rationale**: BLOB is 4× smaller than base64 text (2 KB vs 8 KB per row at 512-dim), no encode/decode CPU, and Qt SQL handles BYTEA + BLOB transparently. JSON array would be 5-6× the size and force per-element parse. The portability concern (operator inspecting embeddings via `sqlite3` CLI) is moot — embeddings aren't human-readable in any encoding.
+- **Trade-off**: `embedding_dim` column adds 4 bytes/row of duplicated info (could be derived from blob size / 4). Cheap and catches the silent-malformed-blob case explicitly.
+
+### Decision: Trails use DELETE-then-INSERT, not UPSERT
+- **Choice**: Each flush deletes all `reid_trails` rows for active gids and re-inserts from the in-memory vector. Bounded by ~5000 rows (max_gallery=500 × avg trail length ~10).
+- **Rationale**: TrailPoint has no natural unique key per row (gid+camera_id+enter_time would work but assumes no re-entry; a person walking through cam 3 → cam 5 → cam 3 again would produce two cam-3 points with different enter_times — UPSERT would need a synthetic id and the in-memory `std::vector` doesn't carry one). DELETE-then-INSERT is exact-match-the-in-memory-state, no edge cases. Bounded size makes the IO trivial.
+- **Trade-off**: 1 DELETE + N INSERTs per flush even when only one trail changed. Acceptable at the 60s cadence. If trail mutation rate ever becomes the bottleneck, switch to "append new points only" (track a high-water mark per gid).
+
 ## 2026-05-14 AlertManager consolidation — single-layer rule dispatch via deliverAction
 
 ### Decision: One delivery layer (`vms::events::deliverAction`), not two rule storage layers
