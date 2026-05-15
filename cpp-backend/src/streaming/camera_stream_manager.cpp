@@ -13,6 +13,7 @@
 #include <mutex>
 #include <QMetaObject>
 #include <QThread>
+#include <QTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -145,6 +146,32 @@ void CameraStreamManager::onNewConnection() {
 
     // Default: unauthenticated until AUTH message is received (when auth is enabled)
     socket->setProperty("vms_authed", false);
+
+    // 2026-05-15 WS audit: pre-auth socket timeout. Pre-fix an attacker could
+    // open N sockets, never send AUTH, and hold resources indefinitely (file
+    // descriptors + QWebSocket per-conn buffers + the camera_clients_ entry
+    // never came into play but the QWebSocket itself remained). Now: a 10s
+    // single-shot timer per socket force-closes any connection still in the
+    // unauthenticated state when it fires. Timer is parented to the socket
+    // so it auto-deletes with the socket on disconnect; no manual stop()
+    // needed on AUTH success because the lambda no-ops if vms_authed=true.
+    // Auth-disabled mode (config.auth.enabled=false) marks the socket
+    // authed on the first AUTH-or-other message — timer still fires but
+    // is a no-op then. 10s is generous: a normal browser+JS client takes
+    // <1s from connect to first AUTH frame; 10s tolerates slow links +
+    // operator manual-connect with token paste.
+    auto* auth_timeout = new QTimer(socket.data());
+    auth_timeout->setSingleShot(true);
+    auth_timeout->setInterval(10000);
+    QObject::connect(auth_timeout, &QTimer::timeout, socket.data(), [socket]() {
+        if (!socket || socket->property("vms_authed").toBool()) return;
+        LOG_THROTTLED_WARN(5000,
+            "WS pre-auth timeout: closing {} after 10s with no AUTH",
+            socket->peerAddress().toString().toStdString());
+        socket->close(QWebSocketProtocol::CloseCodePolicyViolated,
+                      QStringLiteral("AUTH timeout"));
+    });
+    auth_timeout->start();
 }
 
 void CameraStreamManager::socketDisconnected() {

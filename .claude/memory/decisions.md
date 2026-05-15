@@ -1,5 +1,24 @@
 # Architectural Decisions — AI Camera System
 
+## 2026-05-15 WebSocket auth/session — pre-auth timeout now, RBAC + proxy + caps deferred
+
+### Decision: 10s pre-auth socket timeout (close-after-no-AUTH)
+- **Choice**: every accepted `QWebSocket` in `onNewConnection` gets a single-shot `QTimer(10000)` parented to itself. On fire, if `vms_authed` still false, close with `CloseCodePolicyViolated`. Timer auto-deletes with socket via Qt parent ownership.
+- **Rationale**: the AUTH state machine was well-designed (JTI replay protection, IP binding, 30s ticket TTL, one-time use) but didn't bound the lifetime of an *unauthenticated* socket. Pre-fix an attacker could open N TCP+WS handshakes, never AUTH, and hold N file descriptors. Authentication design ≠ session resource policy.
+- **Trade-off**: 10s is the choice point. Too short rejects clients on slow links / manual token paste; too long leaves the DoS window open. 10s matches the typical "client just opened WS, JS picking up the ticket from `/api/ws/ticket` HTTP response, sending AUTH frame" cycle which is <1s; legitimate slow links should still fit comfortably. Could become configurable later but a fixed 10s solves the immediate exposure.
+- **Why a per-socket QTimer instead of a single sweeping QTimer**: per-socket timers are O(1) to set up + auto-cleanup-on-parent-delete. A central sweeper would need a registry, lookup-by-socket, and explicit removal on disconnect — more state for no benefit at our connection scale.
+
+### Decision: Defer per-camera RBAC at WS subscribe — needs caching pass
+- **Choice**: keep the current "any authed user subscribes to any camera_id" behaviour for now.
+- **Rationale**: the `permissions` table HAS the `allowed_cameras` column and `PermissionRepository` HAS the SELECT helper, but nothing in the policy-enforcement layer reads it. Wiring it into the WS subscribe path requires (a) loading allowed_cameras at AUTH time or first subscribe, (b) caching it on the socket (Qt property or a side-map), (c) handling cache invalidation when an admin changes a user's permissions (currently no notify path), (d) deciding the "empty allowed_cameras = all cameras OR no cameras?" semantics (need product call). Each of those is its own design choice.
+- **Trade-off**: until the RBAC sweep lands, a logged-in viewer can subscribe to any camera and see its frame stream. The HTTP `/api/cameras/*` endpoints might also bypass this — need a parallel audit. For deployments without per-user camera scopes (everyone-sees-everything), this is a non-issue. For multi-tenant deployments where operators expect viewer scopes, this is a real leak. Logged prominently in `past-bugs.md` as `BUG-WS-CAMERA-NO-RBAC-01 (HIGH)`.
+
+### Decision: Defer trusted_proxies + connection caps + message-size cap + connection metrics
+- **Trusted proxies**: X-Forwarded-For + localhost-bypass in IP binding combine to defeat IP-binding behind a reverse proxy. Right fix is a `config.security.trusted_proxies` list — only honour X-Forwarded-For if the immediate peer is in that list. Out of scope here because it touches `/api/ws/ticket` AND every other XFF-consuming endpoint.
+- **Connection caps**: no per-IP or global cap on WS connection count. With the 10s pre-auth timeout, the immediate DoS vector is closed; reconnect-loop attacks still need a rate-limiter. Defer until the connection-count metric (see below) shows we need it.
+- **Message-size cap**: `config.websocket.max_message_size_mb` is parsed but never applied to `QWebSocket::setMaxAllowedIncomingMessageSize` — Qt's default (~40 MB) is currently in effect. Tightening is a 1-line fix; logged but punted because the immediate AUTH timeout fix is enough for the security-lean scope.
+- **Connection metrics**: mirror of the `delivery` + `batch_writer` counters landed earlier today. Need `connections_total / connections_current / authed_total / preauth_timeout_total / ticket_replay_total`. Right shape is a `CameraStreamManager::connectionStats()` accessor merged into `/api/rules/stats` (or a new `/api/ws/stats`). Defer to a dedicated observability pass.
+
 ## 2026-05-15 PipelineStateStore — shared_ptr-published frame, defer per-camera sharding
 
 ### Decision: Publish JPEG + objects as `shared_ptr<const vector<...>>`; copy outside the writer's unique_lock
