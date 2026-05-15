@@ -204,16 +204,52 @@ int main(int argc, char* argv[]) {
         }
 
         if (config_path.empty()) {
-            std::cerr << "LOG_ERROR: No configuration file specified and none found in default locations!" << std::endl;
+            std::cerr << "FATAL: No configuration file specified and none found in default locations." << std::endl;
+            std::cerr << "       Pass --config <path> or place backend.yaml in one of: config/, ../../config/, ../config/" << std::endl;
             return EXIT_FAILURE;
         }
 
         std::string absolute_config_path = std::filesystem::absolute(config_path).string();
         std::cout << "Loading configuration from: " << absolute_config_path << std::endl;
-        
+
+        // 2026-05-15: distinguish "couldn't read/parse the YAML" from "YAML
+        // loaded fine but a validation check rejected it" (JWT default secret,
+        // missing required keys, etc). Pre-fix the cerr below claimed
+        // "Failed to load configuration from: <path>" for BOTH cases —
+        // operators chased file-path issues when the real reason was the JWT
+        // sentinel inside Config::loadFromFile. Now we do a separate
+        // file-existence + readability probe so we can give a specific message
+        // when the file itself is the problem; otherwise the cerr says
+        // "validation failed" and points at the preceding LOG_ERROR.
+        std::error_code probe_ec;
+        if (!std::filesystem::exists(config_path, probe_ec) || probe_ec) {
+            std::cerr << "FATAL: Configuration file does not exist: " << absolute_config_path
+                      << (probe_ec ? std::string(" (") + probe_ec.message() + ")" : std::string())
+                      << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (std::filesystem::file_size(config_path, probe_ec) == 0 || probe_ec) {
+            std::cerr << "FATAL: Configuration file is empty or unreadable: " << absolute_config_path
+                      << (probe_ec ? std::string(" (") + probe_ec.message() + ")" : std::string())
+                      << std::endl;
+            return EXIT_FAILURE;
+        }
+
         if (!vms::Config::getInstance().loadFromFile(config_path)) {
-            std::cerr << "LOG_ERROR: Failed to load configuration from: " << config_path << std::endl;
-            // The vms::Config::loadFromFile should have printed the specific YAML error
+            // Config::loadFromFile already emitted a specific LOG_ERROR for
+            // the reason (YAML parse error, JWT sentinel, short secret, etc.).
+            // The spdlog console sink is async (overrun_oldest); plain
+            // logger->flush() just enqueues a flush request and returns —
+            // not synchronous. Call spdlog::shutdown() to drain + join the
+            // worker pool so the [error] log line appears in causal order
+            // before this cerr. We're about to return EXIT_FAILURE anyway,
+            // so loss of the logger is fine.
+            spdlog::shutdown();
+            std::cerr << "FATAL: Configuration load or validation failed for "
+                      << absolute_config_path << "." << std::endl;
+            std::cerr << "       See the preceding [error] log line(s) above for the specific reason "
+                      << "(common causes: YAML parse error, default JWT secret, secret < 32 chars)."
+                      << std::endl;
             return EXIT_FAILURE;
         }
         LOG_INFO("Configuration loaded successfully.");
