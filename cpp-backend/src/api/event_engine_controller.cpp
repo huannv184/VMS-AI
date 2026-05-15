@@ -5,6 +5,7 @@
 
 #include "api/event_engine_controller.h"
 #include "events/rule_engine.h"
+#include "events/alert_delivery.h"
 #include "events/zone_manager.h"
 #include "core/roi_manager.h"
 #include "middleware/auth_middleware.h"
@@ -384,8 +385,13 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
         if (auto err = ApiUtils::requirePermission(ctx, Permission::ALERT_READ, origin)) return std::move(*err);
 
         try {
-             return ApiUtils::createResponse(
-                 events::RuleEngine::getInstance().getStatistics(), 200, origin);
+             json out = events::RuleEngine::getInstance().getStatistics();
+             // Merge alert_delivery queue counters (2026-05-15 hot-path audit):
+             // operators need a way to see how many alerts the bounded runner
+             // is dropping during a burst. Same RBAC scope (ALERT_READ) as the
+             // rule stats it sits alongside.
+             out["delivery"] = events::deliveryStats();
+             return ApiUtils::createResponse(out, 200, origin);
         } catch (const std::exception& e) {
              return ApiUtils::createSafeError(e, 500, origin);
         }

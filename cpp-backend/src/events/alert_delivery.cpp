@@ -60,15 +60,34 @@ std::string readString(const nlohmann::json& meta, const char* key, const std::s
     return it->get<std::string>();
 }
 
-// HTTP POST via libcurl. resolve_entry pins DNS to the IP isInternalUrl()
-// already validated, closing the SSRF DNS-rebind TOCTOU.
-void executeAsyncPost(const std::string& url,
-                      const std::string& payload,
-                      const std::string& resolve_entry = "") {
+// HTTP POST via libcurl, executed inside the worker. ssrf_required toggles the
+// inside-worker isInternalUrl() check + CURLOPT_RESOLVE pin; set to true for
+// operator-supplied URLs (webhook, telegram), false for fully-trusted internal
+// destinations (alarm relay).
+//
+// Pre-2026-05-15 the SSRF check ran on the producer thread to "refuse before
+// queueing", but getaddrinfo() blocks for seconds on slow resolvers and the
+// ZMQ bridge / brand-event-service threads have NO other thread to ingest
+// events while they wait. Burning a worker slot on the few microseconds of a
+// refused job is the cheaper trade.
+void postViaWorker(const std::string& url,
+                   const std::string& payload,
+                   bool ssrf_required) {
     if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
-    if (!deliveryRunner().submit([url, payload, resolve_entry]() {
+    if (!deliveryRunner().submit([url, payload, ssrf_required]() {
         if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
+
+        std::string resolve_entry;
+        if (ssrf_required) {
+            auto v = vms::utils::isInternalUrl(url);
+            if (v.internal) {
+                LOG_ERROR("[alert-delivery] POST rejected (SSRF guard): host='{}' resolved='{}' reason={}",
+                          v.host, v.resolved_ip, v.reason);
+                return;
+            }
+            resolve_entry = vms::utils::buildResolveEntry(v);
+        }
 
         CURL* curl = curl_easy_init();
         if (!curl) return;
@@ -142,6 +161,9 @@ void deliverEmail(const CompositeRule& rule, const RuleAction& action, const Raw
 }
 
 void deliverSMS(const CompositeRule& rule, const RuleAction& action, const RawEvent& event) {
+    // Producer-side validation: cheap stuff only. Twilio settings are read
+    // inside the worker (2026-05-15 hot-path audit) so the producer thread
+    // doesn't pay 3 DB SELECTs per event.
     auto numbers = readStringArray(action.metadata, "phone_numbers");
     if (numbers.empty()) {
         LOG_THROTTLED_WARN(60000,
@@ -150,15 +172,15 @@ void deliverSMS(const CompositeRule& rule, const RuleAction& action, const RawEv
         return;
     }
 
-    auto& db = vms::database::DbManager::getInstance();
-    const std::string sid   = db.getSetting("twilio_account_sid", "");
-    const std::string token = db.getSetting("twilio_auth_token", "");
-    const std::string from  = db.getSetting("twilio_from_number", "");
-    if (sid.empty() || token.empty() || from.empty()) {
-        LOG_WARN("[alert-delivery] Twilio not configured. {} SMS skipped for rule '{}'.",
-                 numbers.size(), rule.name);
-        return;
+    // Sanitise + filter recipients before queueing — no point burning a worker
+    // slot to discover all phone numbers were empty after sanitisation.
+    std::vector<std::string> to_list;
+    to_list.reserve(numbers.size());
+    for (const auto& raw : numbers) {
+        std::string t = sanitizeHeader(raw, 32);
+        if (!t.empty()) to_list.push_back(std::move(t));
     }
+    if (to_list.empty()) return;
 
     std::string body = std::string("[VMS] ") + eventSeverityToString(event.severity) + " " +
                        eventTypeToString(event.type) +
@@ -166,19 +188,36 @@ void deliverSMS(const CompositeRule& rule, const RuleAction& action, const RawEv
                        " rule=" + sanitizeHeader(rule.name, 64);
     if (body.size() > 320) body.resize(320);
 
-    const std::string url = "https://api.twilio.com/2010-04-01/Accounts/" + sid + "/Messages.json";
+    const std::string rule_name = rule.name;
 
     LOG_INFO("[alert-delivery] SMS queued for {} recipient(s): {}",
-             numbers.size(), eventTypeToString(event.type));
+             to_list.size(), eventTypeToString(event.type));
 
-    for (const auto& raw_to : numbers) {
-        const std::string to = sanitizeHeader(raw_to, 32);
-        if (to.empty()) continue;
+    // ONE job per ALERT-fire (not per phone). Loops phones inside the worker,
+    // reading Twilio settings once. Pre-fix this enqueued N jobs each
+    // capturing sid/token/from by value — same effective serial behaviour
+    // (2 workers, Twilio rate-limit) at the cost of 3 string copies × N.
+    if (!deliveryRunner().submit([to_list, body, rule_name]() {
+        if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
-        if (!deliveryRunner().submit([url, sid, token, from, to, body]() {
+        auto& db = vms::database::DbManager::getInstance();
+        const std::string sid   = db.getSetting("twilio_account_sid", "");
+        const std::string token = db.getSetting("twilio_auth_token", "");
+        const std::string from  = db.getSetting("twilio_from_number", "");
+        if (sid.empty() || token.empty() || from.empty()) {
+            LOG_WARN("[alert-delivery] Twilio not configured. {} SMS skipped for rule '{}'.",
+                     to_list.size(), rule_name);
+            return;
+        }
+
+        const std::string url = "https://api.twilio.com/2010-04-01/Accounts/" + sid + "/Messages.json";
+        const std::string userpass = sid + ":" + token;
+
+        for (const auto& to : to_list) {
             if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
+
             CURL* curl = curl_easy_init();
-            if (!curl) return;
+            if (!curl) continue;
 
             char* enc_to   = curl_easy_escape(curl, to.c_str(), 0);
             char* enc_from = curl_easy_escape(curl, from.c_str(), 0);
@@ -188,7 +227,6 @@ void deliverSMS(const CompositeRule& rule, const RuleAction& action, const RawEv
                                "&Body=" + std::string(enc_body ? enc_body : "");
             curl_free(enc_to); curl_free(enc_from); curl_free(enc_body);
 
-            const std::string userpass = sid + ":" + token;
             curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
             curl_easy_setopt(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
             curl_easy_setopt(curl, CURLOPT_USERPWD, userpass.c_str());
@@ -208,15 +246,18 @@ void deliverSMS(const CompositeRule& rule, const RuleAction& action, const RawEv
                 LOG_INFO("[alert-delivery] SMS delivered to {} (http={})", to, http_code);
             }
             curl_easy_cleanup(curl);
-        })) {
-            LOG_THROTTLED_WARN(5000, "[alert-delivery] SMS queue full, dropping send");
         }
+    })) {
+        LOG_THROTTLED_WARN(5000, "[alert-delivery] SMS queue full, dropping batch for rule '{}'", rule_name);
     }
 }
 
-// Picks `url_override` first (used by ALERT actions that put webhook_url in
-// metadata), otherwise falls back to action.webhook_url (the WEBHOOK action
-// case). Skips silently when neither set — caller already logged.
+// Picks metadata.webhook_url first (ALERT actions that put webhook URL in
+// channel metadata), otherwise falls back to action.webhook_url (standalone
+// WEBHOOK action). Skips silently when neither set. The SSRF check + DNS pin
+// happen inside the worker (2026-05-15 audit) — producer-side getaddrinfo
+// could block the ZMQ bridge / brand event service for seconds on a slow
+// resolver.
 void deliverWebhook(const CompositeRule& rule, const RuleAction& action, const RawEvent& event) {
     std::string url = readString(action.metadata, "webhook_url");
     if (url.empty()) url = action.webhook_url;
@@ -235,13 +276,6 @@ void deliverWebhook(const CompositeRule& rule, const RuleAction& action, const R
         return;
     }
 
-    auto v = vms::utils::isInternalUrl(url);
-    if (v.internal) {
-        LOG_ERROR("[alert-delivery] Webhook rejected (SSRF guard): host='{}' resolved='{}' reason={}",
-                  v.host, v.resolved_ip, v.reason);
-        return;
-    }
-
     nlohmann::json payload;
     payload["event_id"]   = event.event_id;
     payload["camera_id"]  = event.camera_id;
@@ -256,8 +290,8 @@ void deliverWebhook(const CompositeRule& rule, const RuleAction& action, const R
     payload["rule_name"]  = rule.name;
     if (!event.metadata.is_null()) payload["metadata"] = event.metadata;
 
-    LOG_INFO("[alert-delivery] WEBHOOK to {} (rule '{}')", url, rule.name);
-    executeAsyncPost(url, payload.dump(), vms::utils::buildResolveEntry(v));
+    LOG_INFO("[alert-delivery] WEBHOOK queued to {} (rule '{}')", url, rule.name);
+    postViaWorker(url, payload.dump(), /*ssrf_required=*/true);
 }
 
 void deliverUINotification(const CompositeRule& rule, const RuleAction& /*action*/, const RawEvent& event) {
@@ -288,60 +322,96 @@ void deliverUINotification(const CompositeRule& rule, const RuleAction& /*action
 }
 
 void deliverTelegram(const CompositeRule& rule, const RuleAction& action, const RawEvent& event) {
-    auto& db = vms::database::DbManager::getInstance();
-    std::string bot_token = db.getSetting("telegram_bot_token", "");
-    // Allow per-rule chat override via metadata; fall back to global setting.
-    std::string chat_id = readString(action.metadata, "telegram_chat_id");
-    if (chat_id.empty()) chat_id = db.getSetting("telegram_chat_id", "");
-
-    if (bot_token.empty() || chat_id.empty()) {
-        LOG_WARN("[alert-delivery] Telegram not configured (bot_token/chat_id missing). Rule '{}' skipped.",
-                 rule.name);
-        return;
-    }
-
-    std::string url = "https://api.telegram.org/bot" + bot_token + "/sendMessage";
-
+    // Per-rule chat override resolved on producer (cheap json lookup).
+    // bot_token + global chat_id fallback + SSRF check run inside the worker
+    // (2026-05-15 audit) — api.telegram.org DNS can still take time on first
+    // resolve, no reason to block the producer for it.
+    std::string per_rule_chat = readString(action.metadata, "telegram_chat_id");
     std::string text = "🚨 VMS AI ALERT 🚨\n\n";
     text += "Tín hiệu: " + std::string(eventTypeToString(event.type)) + "\n";
     text += "Camera: "   + std::to_string(event.camera_id) + "\n";
     text += "Luật: "     + rule.name + "\n";
     text += "Mức độ: "   + std::string(eventSeverityToString(event.severity)) + "\n";
 
-    nlohmann::json payload;
-    payload["chat_id"]    = chat_id;
-    payload["text"]       = text;
-    payload["parse_mode"] = "Markdown";
+    const std::string rule_name = rule.name;
 
-    // Even though api.telegram.org is hardcoded, run through SSRF guard so
-    // /etc/hosts or resolver poisoning can't redirect bot-token POSTs at LAN.
-    auto v = vms::utils::isInternalUrl(url);
-    if (v.internal) {
-        LOG_ERROR("[alert-delivery] Telegram URL refused by SSRF guard: host='{}' resolved='{}' reason={}",
-                  v.host, v.resolved_ip, v.reason);
-        return;
+    if (!deliveryRunner().submit([per_rule_chat, text, rule_name]() {
+        if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
+
+        auto& db = vms::database::DbManager::getInstance();
+        const std::string bot_token = db.getSetting("telegram_bot_token", "");
+        std::string chat_id = per_rule_chat;
+        if (chat_id.empty()) chat_id = db.getSetting("telegram_chat_id", "");
+
+        if (bot_token.empty() || chat_id.empty()) {
+            LOG_WARN("[alert-delivery] Telegram not configured (bot_token/chat_id missing). Rule '{}' skipped.",
+                     rule_name);
+            return;
+        }
+
+        const std::string url = "https://api.telegram.org/bot" + bot_token + "/sendMessage";
+
+        // Even though api.telegram.org is hardcoded, run through SSRF guard
+        // so /etc/hosts or resolver poisoning can't redirect bot-token POSTs
+        // at LAN. The check is now inside the worker (was on producer thread).
+        auto v = vms::utils::isInternalUrl(url);
+        if (v.internal) {
+            LOG_ERROR("[alert-delivery] Telegram URL refused by SSRF guard: host='{}' resolved='{}' reason={}",
+                      v.host, v.resolved_ip, v.reason);
+            return;
+        }
+
+        nlohmann::json payload;
+        payload["chat_id"]    = chat_id;
+        payload["text"]       = text;
+        payload["parse_mode"] = "Markdown";
+
+        CURL* curl = curl_easy_init();
+        if (!curl) return;
+
+        struct curl_slist* headers = nullptr;
+        struct curl_slist* resolve_list = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        const std::string body = payload.dump();
+        const std::string resolve_entry = vms::utils::buildResolveEntry(v);
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+        if (!resolve_entry.empty()) {
+            resolve_list = curl_slist_append(nullptr, resolve_entry.c_str());
+            curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve_list);
+        }
+
+        CURLcode res = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if (res != CURLE_OK) {
+            LOG_ERROR("[alert-delivery] Telegram POST failed: curl={}", curl_easy_strerror(res));
+        } else if (http_code >= 400) {
+            LOG_WARN("[alert-delivery] Telegram POST returned http={}", http_code);
+        } else {
+            LOG_INFO("[alert-delivery] Telegram delivered to chat {} (rule '{}')", chat_id, rule_name);
+        }
+
+        curl_slist_free_all(headers);
+        if (resolve_list) curl_slist_free_all(resolve_list);
+        curl_easy_cleanup(curl);
+    })) {
+        LOG_THROTTLED_WARN(5000, "[alert-delivery] Telegram queue full, dropping send for rule '{}'", rule_name);
     }
-
-    LOG_INFO("[alert-delivery] Telegram queued to chat {} for rule '{}'", chat_id, rule.name);
-    executeAsyncPost(url, payload.dump(), vms::utils::buildResolveEntry(v));
 }
 
 void deliverAlarmOutput(const CompositeRule& rule, const RuleAction& /*action*/, const RawEvent& event) {
-    auto& db = vms::database::DbManager::getInstance();
-    const std::string url = db.getSetting("alarm_output_url", "");
-    if (url.empty()) {
-        LOG_WARN("[alert-delivery] alarm_output_url not configured; alarm trigger logged only "
-                 "(rule '{}', event {})", rule.name, event.event_id);
-        return;
-    }
-
-    bool is_http  = url.rfind("http://", 0) == 0;
-    bool is_https = url.rfind("https://", 0) == 0;
-    if (!is_http && !is_https) {
-        LOG_ERROR("[alert-delivery] alarm_output_url must be http(s)://. Got: {}", url);
-        return;
-    }
-
+    // alarm_output_url setting read inside the worker (2026-05-15 audit) —
+    // DbManager::getSetting is a real SELECT and the producer thread shouldn't
+    // pay it. URL validation (http/https prefix) also moves into worker since
+    // we'd otherwise need a second DB read on the producer just to validate.
     nlohmann::json payload = {
         {"action",     "alarm_trigger"},
         {"event_id",   event.event_id},
@@ -352,10 +422,59 @@ void deliverAlarmOutput(const CompositeRule& rule, const RuleAction& /*action*/,
         {"rule_name",  rule.name}
     };
 
-    // ALARM_OUTPUT typically points at a LAN relay — SSRF guard would refuse
-    // private destinations, which is exactly what we expect here. Skip it.
-    LOG_INFO("[alert-delivery] Alarm output triggered for event {} → {}", event.event_id, url);
-    executeAsyncPost(url, payload.dump());
+    const std::string rule_name = rule.name;
+    const std::uint64_t event_id = event.event_id;
+
+    if (!deliveryRunner().submit([payload_str = payload.dump(), rule_name, event_id]() {
+        if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
+
+        auto& db = vms::database::DbManager::getInstance();
+        const std::string url = db.getSetting("alarm_output_url", "");
+        if (url.empty()) {
+            LOG_WARN("[alert-delivery] alarm_output_url not configured; alarm trigger logged only "
+                     "(rule '{}', event {})", rule_name, event_id);
+            return;
+        }
+
+        const bool is_http  = url.rfind("http://", 0) == 0;
+        const bool is_https = url.rfind("https://", 0) == 0;
+        if (!is_http && !is_https) {
+            LOG_ERROR("[alert-delivery] alarm_output_url must be http(s)://. Got: {}", url);
+            return;
+        }
+
+        // ALARM_OUTPUT typically points at a LAN relay — SSRF guard would
+        // refuse private destinations, which is exactly what we expect here.
+        // No SSRF check on this path (ssrf_required=false equivalent inline).
+        CURL* curl = curl_easy_init();
+        if (!curl) return;
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload_str.c_str());
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+        CURLcode res = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if (res != CURLE_OK) {
+            LOG_ERROR("[alert-delivery] alarm POST {} failed: curl={}", url, curl_easy_strerror(res));
+        } else if (http_code >= 400) {
+            LOG_WARN("[alert-delivery] alarm POST {} returned http={}", url, http_code);
+        } else {
+            LOG_INFO("[alert-delivery] Alarm output triggered for event {} → {}", event_id, url);
+        }
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    })) {
+        LOG_THROTTLED_WARN(5000, "[alert-delivery] alarm-output queue full, dropping for rule '{}'", rule_name);
+    }
 }
 
 void dispatchChannels(const CompositeRule& rule, const RuleAction& action, const RawEvent& event) {
@@ -400,6 +519,20 @@ void deliverAction(const CompositeRule& rule, const RuleAction& action, const Ra
         case ActionType::LOG:
             break;
     }
+}
+
+nlohmann::json deliveryStats() {
+    auto s = deliveryRunner().stats();
+    return nlohmann::json{
+        {"name",                 s.name},
+        {"worker_count",         s.worker_count},
+        {"max_queue_size",       s.max_queue_size},
+        {"current_queue_depth",  s.current_queue_depth},
+        {"submitted_total",      s.submitted_total},
+        {"dropped_total",        s.dropped_total},
+        {"peak_queue_depth",     s.peak_queue_depth},
+        {"stopping",             s.stopping}
+    };
 }
 
 void shutdownDelivery() {

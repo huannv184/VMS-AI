@@ -1,5 +1,24 @@
 # Architectural Decisions — AI Camera System
 
+## 2026-05-15 alert_delivery hot-path — push DNS + DB into workers; keep one shared pool (defer per-channel pool split)
+
+### Decision: SSRF check (getaddrinfo) and DB settings reads move inside the worker job
+- **Choice**: `deliverWebhook` / `deliverTelegram` / `deliverSMS` / `deliverAlarmOutput` now capture the operator-supplied URL + payload + already-resolved metadata fields on the producer thread, and run `isInternalUrl()` + `DbManager::getSetting()` inside the BackgroundJobRunner worker lambda. Producer thread does only cheap checks (URL prefix, non-empty recipient list, shutdown gate).
+- **Rationale**: pre-fix every event matching a webhook rule paid a blocking `getaddrinfo()` on whichever thread invoked `EventManager::createEvent` — almost always the ZMQ bridge (single thread, drives ALL AI worker output) or a brand event service worker (one per camera). A dead resolver (5s timeout × 2 retries on Windows) becomes a 10s producer stall, and there is exactly one ZMQ bridge thread to share. The producer-side SSRF check was originally there to "refuse before queueing" — but queue capacity (128 slots, drop-on-full) is cheap; producer thread time is expensive. Worker-side refusals just consume a few microseconds of the lambda before returning.
+- **Trade-off**: a worker slot is briefly held on every SSRF-refused job. With 2 workers and 128 queue, even a 100% refusal burst is ~64 jobs/sec × tiny work = sub-millisecond aggregate. Net positive vs producer stall.
+- **Alternative considered**: per-rule URL DNS cache (TTL'd `unordered_map<string, ResolveEntry>`) on the producer side. Rejected for this pass — amortises only on repeat-same-URL bursts and adds a shared map + mutex on every dispatch. Right tool only if profiling proves >100 evals/sec on one rule.
+
+### Decision: One shared BackgroundJobRunner pool, defer per-channel pool split
+- **Choice**: keep the existing single 2-worker / 128-queue `deliveryRunner()` for ALL channels (webhook + SMS + Telegram + alarm-output) instead of splitting per channel class.
+- **Rationale**: pool split is the architecturally right fix for the cascade-failure mode (one stalled webhook stops Twilio + Telegram + alarm relay even though those endpoints are healthy). But the split needs design work — how many pools, sizing, shared-vs-isolated workers, draining policy on shutdown — and naively bumping to 4 pools = 8 threads ambient + complicates `shutdownDelivery`'s join sequence. Moving DNS + DB off the producer thread closes the dominant production failure mode (producer stall blocking event ingestion). Cascade between channels matters at the channel-saturation point, not the event-ingestion point.
+- **Trade-off**: under a sustained burst with a dead webhook, the 2-worker pool still serially times out at 15s each, queueing Twilio/Telegram/email behind. Until split lands, operators mitigate by trimming webhook URLs to known-fast endpoints; new `deliveryStats()` surface exposes `queue_depth` + `dropped_total` so the symptom is visible (was previously invisible — see BUG-ALERT-DROP-VISIBILITY-01).
+- **Why not raise workers to 4 or 8 now**: more workers help only if the bottleneck is parallelism; here the bottleneck is one endpoint × 15s timeout. Two stalled jobs still stall 2 workers; eight workers stall 8 just as well. Real fix is isolation, not parallelism. Punt until isolation lands.
+
+### Decision: Drop visibility = atomic counters on BackgroundJobRunner, exposed via stats endpoint
+- **Choice**: `BackgroundJobRunner` gains three `std::atomic<uint64_t>` counters (`submitted_total`, `dropped_total`, `peak_queue_depth`) and a `current_queue_depth` derived via `jobs_.size()` snapshot. New `stats()` accessor returns a POD struct; `alert_delivery::deliveryStats()` wraps it to JSON; exposed on `GET /api/rules/engine/stats` (admin scope, joins existing RuleEngine `getStatistics()` output).
+- **Rationale**: pre-fix the only signal of dropped alerts was a throttled WARN log line every 5s. Operators cannot post-hoc answer "did we lose alerts during yesterday's burst?" Counters give them an exact answer + a deltas-over-time series via repeated polls. Atomic loads are wait-free, no contention with the producer.
+- **Trade-off**: 24 bytes of state per BackgroundJobRunner instance + 2 atomic-increments per submit (lock-amortised; already under queue mutex). Cost-free in steady state.
+
 ## 2026-05-14 ReID gallery persistence — periodic flush, not per-mutation write
 
 ### Decision: 60s dirty-flag flush thread, not per-mutation SQL writes
