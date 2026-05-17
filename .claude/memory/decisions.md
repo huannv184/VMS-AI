@@ -1,5 +1,37 @@
 # Architectural Decisions — AI Camera System
 
+## 2026-05-17 alert_delivery per-channel pool split — close BUG-ALERT-CASCADE-POOL-01
+
+### Decision: 4 independent BackgroundJobRunner pools, one per channel class
+- **Choice**: replace the single `deliveryRunner()` (2/128) with 4 channel-scoped pools — `delivery-webhook` (4/256), `delivery-sms` (2/128), `delivery-telegram` (2/128), `delivery-alarm` (1/64). Each `deliverX()` submits to its own pool; `postViaWorker()` takes a runner reference so the shared SSRF+curl body still works for any operator-URL channel.
+- **Rationale**: pre-split, a single stalled webhook held both workers for up to 25 s (10 s connect + 15 s libcurl timeout) and queued SMS/Telegram/alarm-relay behind it even when those endpoints were healthy. Failure-isolation analysis: webhook, SMS, Telegram, and alarm have unrelated downstream SLAs and unrelated failure modes (FW packet drop vs Twilio rate-limit vs Telegram DNS vs LAN relay unplugged). When channels have unrelated dependencies, pool-per-channel is the natural unit of isolation — no math required, isolation is by-construction (separate mutex / cv / queue / threads).
+- **Trade-off**: +7 worker threads (9 instead of 2) × 1 MB stack = ~7 MB resident, plus ~30 KB queue slots and a slightly larger JSON in `/api/rules/stats` `delivery` block. Negligible vs the cascade-drop risk it eliminates.
+- **Alternative considered**: tune the single pool larger (e.g. 8 workers / 512 queue). Rejected — solves burst absorption but does NOT solve cascade. 8 workers all stuck on the same dead webhook still block the other 3 channels; bigger queue just delays the visible drop by a few seconds. Pool boundary is the right axis.
+- **Alternative considered**: keep one pool, add per-channel queue depth quotas with priority eviction. Rejected — invents a custom queue policy when separate queues already deliver the same guarantees with stock primitives.
+
+### Decision: Sizing 4/2/2/1 hardcoded for now; config-driven sizing deferred to phase 2
+- **Choice**: pool sizes are constants in `alert_delivery.cpp`. No `backend.yaml` config knob yet. Operators tune by editing source + rebuild for now.
+- **Rationale**: sizing is anchored to KNOWN bottlenecks, not guesses:
+  - Webhook 4/256 — operator URL with unknown SLA; more workers absorb parallel stalls, bigger queue absorbs burst.
+  - SMS 2/128 — Twilio long-code rate-limit ~1 msg/s per number is the hard ceiling; more workers just queue 429s.
+  - Telegram 2/128 — api.telegram.org per-chat rate ~30 msg/s; 2 workers covers it.
+  - Alarm 1/64 — LAN endpoint, ms-latency; small queue is intentional, stale alarm = useless.
+  Each number has a defensible upper bound from vendor docs / network class — not gut feel. Operator tuning becomes useful only when drop counters reveal a different bottleneck profile.
+- **Trade-off**: a config knob would let operators react without code change. Punted because the cost of recompiling for a sizing tweak is small (single static instance, no migration), and adding config means parse/validate code + a deployment doc explaining what to set. Phase 2 follow-up: `alert_delivery.{webhook,sms,telegram,alarm}.{workers,queue}` block with defaults matching the hardcoded values.
+- **Alternative considered**: env-var override (e.g. `VMS_ALERT_WEBHOOK_WORKERS=8`). Rejected — env vars are a poor fit for a tuning matrix where 4 channels × 2 fields = 8 knobs; yaml block is the right shape when phase 2 lands.
+
+### Decision: Aggregate roll-up in delivery stats is permanent, not transitional
+- **Choice**: `/api/rules/stats` `delivery` block returns `{webhook: {...}, sms: {...}, telegram: {...}, alarm: {...}, aggregate: {submitted_total, dropped_total, peak_queue_depth}}`. The `aggregate` block stays even after per-channel adoption — it is NOT a backward-compat shim.
+- **Rationale**: operators routinely want "how many alerts did we lose total" as a single number alongside the per-channel breakdown. Computing it client-side from 4 sub-blocks adds JS code without value. Aggregate `peak_queue_depth` uses `max` across pools (not sum) because queues are independent — "what's the deepest any one queue got" is the actionable number; sum is meaningless.
+- **Trade-off**: the aggregate fields are derived (computed each call). Cost is 4 atomic loads + 3 adds + 1 max — sub-microsecond. Cheaper than asking every dashboard to do the same arithmetic.
+- **Alternative considered**: separate `/api/rules/stats/delivery` endpoint with one block per pool, no roll-up. Rejected — adds an endpoint + auth route for what is a 5-line synthesis.
+
+### Decision: Retry policy deferred to a later pass
+- **Choice**: keep current fire-and-forget semantics (log + drop on curl error / 4xx/5xx). No retries on any channel.
+- **Rationale**: retry doubles the worker-hold time per slow endpoint, which directly competes with the queue-depth budget we just established. Without baseline failure-rate data (per channel, per endpoint class), picking retry counts is guesswork that risks making queue overflows WORSE under burst. Pool split + drop visibility ships first; retry design waits until counters show a steady-state failure pattern.
+- **Trade-off**: transient webhook 503 / Telegram 502 / Twilio temporary network blip will drop instead of retrying. Operators see this as a counter tick rather than recovery — acceptable for an alert pipeline where alarm rules typically refire on the next event tick anyway.
+- **Future shape** (when data justifies): webhook 1 retry / 2 s backoff, SMS NO retry (Twilio bills per request — retry risks double-send), Telegram 1 retry / 5 s, Alarm 2 retries / 500 ms (LAN should succeed fast, retry covers transient blip).
+
 ## 2026-05-15 WS subscribe RBAC — per-socket cache populated at AUTH; admin + camera-0 bypass
 
 ### Decision: Cache the allowed-camera set on the socket at AUTH time, not on every subscribe
@@ -90,7 +122,7 @@
 - **Trade-off**: a worker slot is briefly held on every SSRF-refused job. With 2 workers and 128 queue, even a 100% refusal burst is ~64 jobs/sec × tiny work = sub-millisecond aggregate. Net positive vs producer stall.
 - **Alternative considered**: per-rule URL DNS cache (TTL'd `unordered_map<string, ResolveEntry>`) on the producer side. Rejected for this pass — amortises only on repeat-same-URL bursts and adds a shared map + mutex on every dispatch. Right tool only if profiling proves >100 evals/sec on one rule.
 
-### Decision: One shared BackgroundJobRunner pool, defer per-channel pool split
+### Decision: One shared BackgroundJobRunner pool, defer per-channel pool split — REVISED 2026-05-17, see "alert_delivery per-channel pool split" below
 - **Choice**: keep the existing single 2-worker / 128-queue `deliveryRunner()` for ALL channels (webhook + SMS + Telegram + alarm-output) instead of splitting per channel class.
 - **Rationale**: pool split is the architecturally right fix for the cascade-failure mode (one stalled webhook stops Twilio + Telegram + alarm relay even though those endpoints are healthy). But the split needs design work — how many pools, sizing, shared-vs-isolated workers, draining policy on shutdown — and naively bumping to 4 pools = 8 threads ambient + complicates `shutdownDelivery`'s join sequence. Moving DNS + DB off the producer thread closes the dominant production failure mode (producer stall blocking event ingestion). Cascade between channels matters at the channel-saturation point, not the event-ingestion point.
 - **Trade-off**: under a sustained burst with a dead webhook, the 2-worker pool still serially times out at 15s each, queueing Twilio/Telegram/email behind. Until split lands, operators mitigate by trimming webhook URLs to known-fast endpoints; new `deliveryStats()` surface exposes `queue_depth` + `dropped_total` so the symptom is visible (was previously invisible — see BUG-ALERT-DROP-VISIBILITY-01).

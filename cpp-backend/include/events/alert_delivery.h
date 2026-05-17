@@ -29,25 +29,33 @@ namespace vms::events {
 struct CompositeRule;
 struct RuleAction;
 
-// All delivery is async (queued to a shared bounded background runner with
-// drop-on-full). Safe to call from any thread, including the
+// All delivery is async (queued to per-channel bounded background runners
+// with drop-on-full). Safe to call from any thread, including the
 // EventManager::createEvent hot path. Returns immediately; failures are
-// logged inside the worker.
+// logged inside the worker. Per-channel pools (webhook / sms / telegram /
+// alarm) are independent — a stalled webhook endpoint does NOT delay
+// telegram/SMS/alarm delivery (2026-05-17 BUG-ALERT-CASCADE-POOL-01 fix).
 void deliverAction(const CompositeRule& rule,
                    const RuleAction& action,
                    const RawEvent& event);
 
-// Snapshot of the delivery runner's queue counters — submitted_total,
-// dropped_total (queue-full OR submit-during-shutdown), peak_queue_depth,
-// current_queue_depth, worker_count, max_queue_size. Surfaced on
-// `GET /api/rules/stats` so operators can answer "did we lose alerts during
-// last night's burst?" — was previously invisible (one throttled WARN log
-// per 5s with no after-the-fact counter). Wait-free: pure atomic loads.
+// Snapshot of per-channel runner counters. Returns:
+//   { webhook: { name, worker_count, max_queue_size, current_queue_depth,
+//                submitted_total, dropped_total, peak_queue_depth, stopping },
+//     sms:      { … same shape … },
+//     telegram: { … },
+//     alarm:    { … },
+//     aggregate:{ submitted_total, dropped_total, peak_queue_depth } }
+// `aggregate` is a roll-up (sum for totals, max for peak) so dashboards
+// have a single "how many alerts did we drop" number alongside the
+// per-channel breakdown. Surfaced on `GET /api/rules/stats` (ALERT_READ).
+// Wait-free w.r.t. producer hot path — pure atomic loads + try_lock.
 nlohmann::json deliveryStats();
 
-// Stop the internal background runner. Call once during graceful shutdown
-// AFTER the last possible producer (EventManager / RuleEngine / brand
-// event services) has stopped.
+// Stop all per-channel runners. Call once during graceful shutdown AFTER
+// the last possible producer (EventManager / RuleEngine / brand event
+// services) has stopped. Pools are independent — calls run sequentially
+// but each pool's workers drain in parallel.
 void shutdownDelivery();
 
 } // namespace vms::events

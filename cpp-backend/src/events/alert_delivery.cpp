@@ -29,12 +29,39 @@ namespace vms::events {
 
 namespace {
 
-vms::utils::BackgroundJobRunner& deliveryRunner() {
-    // 2 workers / 128 queue mirrors the AlertManager + AlertRouter pools we
-    // are replacing. Drop-on-full keeps the producer hot path bounded; if a
-    // remote endpoint stalls (15s libcurl timeout), workers free up before
-    // the queue fills under any reasonable event rate.
-    static vms::utils::BackgroundJobRunner instance("alert-delivery", 2, 128);
+// 2026-05-17 BUG-ALERT-CASCADE-POOL-01 fix: per-channel pools. A single
+// stalled webhook used to hold both workers of the shared 2/128 pool for up
+// to 25 s (10 s connect + 15 s total libcurl timeout), queueing SMS / Telegram
+// / alarm-relay sends behind it even when those endpoints were healthy. Each
+// channel now drains independently:
+//   - webhook  4/256 : operator-supplied URL, highest stall risk; bigger
+//                      queue absorbs burst, more workers absorb parallel stalls.
+//   - sms      2/128 : Twilio per-long-code rate-limit ~1 msg/s is the real
+//                      bottleneck — more workers just queue more 429s.
+//   - telegram 2/128 : api.telegram.org per-chat ~30 msg/s; 2 workers covers it.
+//   - alarm    1/64  : LAN relay, ms-latency typical. Small queue is intentional:
+//                      a stale alarm is useless, drop is the right semantic.
+// EMAIL stays on the existing `email-sender` pool (utils/email_sender.cpp);
+// UI broadcasts go through CameraStreamManager (Qt queued), neither shares
+// state with these.
+//
+// Shutdown: 4 independent pools, no cross-pool wait → no deadlock. Each
+// pool's worker lambdas already gate on vms::core::shutting_down so in-flight
+// jobs short-circuit; new submits after shutdown are rejected and counted.
+vms::utils::BackgroundJobRunner& webhookRunner() {
+    static vms::utils::BackgroundJobRunner instance("delivery-webhook", 4, 256);
+    return instance;
+}
+vms::utils::BackgroundJobRunner& smsRunner() {
+    static vms::utils::BackgroundJobRunner instance("delivery-sms", 2, 128);
+    return instance;
+}
+vms::utils::BackgroundJobRunner& telegramRunner() {
+    static vms::utils::BackgroundJobRunner instance("delivery-telegram", 2, 128);
+    return instance;
+}
+vms::utils::BackgroundJobRunner& alarmRunner() {
+    static vms::utils::BackgroundJobRunner instance("delivery-alarm", 1, 64);
     return instance;
 }
 
@@ -70,12 +97,18 @@ std::string readString(const nlohmann::json& meta, const char* key, const std::s
 // ZMQ bridge / brand-event-service threads have NO other thread to ingest
 // events while they wait. Burning a worker slot on the few microseconds of a
 // refused job is the cheaper trade.
-void postViaWorker(const std::string& url,
+//
+// Caller picks the runner so per-channel pools stay isolated (2026-05-17
+// BUG-ALERT-CASCADE-POOL-01 split). Webhook goes to webhookRunner(); alarm
+// relay has its own inline submit further down because the worker body reads
+// settings the webhook path does not.
+void postViaWorker(vms::utils::BackgroundJobRunner& runner,
+                   const std::string& url,
                    const std::string& payload,
                    bool ssrf_required) {
     if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
-    if (!deliveryRunner().submit([url, payload, ssrf_required]() {
+    if (!runner.submit([url, payload, ssrf_required]() {
         if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
         std::string resolve_entry;
@@ -121,7 +154,7 @@ void postViaWorker(const std::string& url,
         if (resolve_list) curl_slist_free_all(resolve_list);
         curl_easy_cleanup(curl);
     })) {
-        LOG_THROTTLED_WARN(5000, "[alert-delivery] queue full, dropping POST to {}", url);
+        LOG_THROTTLED_WARN(5000, "[alert-delivery] webhook queue full, dropping POST to {}", url);
     }
 }
 
@@ -197,7 +230,7 @@ void deliverSMS(const CompositeRule& rule, const RuleAction& action, const RawEv
     // reading Twilio settings once. Pre-fix this enqueued N jobs each
     // capturing sid/token/from by value — same effective serial behaviour
     // (2 workers, Twilio rate-limit) at the cost of 3 string copies × N.
-    if (!deliveryRunner().submit([to_list, body, rule_name]() {
+    if (!smsRunner().submit([to_list, body, rule_name]() {
         if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
         auto& db = vms::database::DbManager::getInstance();
@@ -291,7 +324,7 @@ void deliverWebhook(const CompositeRule& rule, const RuleAction& action, const R
     if (!event.metadata.is_null()) payload["metadata"] = event.metadata;
 
     LOG_INFO("[alert-delivery] WEBHOOK queued to {} (rule '{}')", url, rule.name);
-    postViaWorker(url, payload.dump(), /*ssrf_required=*/true);
+    postViaWorker(webhookRunner(), url, payload.dump(), /*ssrf_required=*/true);
 }
 
 void deliverUINotification(const CompositeRule& rule, const RuleAction& /*action*/, const RawEvent& event) {
@@ -335,7 +368,7 @@ void deliverTelegram(const CompositeRule& rule, const RuleAction& action, const 
 
     const std::string rule_name = rule.name;
 
-    if (!deliveryRunner().submit([per_rule_chat, text, rule_name]() {
+    if (!telegramRunner().submit([per_rule_chat, text, rule_name]() {
         if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
         auto& db = vms::database::DbManager::getInstance();
@@ -425,7 +458,7 @@ void deliverAlarmOutput(const CompositeRule& rule, const RuleAction& /*action*/,
     const std::string rule_name = rule.name;
     const std::uint64_t event_id = event.event_id;
 
-    if (!deliveryRunner().submit([payload_str = payload.dump(), rule_name, event_id]() {
+    if (!alarmRunner().submit([payload_str = payload.dump(), rule_name, event_id]() {
         if (vms::core::shutting_down.load(std::memory_order_acquire)) return;
 
         auto& db = vms::database::DbManager::getInstance();
@@ -521,8 +554,8 @@ void deliverAction(const CompositeRule& rule, const RuleAction& action, const Ra
     }
 }
 
-nlohmann::json deliveryStats() {
-    auto s = deliveryRunner().stats();
+namespace {
+nlohmann::json runnerStatsJson(const vms::utils::BackgroundJobRunnerStats& s) {
     return nlohmann::json{
         {"name",                 s.name},
         {"worker_count",         s.worker_count},
@@ -534,9 +567,53 @@ nlohmann::json deliveryStats() {
         {"stopping",             s.stopping}
     };
 }
+} // namespace
 
+// Returns one block per per-channel pool plus an `aggregate` roll-up so
+// pre-split dashboards still see one top-level submitted/dropped/peak triple.
+// Schema change vs pre-2026-05-17: was flat (single pool's fields at top
+// level), now nested. The `aggregate` block is permanent — operators want a
+// single "total alerts lost" number alongside the per-channel breakdown.
+nlohmann::json deliveryStats() {
+    const auto webhook  = webhookRunner().stats();
+    const auto sms      = smsRunner().stats();
+    const auto telegram = telegramRunner().stats();
+    const auto alarm    = alarmRunner().stats();
+
+    // Peak is monotonic per pool; aggregate peak takes the max across pools
+    // (not the sum) because the four queues are independent — a single
+    // event cannot occupy a slot in more than one pool at the same time
+    // for a given channel, and we want "what's the deepest any one queue
+    // got" rather than "what's the sum of high-watermarks".
+    const std::uint64_t agg_submitted = webhook.submitted_total + sms.submitted_total +
+                                        telegram.submitted_total + alarm.submitted_total;
+    const std::uint64_t agg_dropped   = webhook.dropped_total + sms.dropped_total +
+                                        telegram.dropped_total + alarm.dropped_total;
+    const std::uint64_t agg_peak = std::max({webhook.peak_queue_depth, sms.peak_queue_depth,
+                                             telegram.peak_queue_depth, alarm.peak_queue_depth});
+
+    return nlohmann::json{
+        {"webhook",  runnerStatsJson(webhook)},
+        {"sms",      runnerStatsJson(sms)},
+        {"telegram", runnerStatsJson(telegram)},
+        {"alarm",    runnerStatsJson(alarm)},
+        {"aggregate", {
+            {"submitted_total",  agg_submitted},
+            {"dropped_total",    agg_dropped},
+            {"peak_queue_depth", agg_peak}
+        }}
+    };
+}
+
+// Independent shutdowns — pools share no state. Order doesn't matter; each
+// call is blocking until its workers join. Total wall time ≈ max(per-pool
+// drain), not sum, because workers run in parallel even though the
+// shutdown() calls themselves are sequential.
 void shutdownDelivery() {
-    deliveryRunner().shutdown();
+    webhookRunner().shutdown();
+    smsRunner().shutdown();
+    telegramRunner().shutdown();
+    alarmRunner().shutdown();
 }
 
 } // namespace vms::events

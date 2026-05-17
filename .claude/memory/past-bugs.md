@@ -1,5 +1,35 @@
 # Past Bugs — AI Camera System
 
+## 2026-05-17 BUG-ALERT-CASCADE-POOL-01 closed — per-channel delivery pools
+
+- **Files**: `cpp-backend/src/events/alert_delivery.cpp` (4 separate `BackgroundJobRunner` instances replacing the single `deliveryRunner()`; `postViaWorker` takes a runner reference; `deliveryStats()` returns nested JSON with `aggregate` roll-up; `shutdownDelivery()` shuts down all 4), `cpp-backend/include/events/alert_delivery.h` (doc comments updated for the new shape).
+- **Bug**: pre-fix, all 4 network channels (WEBHOOK / SMS / TELEGRAM / ALARM_OUTPUT) submitted into a SINGLE shared `BackgroundJobRunner` (2 workers / 128 queue). One stalled webhook endpoint (10s connect + 15s total = up to 25s libcurl hold per slot) could occupy BOTH workers, queueing healthy SMS / Telegram / alarm-relay sends behind it. At burst rates (~10 evt/sec aggregate) the 128-slot queue overflowed in ~12 s and the runner shed ~398 alerts/sec across the cascade — all four channels silently dropping while only one was actually broken. EMAIL was already isolated on a separate `email-sender` pool, and UI broadcasts go through CameraStreamManager (Qt path) — so the cascade was specifically among the 4 outbound-HTTP channels.
+- **Detection**: 2026-05-15 alert_delivery hot-path audit. Deferred (logged HIGH in audit memo + `decisions.md`) until the new drop counter (BUG-ALERT-DROP-VISIBILITY-01 fix, same audit) had run long enough for operators to confirm cascade was the real failure mode rather than DNS / DB I/O on the producer (BUG-ALERT-DNS-PRODUCER-01 + BUG-ALERT-DB-PRODUCER-01 fixes already shipped). Closed in 2026-05-17 design-then-implement session.
+- **Fix**: split into 4 per-channel singleton pools, sized by each channel's real bottleneck:
+  - `delivery-webhook  4/256`: operator-supplied URL = highest stall risk + unknown SLA. 4 workers absorb multiple parallel stalls; 256 queue absorbs burst.
+  - `delivery-sms      2/128`: Twilio long-code rate-limit is ~1 msg/s/number — more workers just queue 429s. 2 covers it.
+  - `delivery-telegram 2/128`: api.telegram.org rate-limit ~30 msg/s/chat. 2 workers covers it.
+  - `delivery-alarm    1/64`:  LAN endpoint, ms-latency typical. Small queue is intentional — stale alarm is useless, drop is the right semantic.
+  Steady-state cost: +7 threads (9 instead of 2) × 1 MB stack = ~7 MB, plus ~30 KB queue slots. Acceptable on any production server.
+- **Concurrency notes**: pools share no state (no global mutex, no shared queue). `postViaWorker(BackgroundJobRunner&, …)` now takes the runner by reference so the same body serves webhook today and any future operator-URL channel that needs SSRF guard + DNS pin. SMS / Telegram / Alarm each have inline `submit` because each worker body reads channel-specific DB settings. `shutdownDelivery()` calls 4 `shutdown()` sequentially — pools are independent, no deadlock possible, total wall time ≈ max(per-pool drain) since workers parallelise across pools.
+- **Schema change visible to operators**: `GET /api/rules/stats` `delivery` block was a flat object with `{name, worker_count, max_queue_size, current_queue_depth, submitted_total, dropped_total, peak_queue_depth, stopping}`; now nested as `{webhook: {…}, sms: {…}, telegram: {…}, alarm: {…}, aggregate: {submitted_total, dropped_total, peak_queue_depth}}`. The `aggregate` block is permanent — operators want a single "total alerts dropped" number alongside the per-channel breakdown. Aggregate `peak_queue_depth` is `max` across pools (not sum) since pool queues are independent. Frontend grep confirmed `getRuleStats()` is exposed in `apiClient.js` but unused by any view, so no FE changes needed.
+- **Failure isolation post-fix** (verified by-construction, since pools share no state):
+
+  | Failure | Pre-fix blast | Post-fix blast |
+  |---|---|---|
+  | Webhook endpoint dead (10-25 s timeouts) | All 4 channels cascade-drop | Webhook only |
+  | Twilio rate-limit burst | All 4 queue behind SMS | SMS queue grows alone |
+  | Telegram DNS down | All 4 queue behind Telegram | Telegram only |
+  | Alarm relay unplugged | All 4 queue behind alarm | Alarm queue (small) drops fast — correct semantic |
+  | 100 evt/s burst, all 4 healthy | Shared queue overflows | Each queue absorbs independently |
+
+- **What this does NOT close** (deferred phase-2 items, documented in decisions.md):
+  - **Config-driven sizing**: pool sizes are hardcoded. A `backend.yaml` `alert_delivery.{webhook,sms,telegram,alarm}.{workers,queue}` block would let operators tune after observing real drop patterns. Defaults match the current hardcoded values, so this is a follow-up convenience, not load-bearing.
+  - **Per-channel retry policy**: still fire-and-forget with log + drop. Webhook 1 retry / 2 s, SMS NO retry (Twilio bills per request, dedup risk), Telegram 1 retry / 5 s, Alarm 2 retry / 500 ms — punted until burst data shows failure rate justifies the worker-hold cost.
+  - **Per-rule URL DNS cache**: amortises repeat-same-URL bursts. Defer until profiling shows >100 evals/sec on one rule.
+- **Verification**: `cmake --build` clean, `ctest -C Release` 9/9 pass, controller-lint guard 0 violations. No new test added for cascade-isolation specifically — isolation is by-construction (separate `BackgroundJobRunner` instances each with own mutex/cv/queue/threads). Drop counters per pool expose the symptom for ops verification.
+- **Detection lesson**: shared worker pools across channels with different SLA / failure profiles is a hidden serialisation point. When designing async fan-out, ask "if one downstream is dead, do the others still drain?" If the answer requires reasoning about pool sizing vs timeout × queue-depth math, isolate the pools instead. Pool-per-channel is the natural unit of failure isolation when channels have unrelated downstream dependencies.
+
 ## 2026-05-17 BUG-WS-GLOBAL-FANOUT-01 closed — broadcast-side scope filter on camera-0 fan-out
 
 - **Files**: `cpp-backend/src/streaming/camera_stream_manager.cpp` (anonymous-namespace `isSocketAllowedForCamera()` helper, filter loop in `broadcastEvent` global fan-out, refreshed comment on `g_allowed_cameras`).
