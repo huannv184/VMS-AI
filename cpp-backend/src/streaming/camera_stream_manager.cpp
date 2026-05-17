@@ -27,20 +27,43 @@ namespace {
 
 // 2026-05-15 WS RBAC enforcement: per-socket allowed-camera cache, populated
 // at AUTH success. Admins (role_id == 1) and auth-disabled mode bypass this
-// map entirely via the vms_is_admin Qt property. Non-admins:
-//   - Empty allowed set → only camera_id=0 (global) subscribe permitted.
+// map entirely (their socket is intentionally NEVER inserted). Non-admins:
+//   - Empty allowed set → only camera_id=0 (global) subscribe permitted; no
+//     per-camera events leak via the camera-0 fan-out (see broadcastEvent).
 //   - Non-empty allowed set → subscribe to camera_id in the set OR =0 only.
-// Camera 0 (global) is intentionally allowed for any authed user — events
-// broadcast to camera 0 still contain camera_id metadata; subscriber-side
-// filtering on that field is a separate pass (BUG-WS-GLOBAL-FANOUT-01,
-// see decisions.md). This pass closes the direct-subscribe-and-stream
-// data leak; the indirect global-event leak remains documented.
+//
+// The admin/auth-disabled bypass is encoded by ABSENCE from the map — see
+// isSocketAllowedForCamera below. We deliberately avoid Qt property reads
+// from broadcast threads (QObject::property is not formally thread-safe).
 //
 // Cleanup: socketDisconnected removes the entry. The map is keyed by raw
 // QWebSocket* — the pointer is stable for the socket's lifetime, never
 // reused while alive (Qt::deleteLater fires after we erase).
 std::unordered_map<QWebSocket*, std::unordered_set<int>> g_allowed_cameras;
 std::mutex g_allowed_cameras_mutex;
+
+// 2026-05-17 BUG-WS-GLOBAL-FANOUT-01: broadcast-side scope check for the
+// camera-0 fan-out. Same map, same mutex — but called from arbitrary
+// producer threads (EventManager, AiEventProcessor, ZmqEventBridge, alert
+// delivery workers) so it MUST NOT touch Qt properties.
+//
+// Contract: returns true if the socket should receive an event tagged with
+// `camera_id`. Admin / auth-disabled sockets are NEVER in the map and are
+// therefore allowed unconditionally. Non-admin sockets are filtered by
+// their cached allowed set.
+//
+// Pre-AUTH sockets are also absent from the map but they cannot reach the
+// global subscriber list (camera_clients_[0]) because subscribe requires
+// AUTH success first — so the "absent ⟹ allow" branch is never reached
+// from a pre-AUTH socket via this path.
+inline bool isSocketAllowedForCamera(QWebSocket* socket, int camera_id) {
+    if (!socket) return false;
+    if (camera_id == 0) return true; // system-wide event, no scope filter
+    std::lock_guard<std::mutex> alock(g_allowed_cameras_mutex);
+    auto it = g_allowed_cameras.find(socket);
+    if (it == g_allowed_cameras.end()) return true; // admin / auth-disabled
+    return it->second.count(camera_id) > 0;
+}
 
 } // namespace
 
@@ -727,15 +750,51 @@ void CameraStreamManager::broadcastFmp4Fragment(
 void CameraStreamManager::broadcastEvent(int camera_id, const nlohmann::json& event) {
     QString msg = QString::fromStdString(event.dump());
 
-    // Camera specific
+    // Camera-specific subscribers. RBAC enforced at subscribe time
+    // (g_allowed_cameras populated at AUTH success), so anyone in this set
+    // already has the camera in their scope. No re-check needed.
     if (camera_id != 0) {
         for (const auto& client : snapshotClients(camera_id)) {
             sendText(client.socket, msg);
         }
     }
 
-    // Global listeners
-    for (const auto& client : snapshotClients(0)) {
+    // Global listeners (subscribed to camera_id=0). Camera-0 subscribe is
+    // permitted for any authed user (system events + audit notifications);
+    // therefore for per-camera events fanning out here we MUST re-check
+    // each recipient's allowed-set on the broadcast side, or non-admin
+    // users would receive every camera's events via the global channel.
+    // System-wide events (camera_id == 0 at the source) bypass the filter.
+    // BUG-WS-GLOBAL-FANOUT-01 closed 2026-05-17.
+    auto global_clients = snapshotClients(0);
+    if (camera_id == 0) {
+        for (const auto& client : global_clients) {
+            sendText(client.socket, msg);
+        }
+        return;
+    }
+
+    // Pre-compute allowed recipients under one mutex hold; send outside.
+    // sendText is QueuedConnection so it must NOT be called under the
+    // g_allowed_cameras_mutex (the queued lambda runs on the socket's
+    // thread which can in turn try to AUTH/disconnect and grab the same
+    // mutex — keep send strictly after release).
+    std::vector<ClientInfo> allowed;
+    allowed.reserve(global_clients.size());
+    {
+        std::lock_guard<std::mutex> alock(g_allowed_cameras_mutex);
+        for (const auto& client : global_clients) {
+            QWebSocket* raw = client.socket.data();
+            if (!raw) continue;
+            auto it = g_allowed_cameras.find(raw);
+            if (it == g_allowed_cameras.end()) {
+                allowed.push_back(client); // admin / auth-disabled
+            } else if (it->second.count(camera_id) > 0) {
+                allowed.push_back(client);
+            }
+        }
+    }
+    for (const auto& client : allowed) {
         sendText(client.socket, msg);
     }
 }
