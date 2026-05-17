@@ -109,6 +109,14 @@ public:
         int ping_timeout_sec = 10;
         int max_message_size_mb = 10;
         int update_interval_ms = 100;
+        // 2026-05-17 WS observability trifecta: caps + applied msg size cap.
+        // Both caps default to "off" (0) so existing deployments aren't
+        // suddenly rejecting connections after a binary upgrade — operators
+        // opt in by setting non-zero values in backend.yaml. Reasonable
+        // starting points: global=200, per_ip=10 for a typical control-room
+        // deployment; raise both for high-density videowall mosaics.
+        int max_connections_global = 0;   // 0 = unlimited
+        int max_connections_per_ip = 0;   // 0 = unlimited
     };
     
     // AI Server configuration

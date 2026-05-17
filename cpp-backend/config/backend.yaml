@@ -82,8 +82,18 @@ websocket:
   heartbeat_interval_sec: 30
   ping_interval_sec: 20
   ping_timeout_sec: 10
-  max_message_size_mb: 10
-  update_interval_ms: 100  # Metadata update interval
+  max_message_size_mb: 10            # applied to QWebSocket::setMaxAllowedIncomingMessageSize
+  update_interval_ms: 100            # Metadata update interval
+
+  # 2026-05-17 WS DoS hardening — both default 0 (= unlimited) so a binary
+  # upgrade does not suddenly reject connections. Set non-zero per deployment:
+  #   max_connections_global: 200    # cap total concurrent WS sockets
+  #   max_connections_per_ip: 10     # cap concurrent sockets per source IP
+  # When set, a connection over the cap is closed with CloseCodePolicyViolated
+  # at accept-time and counted in /api/rules/stats websocket.conn_cap_rejected_total.
+  # See ws_observability_2026_05_17 memo for sizing guidance.
+  max_connections_global: 0
+  max_connections_per_ip: 0
 
 # ============================================================================
 # AI SERVER INTEGRATION (C++ ai-server via ZMQ)

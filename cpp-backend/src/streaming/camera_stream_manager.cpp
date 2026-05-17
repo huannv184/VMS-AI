@@ -42,6 +42,72 @@ namespace {
 std::unordered_map<QWebSocket*, std::unordered_set<int>> g_allowed_cameras;
 std::mutex g_allowed_cameras_mutex;
 
+// 2026-05-17 WS observability trifecta — atomic counters + per-IP gauge map.
+// Counter writes happen on the Qt thread (server's owning thread for
+// onNewConnection / socketDisconnected / processTextMessage), but the
+// `connectionStats()` reader can be invoked from any thread (HTTP handler
+// inside Crow worker pool). All counters are atomic so the read path is
+// wait-free; only the per-IP map needs a mutex (writes from Qt thread,
+// occasional snapshot reads from HTTP thread).
+std::atomic<std::uint64_t> g_conn_total{0};
+std::atomic<std::uint64_t> g_conn_current{0};     // gauge
+std::atomic<std::uint64_t> g_conn_peak{0};        // monotonic max(current)
+std::atomic<std::uint64_t> g_authed_total{0};
+std::atomic<std::uint64_t> g_auth_failed_total{0};
+std::atomic<std::uint64_t> g_ticket_replay_total{0};
+std::atomic<std::uint64_t> g_preauth_timeout_total{0};
+std::atomic<std::uint64_t> g_conn_cap_rejected_total{0};
+std::atomic<std::uint64_t> g_disconnects_total{0};
+
+std::unordered_map<std::string, int> g_per_ip_count;
+std::mutex g_per_ip_mutex;
+
+// Try to reserve a connection slot under the configured caps. Returns true
+// if accepted (and per-IP count + current gauge are incremented atomically
+// with the cap check). false on rejection — caller closes the socket without
+// further bookkeeping. Both caps treated as "unlimited" when configured ≤ 0.
+//
+// Atomicity: the mutex covers BOTH the per-IP map mutation AND the global
+// gauge increment, so a flurry of simultaneous accepts can't temporarily
+// exceed the cap by racing between "load current" and "increment current".
+bool tryReserveConnSlot(const std::string& ip,
+                        int max_global,
+                        int max_per_ip,
+                        std::string& reject_reason) {
+    std::lock_guard<std::mutex> lock(g_per_ip_mutex);
+    if (max_global > 0 &&
+        g_conn_current.load(std::memory_order_relaxed) >= static_cast<std::uint64_t>(max_global)) {
+        reject_reason = "global cap (" + std::to_string(max_global) + ")";
+        return false;
+    }
+    auto& per = g_per_ip_count[ip];
+    if (max_per_ip > 0 && per >= max_per_ip) {
+        reject_reason = "per-IP cap (" + std::to_string(max_per_ip) + ", ip=" + ip + ")";
+        // Don't leave an entry with count=0 behind on a rejection — keep map clean.
+        if (per == 0) g_per_ip_count.erase(ip);
+        return false;
+    }
+    ++per;
+    const std::uint64_t now_current = g_conn_current.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Best-effort peak via CAS loop. Atomic-only — never blocks.
+    std::uint64_t prev_peak = g_conn_peak.load(std::memory_order_relaxed);
+    while (now_current > prev_peak &&
+           !g_conn_peak.compare_exchange_weak(prev_peak, now_current,
+                                              std::memory_order_relaxed)) {
+        // retry with refreshed prev_peak
+    }
+    return true;
+}
+
+void releaseConnSlot(const std::string& ip) {
+    std::lock_guard<std::mutex> lock(g_per_ip_mutex);
+    auto it = g_per_ip_count.find(ip);
+    if (it != g_per_ip_count.end()) {
+        if (--it->second <= 0) g_per_ip_count.erase(it);
+    }
+    g_conn_current.fetch_sub(1, std::memory_order_relaxed);
+}
+
 // 2026-05-17 BUG-WS-GLOBAL-FANOUT-01: broadcast-side scope check for the
 // camera-0 fan-out. Same map, same mutex — but called from arbitrary
 // producer threads (EventManager, AiEventProcessor, ZmqEventBridge, alert
@@ -175,13 +241,55 @@ void CameraStreamManager::onNewConnection() {
     if (!socket) {
         return;
     }
+
+    const std::string peer_ip = socket->peerAddress().toString().toStdString();
+    const auto& ws_cfg = vms::Config::getInstance().getWebSocketConfig();
+
+    // 2026-05-17 BUG-WS-NO-CONN-CAP-01: enforce per-IP + global connection
+    // caps BEFORE wiring handlers, so a probing client that just keeps
+    // reconnecting can't even register signal/slot callbacks. Caps default
+    // to 0 (unlimited) — operators opt in via backend.yaml. Cap rejection
+    // closes the socket with CloseCodePolicyViolated; the throttled WARN
+    // log surfaces a DoS attempt without flooding logs.
+    {
+        std::string reject_reason;
+        if (!tryReserveConnSlot(peer_ip,
+                                ws_cfg.max_connections_global,
+                                ws_cfg.max_connections_per_ip,
+                                reject_reason)) {
+            g_conn_cap_rejected_total.fetch_add(1, std::memory_order_relaxed);
+            LOG_THROTTLED_WARN(5000,
+                "WS connection rejected ({}): closing peer {}",
+                reject_reason, peer_ip);
+            socket->close(QWebSocketProtocol::CloseCodePolicyViolated,
+                          QStringLiteral("connection cap exceeded"));
+            socket->deleteLater();
+            return;
+        }
+    }
+
+    // Track for disconnect cleanup. Property read on Qt thread only.
+    socket->setProperty("vms_peer_ip", QString::fromStdString(peer_ip));
+    g_conn_total.fetch_add(1, std::memory_order_relaxed);
+
     LOG_THROTTLED_INFO(5000, "New WS connection from: {} (Path: {})",
-             socket->peerAddress().toString().toStdString(),
+             peer_ip,
              socket->requestUrl().path().toStdString());
 
     connect(socket.data(), &QWebSocket::textMessageReceived, this, &CameraStreamManager::processTextMessage);
     connect(socket.data(), &QWebSocket::binaryMessageReceived, this, &CameraStreamManager::processBinaryMessage);
     connect(socket.data(), &QWebSocket::disconnected, this, &CameraStreamManager::socketDisconnected);
+
+    // 2026-05-17 BUG-WS-NO-MSGSIZE-CAP-01: cap incoming message size to
+    // config.websocket.max_message_size_mb (config field was parsed but
+    // never applied; Qt's default ~40 MB allowed any AUTH'd client to
+    // pin the WS server with a single oversized text frame). Applied
+    // per-socket because QWebSocketServer doesn't expose a default.
+    if (ws_cfg.max_message_size_mb > 0) {
+        const quint64 bytes = static_cast<quint64>(ws_cfg.max_message_size_mb) * 1024ULL * 1024ULL;
+        socket->setMaxAllowedIncomingMessageSize(bytes);
+        socket->setMaxAllowedIncomingFrameSize(bytes);
+    }
 
     // Disable Nagle's algorithm: WebSocket frames are self-framed and latency-sensitive.
     // Without TCP_NODELAY, the kernel may buffer small writes up to 40ms before sending.
@@ -210,6 +318,7 @@ void CameraStreamManager::onNewConnection() {
     auth_timeout->setInterval(10000);
     QObject::connect(auth_timeout, &QTimer::timeout, socket.data(), [socket]() {
         if (!socket || socket->property("vms_authed").toBool()) return;
+        g_preauth_timeout_total.fetch_add(1, std::memory_order_relaxed);
         LOG_THROTTLED_WARN(5000,
             "WS pre-auth timeout: closing {} after 10s with no AUTH",
             socket->peerAddress().toString().toStdString());
@@ -233,6 +342,16 @@ void CameraStreamManager::socketDisconnected() {
             std::lock_guard<std::mutex> alock(g_allowed_cameras_mutex);
             g_allowed_cameras.erase(socket.data());
         }
+
+        // 2026-05-17 WS observability + cap accounting: release the slot
+        // reserved at onNewConnection. The peer IP property is set in
+        // onNewConnection BEFORE any cap-rejection branch returns, so if
+        // we get here the property is guaranteed populated.
+        const QString peer_ip_q = socket->property("vms_peer_ip").toString();
+        if (!peer_ip_q.isEmpty()) {
+            releaseConnSlot(peer_ip_q.toStdString());
+        }
+        g_disconnects_total.fetch_add(1, std::memory_order_relaxed);
 
         socket->deleteLater();
     }
@@ -267,10 +386,12 @@ void CameraStreamManager::processTextMessage(const QString& message) {
                 // no filter" semantics elsewhere in the codebase.
                 socket->setProperty("vms_authed", true);
                 socket->setProperty("vms_is_admin", true);
+                g_authed_total.fetch_add(1, std::memory_order_relaxed);
                 sendText(socket, QStringLiteral("{\"type\":\"AUTH_OK\"}"));
                 return;
             }
             if (!j.contains("token") || !j["token"].is_string()) {
+                g_auth_failed_total.fetch_add(1, std::memory_order_relaxed);
                 sendText(socket, QStringLiteral("{\"type\":\"AUTH_ERR\",\"error\":\"token required\"}"));
                 socket->close(QWebSocketProtocol::CloseCodePolicyViolated, QStringLiteral("AUTH required"));
                 return;
@@ -297,6 +418,8 @@ void CameraStreamManager::processTextMessage(const QString& message) {
                 }
 
                 if (ticket_set.count(jti)) {
+                    g_ticket_replay_total.fetch_add(1, std::memory_order_relaxed);
+                    g_auth_failed_total.fetch_add(1, std::memory_order_relaxed);
                     LOG_WARN("WS Ticket replay attack detected for JTI: {}", jti);
                     sendText(socket, QStringLiteral("{\"type\":\"AUTH_ERR\",\"error\":\"ticket already used\"}"));
                     socket->close(QWebSocketProtocol::CloseCodePolicyViolated, QStringLiteral("Ticket replay"));
@@ -333,8 +456,10 @@ void CameraStreamManager::processTextMessage(const QString& message) {
                     g_allowed_cameras[socket.data()] = std::move(allowed_ids);
                 }
 
+                g_authed_total.fetch_add(1, std::memory_order_relaxed);
                 sendText(socket, QStringLiteral("{\"type\":\"AUTH_OK\"}"));
             } else {
+                g_auth_failed_total.fetch_add(1, std::memory_order_relaxed);
                 sendText(socket, QStringLiteral("{\"type\":\"AUTH_ERR\",\"error\":\"invalid, expired, or stolen ticket\"}"));
                 socket->close(QWebSocketProtocol::CloseCodePolicyViolated, QStringLiteral("Invalid ticket"));
             }
@@ -343,6 +468,7 @@ void CameraStreamManager::processTextMessage(const QString& message) {
 
         // Enforce auth for all other messages when enabled
         if (auth_enabled && !is_authed) {
+            g_auth_failed_total.fetch_add(1, std::memory_order_relaxed);
             sendText(socket, QStringLiteral("{\"type\":\"AUTH_ERR\",\"error\":\"AUTH required\"}"));
             socket->close(QWebSocketProtocol::CloseCodePolicyViolated, QStringLiteral("AUTH required"));
             return;
@@ -797,6 +923,32 @@ void CameraStreamManager::broadcastEvent(int camera_id, const nlohmann::json& ev
     for (const auto& client : allowed) {
         sendText(client.socket, msg);
     }
+}
+
+// 2026-05-17 WS observability trifecta — wait-free snapshot of all atomic
+// counters + best-effort try_lock read of per-IP map size for distinct_ips.
+// Operators consume via `GET /api/rules/stats` `websocket` block. Lock-free
+// w.r.t. the producer hot path: try_to_lock means the snapshot reader
+// never blocks onNewConnection / socketDisconnected.
+CameraStreamManager::ConnectionStats CameraStreamManager::connectionStats() const {
+    ConnectionStats s;
+    s.connections_total       = g_conn_total.load(std::memory_order_relaxed);
+    s.connections_current     = g_conn_current.load(std::memory_order_relaxed);
+    s.peak_connections        = g_conn_peak.load(std::memory_order_relaxed);
+    s.authed_total            = g_authed_total.load(std::memory_order_relaxed);
+    s.auth_failed_total       = g_auth_failed_total.load(std::memory_order_relaxed);
+    s.ticket_replay_total     = g_ticket_replay_total.load(std::memory_order_relaxed);
+    s.preauth_timeout_total   = g_preauth_timeout_total.load(std::memory_order_relaxed);
+    s.conn_cap_rejected_total = g_conn_cap_rejected_total.load(std::memory_order_relaxed);
+    s.disconnects_total       = g_disconnects_total.load(std::memory_order_relaxed);
+    {
+        std::unique_lock<std::mutex> lk(g_per_ip_mutex, std::try_to_lock);
+        if (lk.owns_lock()) s.distinct_ips = g_per_ip_count.size();
+    }
+    const auto& cfg = vms::Config::getInstance().getWebSocketConfig();
+    s.max_connections_global  = cfg.max_connections_global;
+    s.max_connections_per_ip  = cfg.max_connections_per_ip;
+    return s;
 }
 
 } // namespace streaming

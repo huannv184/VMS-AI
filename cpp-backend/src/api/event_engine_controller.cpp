@@ -9,6 +9,7 @@
 #include "events/zone_manager.h"
 #include "database/db_manager.h"
 #include "core/roi_manager.h"
+#include "streaming/camera_stream_manager_qt.h"
 #include "middleware/auth_middleware.h"
 #include "server/vms_app.h"
 #include "utils/api_utils.h"
@@ -411,6 +412,26 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
                  {"peak_queue_depth",     bw.peak_queue_depth},
                  {"running",              bw.running},
                  {"accepting",            bw.accepting}
+             };
+             // Merge WebSocket connection counters (2026-05-17 WS observability
+             // trifecta). Same kitchen-sink pattern as delivery + batch_writer:
+             // operators check one endpoint to answer "is the stack healthy".
+             // RBAC: ALERT_READ here is a pragmatic fit (same scope as delivery
+             // / batch_writer ops counters); WS-specific permission is overkill.
+             const auto ws = streaming::CameraStreamManager::getInstance().connectionStats();
+             out["websocket"] = {
+                 {"connections_total",       ws.connections_total},
+                 {"connections_current",     ws.connections_current},
+                 {"peak_connections",        ws.peak_connections},
+                 {"authed_total",            ws.authed_total},
+                 {"auth_failed_total",       ws.auth_failed_total},
+                 {"ticket_replay_total",     ws.ticket_replay_total},
+                 {"preauth_timeout_total",   ws.preauth_timeout_total},
+                 {"conn_cap_rejected_total", ws.conn_cap_rejected_total},
+                 {"disconnects_total",       ws.disconnects_total},
+                 {"distinct_ips",            ws.distinct_ips},
+                 {"max_connections_global",  ws.max_connections_global},
+                 {"max_connections_per_ip",  ws.max_connections_per_ip}
              };
              return ApiUtils::createResponse(out, 200, origin);
         } catch (const std::exception& e) {

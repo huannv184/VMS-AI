@@ -99,6 +99,26 @@ public:
 
     void broadcastEvent(int camera_id, const nlohmann::json& event);
 
+    // 2026-05-17 WS observability trifecta (BUG-WS-NO-METRICS-01 +
+    // BUG-WS-NO-CONN-CAP-01 + BUG-WS-NO-MSGSIZE-CAP-01). Wait-free atomic
+    // snapshot of connection counters + cap-rejection counter; surfaced
+    // via `GET /api/rules/stats` `websocket` block.
+    struct ConnectionStats {
+        std::uint64_t connections_total{0};       // monotonic — every accepted socket
+        std::uint64_t connections_current{0};     // gauge — live sockets
+        std::uint64_t peak_connections{0};        // monotonic max of connections_current
+        std::uint64_t authed_total{0};            // monotonic — successful AUTH
+        std::uint64_t auth_failed_total{0};       // monotonic — AUTH_ERR responses
+        std::uint64_t ticket_replay_total{0};     // monotonic — JTI replay rejections
+        std::uint64_t preauth_timeout_total{0};   // monotonic — 10s timer fired with no AUTH
+        std::uint64_t conn_cap_rejected_total{0}; // monotonic — accept-time cap rejection
+        std::uint64_t disconnects_total{0};       // monotonic — socketDisconnected fires
+        std::size_t   distinct_ips{0};            // gauge — entries in per-IP map (read-only snapshot)
+        int           max_connections_global{0};  // configured cap (0 = unlimited)
+        int           max_connections_per_ip{0};  // configured cap (0 = unlimited)
+    };
+    ConnectionStats connectionStats() const;
+
 public Q_SLOTS:
     void handleAiEvent(const QString& type, const QString& payload);
 

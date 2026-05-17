@@ -231,6 +231,8 @@ bool Config::loadFromFile(const std::string& filepath) {
             websocket_.ping_timeout_sec = ws["ping_timeout_sec"].as<int>(websocket_.ping_timeout_sec);
             websocket_.max_message_size_mb = ws["max_message_size_mb"].as<int>(websocket_.max_message_size_mb);
             websocket_.update_interval_ms = ws["update_interval_ms"].as<int>(websocket_.update_interval_ms);
+            websocket_.max_connections_global = ws["max_connections_global"].as<int>(websocket_.max_connections_global);
+            websocket_.max_connections_per_ip = ws["max_connections_per_ip"].as<int>(websocket_.max_connections_per_ip);
         }
 
         if (tryGetEnvInt("PORT", server_.port)) {
