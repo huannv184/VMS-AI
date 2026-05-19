@@ -13,6 +13,7 @@
 #include "database/db_manager.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include "utils/background_job_runner.h"
+#include "utils/config.h"
 #include "utils/email_sender.h"
 #include "utils/logger.h"
 #include "utils/url_validator.h"
@@ -48,20 +49,42 @@ namespace {
 // Shutdown: 4 independent pools, no cross-pool wait → no deadlock. Each
 // pool's worker lambdas already gate on vms::core::shutting_down so in-flight
 // jobs short-circuit; new submits after shutdown are rejected and counted.
+// 2026-05-19 BUG-ALERT-CASCADE-POOL-01 phase 2: config-driven sizing.
+// Each *Runner() is a Meyers singleton — the workers/queue values read
+// from config at FIRST CALL are captured for the program's lifetime.
+// Boot order: main.cpp loads Config::loadFromFile well before any event
+// delivery path (AI ingestion or HTTP rule fire) executes, so the read
+// reflects the operator's settings. Non-positive values fall back to
+// the channel's hardcoded default, matching the 2026-05-17 sizing.
+inline std::size_t poolWorkers(int cfg, std::size_t fallback) {
+    return cfg > 0 ? static_cast<std::size_t>(cfg) : fallback;
+}
+inline std::size_t poolQueue(int cfg, std::size_t fallback) {
+    return cfg > 0 ? static_cast<std::size_t>(cfg) : fallback;
+}
+
 vms::utils::BackgroundJobRunner& webhookRunner() {
-    static vms::utils::BackgroundJobRunner instance("delivery-webhook", 4, 256);
+    const auto& c = vms::Config::getInstance().getAlertDeliveryConfig().webhook;
+    static vms::utils::BackgroundJobRunner instance(
+        "delivery-webhook", poolWorkers(c.workers, 4), poolQueue(c.queue_size, 256));
     return instance;
 }
 vms::utils::BackgroundJobRunner& smsRunner() {
-    static vms::utils::BackgroundJobRunner instance("delivery-sms", 2, 128);
+    const auto& c = vms::Config::getInstance().getAlertDeliveryConfig().sms;
+    static vms::utils::BackgroundJobRunner instance(
+        "delivery-sms", poolWorkers(c.workers, 2), poolQueue(c.queue_size, 128));
     return instance;
 }
 vms::utils::BackgroundJobRunner& telegramRunner() {
-    static vms::utils::BackgroundJobRunner instance("delivery-telegram", 2, 128);
+    const auto& c = vms::Config::getInstance().getAlertDeliveryConfig().telegram;
+    static vms::utils::BackgroundJobRunner instance(
+        "delivery-telegram", poolWorkers(c.workers, 2), poolQueue(c.queue_size, 128));
     return instance;
 }
 vms::utils::BackgroundJobRunner& alarmRunner() {
-    static vms::utils::BackgroundJobRunner instance("delivery-alarm", 1, 64);
+    const auto& c = vms::Config::getInstance().getAlertDeliveryConfig().alarm;
+    static vms::utils::BackgroundJobRunner instance(
+        "delivery-alarm", poolWorkers(c.workers, 1), poolQueue(c.queue_size, 64));
     return instance;
 }
 

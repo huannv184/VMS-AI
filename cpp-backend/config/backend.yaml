@@ -153,7 +153,42 @@ events:
     
   # Loitering settings
   loitering_threshold_sec: 30
-  
+
+# ============================================================================
+# ALERT DELIVERY POOL SIZING (BUG-ALERT-CASCADE-POOL-01 phase 2)
+# ============================================================================
+# Per-channel pool sizing for vms::events::deliverAction. Each channel runs
+# on its own BackgroundJobRunner so a stalled webhook does NOT queue SMS /
+# Telegram / alarm-relay sends behind it. Leave keys out (or set 0) to use
+# the defaults baked into alert_delivery.cpp — they match the operator-green-
+# lit 2026-05-17 sizing.
+#
+# Sizing rationale (don't tune blindly):
+#   webhook  4/256 : operator-supplied URL, unknown SLA, biggest stall risk.
+#                    4 workers absorb parallel stalls; 256 queue absorbs
+#                    ~100 evt/s × 2.5 s without drop.
+#   sms      2/128 : hard ceiling is Twilio's ~1 msg/s per long-code number;
+#                    more workers just queue more 429s.
+#   telegram 2/128 : api.telegram.org ~30 msg/s per chat; 2 workers covers it.
+#   alarm    1/64  : LAN endpoint, ms-latency; small queue intentional —
+#                    a stale alarm is useless, drop is the right semantic.
+#
+# Sizes are captured at first delivery call and frozen for program lifetime;
+# live reload not supported.
+alert_delivery:
+  webhook:
+    workers: 4
+    queue_size: 256
+  sms:
+    workers: 2
+    queue_size: 128
+  telegram:
+    workers: 2
+    queue_size: 128
+  alarm:
+    workers: 1
+    queue_size: 64
+
 # ============================================================================
 # SNAPSHOT SYSTEM
 # ============================================================================

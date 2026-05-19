@@ -235,6 +235,23 @@ bool Config::loadFromFile(const std::string& filepath) {
             websocket_.max_connections_per_ip = ws["max_connections_per_ip"].as<int>(websocket_.max_connections_per_ip);
         }
 
+        // 2026-05-19 BUG-ALERT-CASCADE-POOL-01 phase 2: per-channel pool
+        // sizing. Missing keys / non-positive values leave the field at
+        // its 0 sentinel; alert_delivery.cpp factories fall back to the
+        // channel's hardcoded default in that case.
+        if (config_["alert_delivery"]) {
+            auto ad = config_["alert_delivery"];
+            auto load = [](YAML::Node n, AlertDeliveryConfig::PoolConfig& pc) {
+                if (!n) return;
+                if (n["workers"])    pc.workers    = n["workers"].as<int>(pc.workers);
+                if (n["queue_size"]) pc.queue_size = n["queue_size"].as<int>(pc.queue_size);
+            };
+            load(ad["webhook"],  alert_delivery_.webhook);
+            load(ad["sms"],      alert_delivery_.sms);
+            load(ad["telegram"], alert_delivery_.telegram);
+            load(ad["alarm"],    alert_delivery_.alarm);
+        }
+
         if (tryGetEnvInt("PORT", server_.port)) {
             LOG_INFO("Loaded server port from PORT environment variable: {}", server_.port);
         }

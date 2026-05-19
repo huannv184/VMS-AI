@@ -155,6 +155,33 @@ public:
         std::vector<std::string> trusted_proxies;
     };
 
+    // 2026-05-19 BUG-ALERT-CASCADE-POOL-01 phase 2: operator-tunable pool
+    // sizing for the 4 alert delivery channels. Defaults match the
+    // hardcoded values shipped 2026-05-17: webhook 4/256, sms 2/128,
+    // telegram 2/128, alarm 1/64. Sizes are anchored to vendor rate
+    // limits (Twilio ~1 msg/s/number → 2 SMS workers; Telegram 30 msg/s
+    // /chat → 2 telegram workers; webhook + alarm sized for burst absorb).
+    // Operators tune via `alert_delivery.{webhook,sms,telegram,alarm}.
+    // {workers, queue_size}` in backend.yaml.
+    //
+    // Reading order: each pool's BackgroundJobRunner is constructed via
+    // a function-local static at first use of the *Runner() accessor in
+    // alert_delivery.cpp. Config must be loaded before any alert delivery
+    // path runs — main.cpp does `Config::loadFromFile` well before AI
+    // event ingestion starts, so the read order is safe by-construction.
+    // After the first runner-accessor call the values are captured for
+    // the program's lifetime; live config reload is NOT supported here.
+    struct AlertDeliveryConfig {
+        struct PoolConfig {
+            int workers = 0;     // 0/<=0 → use channel default
+            int queue_size = 0;  // 0/<=0 → use channel default
+        };
+        PoolConfig webhook;
+        PoolConfig sms;
+        PoolConfig telegram;
+        PoolConfig alarm;
+    };
+
     // Logging configuration
     struct LoggingConfig {
         std::string level = "info";
@@ -234,6 +261,11 @@ public:
      * @brief Get security configuration (trusted proxies, etc.)
      */
     const SecurityConfig& getSecurityConfig() const { return security_; }
+
+    /**
+     * @brief Get alert delivery pool sizing (0 fields mean "use default").
+     */
+    const AlertDeliveryConfig& getAlertDeliveryConfig() const { return alert_delivery_; }
     
     /**
      * @brief Print configuration to console
@@ -263,6 +295,7 @@ private:
     LoggingConfig logging_;
     StorageConfig storage_;
     SecurityConfig security_;
+    AlertDeliveryConfig alert_delivery_;
     
     // YAML root node
     YAML::Node config_;
