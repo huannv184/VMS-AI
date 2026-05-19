@@ -1,8 +1,28 @@
 #include "core/pipeline_state_store.h"
+#include "core/runtime_state.h"
 
 #include <mutex>
 
 namespace vms::core {
+
+namespace {
+
+// 2026-05-19 PSS shutdown gate. Late producers (decoder thread still
+// flushing, ZmqEventBridge metadata message in flight) can call write
+// methods AFTER main.cpp set vms::core::shutting_down. Pre-fix those
+// calls grew the snapshots_ map (via getOrCreateLocked) and dirtied
+// state during the teardown window — harmless to readers (they hold
+// shared_ptr handles already) but messy: stat counters showed entries
+// for cameras whose producers had already stopped, removeCamera races
+// re-add. Read paths intentionally NOT gated — they keep working off
+// the published shared_ptr handles which remain valid through teardown,
+// and the snapshot endpoint / health poller should keep serving "last
+// known state" until the process actually exits.
+inline bool shuttingDown() {
+    return vms::core::shutting_down.load(std::memory_order_acquire);
+}
+
+} // namespace
 
 PipelineStateStore& PipelineStateStore::getInstance() {
     static PipelineStateStore instance;
@@ -10,6 +30,7 @@ PipelineStateStore& PipelineStateStore::getInstance() {
 }
 
 void PipelineStateStore::registerCamera(int camera_id) {
+    if (shuttingDown()) return;
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.state = CameraState::CONNECTING;
@@ -18,6 +39,9 @@ void PipelineStateStore::registerCamera(int camera_id) {
 }
 
 void PipelineStateStore::removeCamera(int camera_id) {
+    // removeCamera is the cleanup path — must run even during shutdown
+    // so per-camera teardown completes (e.g. MediaPipeline::stop calling
+    // removeCamera as part of its destructor).
     std::unique_lock<std::shared_mutex> lock(mutex_);
     snapshots_.erase(camera_id);
 }
@@ -27,6 +51,7 @@ void PipelineStateStore::updateFrame(int camera_id,
                                      const std::vector<inference::TrackedObject>& objects,
                                      const nlohmann::json& metadata,
                                      uint64_t timestamp_ms) {
+    if (shuttingDown()) return;
     // 2026-05-15 hot-path audit: build the immutable copies OUTSIDE the
     // unique_lock. At 30 fps × N cameras the JPEG memcpy (200-500 KB) and
     // objects vector copy dominate updateFrame's cost; doing them unlocked
@@ -52,6 +77,7 @@ void PipelineStateStore::updateFrame(int camera_id,
 }
 
 void PipelineStateStore::updateMetadata(int camera_id, const nlohmann::json& metadata) {
+    if (shuttingDown()) return;
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.latest_metadata = metadata;
@@ -63,6 +89,7 @@ void PipelineStateStore::updateStats(int camera_id,
                                      long long last_frame_ts,
                                      CameraState state,
                                      bool is_running) {
+    if (shuttingDown()) return;
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.fps = fps;
@@ -76,12 +103,14 @@ void PipelineStateStore::updateStats(int camera_id,
 }
 
 void PipelineStateStore::updateCpuUsage(int camera_id, double percent) {
+    if (shuttingDown()) return;
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.cpu_usage_percent = percent;
 }
 
 void PipelineStateStore::setState(int camera_id, CameraState state, const std::string& last_error) {
+    if (shuttingDown()) return;
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.state = state;
