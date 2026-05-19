@@ -163,11 +163,14 @@ void AiEventProcessor::eventWorkerLoop() {
                     processIntrusion(job.camera_id, obj, job.frame);
                 } else if (class_id == 200 || label == "LicensePlate") {
                     processLicensePlate(job.camera_id, obj, job.frame);
-                } else if (class_id == 302 || class_id == 304 ||
+                } else if (class_id == 406 || class_id == 407 ||
                            label == "NoHelmet" || label == "NoVest") {
-                    // 2026-05-19 PPE violation classes from PPE-YOLOv8 engine
-                    // (post 300-offset remap in ai_worker): 302=NoHelmet,
-                    // 304=NoVest. Engine ships 6 classes; ids 0-5 → 300-305.
+                    // 2026-05-19 PPE violation classes — DERIVED in ai_worker
+                    // via person↔helmet/vest containment pairing. Engine
+                    // itself is detection-only (helmet/vest/person/gloves/
+                    // mask/boots); ai_worker emits synthetic 406=NoHelmet
+                    // and 407=NoVest events when a person bbox has no
+                    // containing helmet/vest bbox (≥50% containment).
                     processPPEViolation(job.camera_id, obj, job.frame);
                 }
             }
@@ -380,10 +383,10 @@ void AiEventProcessor::processPPEViolation(int camera_id,
     // Build a stable kind tag for the cooldown key + event description.
     std::string kind;
     std::string desc;
-    if (class_id == 302 || label == "NoHelmet") {
+    if (class_id == 406 || label == "NoHelmet") {
         kind = "no_helmet";
         desc = "Phát hiện nhân viên không đội mũ bảo hiểm";
-    } else if (class_id == 304 || label == "NoVest") {
+    } else if (class_id == 407 || label == "NoVest") {
         kind = "no_vest";
         desc = "Phát hiện nhân viên không mặc áo phản quang";
     } else {

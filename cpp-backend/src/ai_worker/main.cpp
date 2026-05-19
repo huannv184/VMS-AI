@@ -1084,34 +1084,49 @@ int main(int argc, char** argv) {
                     });
                 }
                 
-                // 2026-05-19 PPE detections — engine outputs 6 classes
-                // (confirmed via output-tensor size 8,400 × 10 = 84,000).
-                // Class ids 0-5 are remapped to 300-305 to avoid COCO
-                // collision (COCO already uses class_id=0 for person).
+                // 2026-05-19 PPE detections — engine classes confirmed via
+                // best.pt model.names: ['helmet','vest','person','gloves',
+                // 'mask','boots']. This is a DETECTION-only model (no
+                // NoHelmet/NoVest violation classes). Violation must be
+                // DERIVED — for each person bbox, find overlapping helmet
+                // and vest bboxes; if missing → that person is violating.
                 //
-                // EDUCATED-GUESS mapping (operator validates by physical
-                // test — walk in frame with/without each PPE item and see
-                // which label fires):
-                //   0 → 300 PPE_Person
-                //   1 → 301 Helmet         (hard hat present)
-                //   2 → 302 NoHelmet       (violation)
-                //   3 → 303 Vest           (safety vest present)
-                //   4 → 304 NoVest         (violation)
-                //   5 → 305 PPE_Class5     (unknown 6th class — operator
-                //                            sees the label fire and tells
-                //                            us what it actually detected)
+                // Per-frame pairing happens in this loop because we have
+                // the full result.ppe_objects vector here. We build two
+                // synthetic event class_ids on the AI-worker side:
+                //   406 = NoHelmet violation (person bbox without overlap)
+                //   407 = NoVest violation   (person bbox without overlap)
+                // And forward the raw detections too with 300-offset
+                // namespace (for AnprView / debug visibility).
                 //
-                // AiEventProcessor::processPPEViolation fires on class_ids
-                // 302 / 304 (the violation classes after offset). If the
-                // engine's actual class order differs, edit kPPELabels[]
-                // AND the dispatch in ai_event_processor.cpp.
+                // Class id remap (raw items, 300-offset to avoid COCO):
+                //   0 helmet  → 300, 1 vest   → 301, 2 person → 302,
+                //   3 gloves  → 303, 4 mask   → 304, 5 boots  → 305
+                // Synthetic violation ids (derived, 400-offset):
+                //   406 NoHelmet, 407 NoVest
                 static const char* kPPELabels[] = {
-                    "PPE_Person", "Helmet", "NoHelmet",
-                    "Vest", "NoVest", "PPE_Class5"
+                    "Helmet", "Vest", "PPE_Person",
+                    "Gloves", "Mask", "Boots"
                 };
+
+                // Collect person, helmet, vest detections for pairing.
+                // (Other items still flow through as raw detections; their
+                // presence/absence isn't used for violations today.)
+                std::vector<const inference::BBox*> ppe_persons;
+                std::vector<const inference::BBox*> ppe_helmets;
+                std::vector<const inference::BBox*> ppe_vests;
                 for (const auto& ppe : result.ppe_objects) {
                     const int src_cls = ppe.class_id;
-                    if (src_cls < 0 || src_cls > 5) continue; // out of expected range
+                    if (src_cls < 0 || src_cls > 5) continue;
+                    if (src_cls == 2) ppe_persons.push_back(&ppe);
+                    else if (src_cls == 0) ppe_helmets.push_back(&ppe);
+                    else if (src_cls == 1) ppe_vests.push_back(&ppe);
+                }
+
+                // Push raw detections into metadata channel.
+                for (const auto& ppe : result.ppe_objects) {
+                    const int src_cls = ppe.class_id;
+                    if (src_cls < 0 || src_cls > 5) continue;
                     inference::TrackedObject to;
                     to.bbox.x1 = ppe.x1; to.bbox.y1 = ppe.y1;
                     to.bbox.x2 = ppe.x2; to.bbox.y2 = ppe.y2;
@@ -1129,6 +1144,58 @@ int main(int argc, char** argv) {
                         {"track_id", to.track_id},
                         {"box", {to.bbox.x1, to.bbox.y1, to.bbox.x2, to.bbox.y2}}
                     });
+                }
+
+                // 2026-05-19 PPE violation pairing — for each person bbox,
+                // check whether ANY helmet/vest bbox overlaps (IoU >= 0.10
+                // because PPE items typically sit on/inside the person
+                // bbox so a person-with-helmet has helmet bbox CONTAINED
+                // inside their body bbox; geometric containment fits the
+                // physical reality better than tight IoU). If no overlap
+                // is found, emit synthetic NoHelmet (406) / NoVest (407)
+                // detection with the person's bbox.
+                //
+                // Why "min overlap" not tight IoU:
+                //   helmet_bbox is small relative to person_bbox, so even
+                //   when the person IS wearing a helmet IoU ≈ 0.05-0.15.
+                //   The right check is "PPE item bbox CONTAINED in person
+                //   bbox" — use intersection / smaller_area as the metric.
+                auto contained_in = [](const inference::BBox& small,
+                                       const inference::BBox& big) -> bool {
+                    const float ix1 = std::max(small.x1, big.x1);
+                    const float iy1 = std::max(small.y1, big.y1);
+                    const float ix2 = std::min(small.x2, big.x2);
+                    const float iy2 = std::min(small.y2, big.y2);
+                    if (ix2 <= ix1 || iy2 <= iy1) return false;
+                    const float inter = (ix2 - ix1) * (iy2 - iy1);
+                    const float small_area =
+                        std::max(1.0f, (small.x2 - small.x1) * (small.y2 - small.y1));
+                    return (inter / small_area) >= 0.50f; // ≥50% of helmet
+                };
+                for (const auto* person : ppe_persons) {
+                    bool has_helmet = false, has_vest = false;
+                    for (const auto* h : ppe_helmets) if (contained_in(*h, *person)) { has_helmet = true; break; }
+                    for (const auto* v : ppe_vests)   if (contained_in(*v, *person)) { has_vest   = true; break; }
+                    auto emit_violation = [&](int class_id, const char* label) {
+                        inference::TrackedObject to;
+                        to.bbox.x1 = person->x1; to.bbox.y1 = person->y1;
+                        to.bbox.x2 = person->x2; to.bbox.y2 = person->y2;
+                        to.confidence = person->score;
+                        to.bbox.score = person->score;
+                        to.bbox.class_id = class_id;
+                        to.label = label;
+                        to.track_id = -1;
+                        tracked_objects.push_back(to);
+                        j_out["objects"].push_back({
+                            {"label", to.label},
+                            {"class_id", to.bbox.class_id},
+                            {"confidence", to.confidence},
+                            {"track_id", to.track_id},
+                            {"box", {to.bbox.x1, to.bbox.y1, to.bbox.x2, to.bbox.y2}}
+                        });
+                    };
+                    if (!has_helmet) emit_violation(406, "NoHelmet");
+                    if (!has_vest)   emit_violation(407, "NoVest");
                 }
 
                 // License Plates
