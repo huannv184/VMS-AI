@@ -177,6 +177,14 @@ private:
     // Actual bound port — set after listen() succeeds; -1 if server not started
     std::atomic<int> bound_port_{-1};
 
+    // 2026-05-19 BUG-WS-SHUTDOWN-NEWCONN-01 gate: set true at the top of
+    // stop() before close()/deleteLater()/server_.clear(). Any newConnection
+    // signal that was already queued in the Qt event loop before close()
+    // landed will still fire onNewConnection after stop() returns; that slot
+    // checks this flag and drains the pending socket without wiring it up.
+    // Atomic because stop() may be marshalled from a non-Qt thread.
+    std::atomic<bool> shutting_down_{false};
+
     // Backpressure metrics — lock-free, O(1)
     std::atomic<uint64_t> frames_dropped_{0};
     std::atomic<uint64_t> frames_sent_{0};

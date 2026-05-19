@@ -263,6 +263,11 @@ void CameraStreamManager::stop() {
     }
 
     // Now we are on the Qt thread — safe to call Qt methods directly.
+    // 2026-05-19 BUG-WS-SHUTDOWN-NEWCONN-01: latch the gate BEFORE close()
+    // so any newConnection signal queued in the event loop pre-close that
+    // fires AFTER this slot returns finds the flag set and drops the
+    // socket without registering it.
+    shutting_down_.store(true, std::memory_order_release);
     if (server_) {
         server_->close();
         server_->deleteLater(); // deferred Qt-safe deletion
@@ -279,6 +284,24 @@ void CameraStreamManager::stop() {
 // ============================================================
 
 void CameraStreamManager::onNewConnection() {
+    // 2026-05-19 BUG-WS-SHUTDOWN-NEWCONN-01: server_ may have been
+    // cleared by a concurrent stop() that ran earlier on this same
+    // (Qt) thread. The QPointer null-checks against UAF, the
+    // shutting_down_ gate covers the close()-but-not-yet-cleared case
+    // where the socket is still acceptable but the system is tearing
+    // down. Drain + close any socket caught here so the OS-side accept
+    // queue doesn't carry a dangling FD into post-shutdown.
+    if (!server_ || shutting_down_.load(std::memory_order_acquire)) {
+        if (server_) {
+            QPointer<QWebSocket> pending = server_->nextPendingConnection();
+            if (pending) {
+                pending->close(QWebSocketProtocol::CloseCodeGoingAway,
+                               QStringLiteral("server shutting down"));
+                pending->deleteLater();
+            }
+        }
+        return;
+    }
     QPointer<QWebSocket> socket = server_->nextPendingConnection();
     if (!socket) {
         return;
