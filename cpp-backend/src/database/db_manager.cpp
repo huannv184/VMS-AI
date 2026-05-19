@@ -1324,6 +1324,19 @@ void DbManager::rollback() {
 std::string DbManager::getSetting(const std::string& key, const std::string& default_val) {
     if (!initialized_.load(std::memory_order_acquire)) return default_val;
 
+    // 2026-05-19 settings cache: positive-hit only, 5s TTL, shared_mutex
+    // for concurrent readers. setSetting + change-notify invalidate on
+    // write so an operator PUT propagates to callers within the same
+    // window even if TTL hasn't elapsed.
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::shared_lock<std::shared_mutex> rlock(settings_cache_mu_);
+        auto it = settings_cache_.find(key);
+        if (it != settings_cache_.end() && now < it->second.expires_at) {
+            return it->second.value;
+        }
+    }
+
     QSqlDatabase db = getThreadConnection();
     if (!db.isValid() || !db.isOpen()) return default_val;
 
@@ -1334,10 +1347,18 @@ std::string DbManager::getSetting(const std::string& key, const std::string& def
     if (query.exec() && query.next()) {
         QVariant val = query.value(0);
         if (!val.isNull()) {
-            return val.toString().toStdString();
+            std::string value = val.toString().toStdString();
+            {
+                std::unique_lock<std::shared_mutex> wlock(settings_cache_mu_);
+                settings_cache_[key] = {value, now + kSettingsCacheTtl};
+            }
+            return value;
         }
     }
 
+    // Negative result intentionally NOT cached — a key racing with a
+    // pending PUT must hit DB next call rather than sticking with the
+    // "not found → default" answer for the full TTL.
     return default_val;
 }
 
@@ -1362,6 +1383,15 @@ bool DbManager::setSetting(const std::string& key, const std::string& value) {
         return false;
     }
 
+    // 2026-05-19 settings cache write-side invalidation. Insert the
+    // fresh value directly so the next reader on this thread sees it
+    // without a DB round-trip; other threads with a stale entry will
+    // be overwritten by this same insert (we hold the exclusive lock).
+    {
+        const auto now = std::chrono::steady_clock::now();
+        std::unique_lock<std::shared_mutex> wlock(settings_cache_mu_);
+        settings_cache_[key] = {value, now + kSettingsCacheTtl};
+    }
     return true;
 }
 

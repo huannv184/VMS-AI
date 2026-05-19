@@ -2,11 +2,14 @@
 
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <map>
 
@@ -217,6 +220,30 @@ private:
     // Mutex protecting connection name registry (for close/cleanup)
     std::mutex connection_registry_mutex_;
     std::vector<QString> registered_connections_;
+
+    // 2026-05-19 getSetting() hot-path cache. Pre-fix every call did a
+    // SELECT round-trip to settings; alert_delivery (post 2026-05-15
+    // BUG-ALERT-DNS-PRODUCER-01 fix) reads SMTP/Twilio/Telegram/alarm
+    // settings INSIDE the worker lambda for every fired event, plus
+    // batch writer + rule eval. With a 5 s TTL + write-side invalidation
+    // we cap the DB read rate at one per key per 5 s while keeping
+    // operator settings PUTs visible to all callers within the same
+    // window. shared_mutex: readers parallelise; writers (cache miss
+    // insert, setSetting invalidate) take exclusive.
+    //
+    // Only POSITIVE hits are cached (key present, non-null value).
+    // Negative results (key absent) fall through to DB each call —
+    // a transient race where a key is about to be PUT'd would
+    // otherwise let a "not found" answer stick for the full TTL.
+    // Bounded growth: schema has a fixed small set of keys (~tens),
+    // no LRU needed.
+    struct CachedSetting {
+        std::string value;
+        std::chrono::steady_clock::time_point expires_at;
+    };
+    mutable std::shared_mutex settings_cache_mu_;
+    std::unordered_map<std::string, CachedSetting> settings_cache_;
+    static constexpr auto kSettingsCacheTtl = std::chrono::seconds(5);
 
     // ── Event Batch Writer ──────────────────────────────────────────────
     void startBatchWriter();
