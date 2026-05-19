@@ -1511,7 +1511,13 @@ const SettingsView = () => {
                 <div className="config-row">
                   <div><div className="config-label">Gửi Email tự động</div><div className="config-desc">Kèm theo ảnh chụp Snapshot</div></div>
                   <div style={{display:'flex', gap:'10px', alignItems:'center'}}>
-                    <input className="config-input" disabled={!settings.alert_email_enabled} value={settings.alert_email_address} onChange={e => handleChange('alert_email_address', e.target.value)} />
+                    {/* 2026-05-19 unlock: operator needs to enter recipient
+                        BEFORE flipping the toggle on; pre-fix the input was
+                        locked until toggle=true, creating chicken-and-egg
+                        flow ("how do I enter the email if toggle won't
+                        accept until email is set?"). Backend PUT accepts
+                        the field regardless of the enabled flag. */}
+                    <input className="config-input" value={settings.alert_email_address} onChange={e => handleChange('alert_email_address', e.target.value)} />
                     <div className={`toggle ${settings.alert_email_enabled ? 'on' : ''}`} onClick={() => handleToggle('alert_email_enabled')}></div>
                   </div>
                 </div>

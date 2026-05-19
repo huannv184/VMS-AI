@@ -45,10 +45,10 @@ const FaceIdView = () => {
     const intv = setInterval(() => {
       apiClient.getEvents({ event_type: 'FACE_RECOGNIZED', limit: 20 })
         .then((res) => { if (res.success) setRecognitionLogs(res.data?.events || []); })
-        .catch(() => {});
+        .catch((err) => console.error('[FaceIdView] recognized poll failed:', err));
       apiClient.getEvents({ event_type: 'FACE_UNKNOWN', limit: 30 })
         .then((res) => { if (res.success) setUnknownLogs(res.data?.events || []); })
-        .catch(() => {});
+        .catch((err) => console.error('[FaceIdView] unknown poll failed:', err));
     }, 5000);
     return () => clearInterval(intv);
   }, []);

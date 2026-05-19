@@ -37,15 +37,21 @@ const ReIDView = () => {
           setProducerWired(res.data.producer_wired);
         }
       }
-    } catch {}
+    } catch (e) {
+      // Background poll — don't toast, but surface in console so a dev
+      // debugging "gallery seems frozen" has a breadcrumb.
+      console.error('[ReIDView] gallery fetch failed:', e);
+    }
   }, []);
 
-  // Fetch config  
+  // Fetch config
   const fetchConfig = useCallback(async () => {
     try {
       const res = await apiClient.getReIDConfig?.();
       if (res?.success) setConfig(res.data || {});
-    } catch {}
+    } catch (e) {
+      console.error('[ReIDView] config fetch failed:', e);
+    }
   }, []);
 
   useEffect(() => {
@@ -61,7 +67,9 @@ const ReIDView = () => {
     try {
       const res = await apiClient.getReIDTrail?.(globalId);
       if (res?.success) setTrail(res.data?.trail || []);
-    } catch {}
+    } catch (e) {
+      console.error('[ReIDView] trail load failed:', e);
+    }
   }, []);
 
   // Search by image
@@ -74,7 +82,12 @@ const ReIDView = () => {
         const base64 = ev.target.result;
         const res = await apiClient.searchReID?.(base64);
         if (res?.success) setSearchResults(res.data?.results || []);
-      } catch {}
+      } catch (err) {
+        console.error('[ReIDView] image search failed:', err);
+        // User-initiated upload — surface failure so they don't keep
+        // re-uploading hoping for results.
+        window.alert(`Tìm kiếm Re-ID thất bại: ${err?.message || err}`);
+      }
     };
     reader.readAsDataURL(file);
   };
@@ -83,7 +96,14 @@ const ReIDView = () => {
   const updateConfig = async (key, value) => {
     const newConfig = { ...config, [key]: value };
     setConfig(newConfig);
-    try { await apiClient.updateReIDConfig?.(newConfig); } catch {}
+    try {
+      await apiClient.updateReIDConfig?.(newConfig);
+    } catch (err) {
+      console.error('[ReIDView] config update failed:', err);
+      // Revert optimistic UI so user sees their change didn't stick.
+      setConfig(config);
+      window.alert(`Cập nhật config Re-ID thất bại: ${err?.message || err}`);
+    }
   };
 
   // Clear gallery
@@ -95,7 +115,13 @@ const ReIDView = () => {
       setStats({});
       setSelectedPerson(null);
       setTrail([]);
-    } catch {}
+    } catch (err) {
+      console.error('[ReIDView] clear gallery failed:', err);
+      // Critical destructive action — operator clicked, must know if it
+      // succeeded or not. Pre-fix the UI cleared locally even on 403/500
+      // and gallery reappeared on next poll, creating "what happened?" UX.
+      window.alert(`Xóa gallery thất bại: ${err?.message || err}`);
+    }
   };
 
   const getCameraName = (camId) => {

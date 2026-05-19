@@ -95,21 +95,30 @@ const CounterView = () => {
   };
 
   const handleThresholdChange = async (val) => {
+    const prev = capacityThreshold;
     setCapacityThreshold(val);
     try {
       await apiClient.updateSettings({ counter_capacity_threshold: val });
     } catch (err) {
-      console.warn('Failed to persist capacity threshold', err);
+      console.error('[CounterView] persist capacity threshold failed:', err);
+      // Operator slid the threshold — they expect it to stick. Revert
+      // optimistic UI + tell them so they don't trust the displayed value.
+      setCapacityThreshold(prev);
+      window.alert(`Lưu ngưỡng sức chứa thất bại: ${err?.message || err}`);
     }
   };
 
   const handleAudibleToggle = async () => {
+    const prev = audibleAlert;
     const next = !audibleAlert;
     setAudibleAlert(next);
     try {
       await apiClient.updateSettings({ counter_audible_alert: next });
     } catch (err) {
-      console.warn('Failed to persist audible alert', err);
+      console.error('[CounterView] persist audible alert failed:', err);
+      // Toggle visible UI state — operator must know it didn't persist.
+      setAudibleAlert(prev);
+      window.alert(`Lưu cảnh báo âm thanh thất bại: ${err?.message || err}`);
     }
   };
 

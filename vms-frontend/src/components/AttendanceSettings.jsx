@@ -749,9 +749,13 @@ const AttendanceSettings = ({ cameras = [], onToast = () => {} }) => {
                 {editingEmp === emp.id ? (
                   <>
                     <td style={cellStyle}>
+                      {/* 2026-05-19 unlock: operator must be able to fix a
+                          mistyped person_id post-create. Backend PUT
+                          accepts person_id on updateAttendanceEmployee,
+                          but UI froze the field after first save. */}
                       <input style={{ ...inputStyle, width: 70 }} type="number"
                              value={draftEmp.person_id}
-                             onChange={(e) => setDraftEmp({ ...draftEmp, person_id: e.target.value })} disabled />
+                             onChange={(e) => setDraftEmp({ ...draftEmp, person_id: e.target.value })} />
                     </td>
                     <td style={cellStyle}>
                       <input style={{ ...inputStyle, width: 100 }}

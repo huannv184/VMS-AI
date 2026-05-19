@@ -425,9 +425,14 @@ const apiClient = {
     method: 'POST',
     body: JSON.stringify({ preset_token: presetToken }),
   }),
-  ptzStartPatrol: () => apiClient.unsupported('PTZ patrol control is not exposed by the current backend API'),
-  ptzStopPatrol: () => apiClient.unsupported('PTZ patrol control is not exposed by the current backend API'),
-  ptzAddPatrolEntry: () => apiClient.unsupported('PTZ patrol entries are managed on the frontend because the backend API has no patrol endpoint'),
+  // NOTE: PTZ patrol (preset tour) is orchestrated CLIENT-SIDE by
+  // PtzPatrolModal — it walks a list of preset tokens with setTimeout
+  // and dwell-time between ptzGoToPreset calls. The three placeholder
+  // ptzStart/StopPatrol + ptzAddPatrolEntry stubs that lived here used
+  // to throw `unsupported` but had ZERO callers; removed 2026-05-19
+  // after audit. If a future contributor wants real server-side patrol
+  // (hardware-driven tour with persistent state across page reload),
+  // wire matching backend endpoints first.
 
   getEvents: (params = {}) => apiClient.request(`/api/events${buildQuery(params)}`),
   getEventStats: (cameraId) => apiClient.request(`/api/events/stats${buildQuery(cameraId ? { camera_id: cameraId } : {})}`),
