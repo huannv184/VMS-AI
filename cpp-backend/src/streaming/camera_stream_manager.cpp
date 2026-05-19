@@ -108,6 +108,48 @@ void releaseConnSlot(const std::string& ip) {
     g_conn_current.fetch_sub(1, std::memory_order_relaxed);
 }
 
+// 2026-05-19 BUG-WS-HANDSHAKE-XFF-01: per-socket client-IP resolution that
+// honours the same trusted_proxies gate as ApiUtils::resolveClientIp on the
+// HTTP side (commit 21a2715d). Without this, a reverse-proxied deployment
+// is doubly broken:
+//   1. `POST /api/ws/ticket` issues a ticket whose `ip` claim is the REAL
+//      client IP (resolveClientIp returned XFF). The WS handshake then
+//      compares the ticket's `ip` against `peerAddress()` (= the proxy),
+//      and decodeWsTicketJwt always rejects the legitimate ticket.
+//   2. The per-IP connection cap (BUG-WS-NO-CONN-CAP-01) collapses to
+//      "one bucket per proxy" — every real client maps to the same key
+//      and the cap is either useless or denies every legit connection.
+//
+// Resolution: if the QWebSocket's direct peer is listed in
+// config.security.trusted_proxies, return the leftmost X-Forwarded-For
+// entry from the upgrade request's headers (Qt 6+ exposes them via
+// QWebSocket::request()). Otherwise return the peer IP and ignore XFF.
+// Matches the HTTP helper's behaviour bit-for-bit so a proxy
+// (mis)configured for HTTP works identically for WS, and a proxy missing
+// from trusted_proxies fails both paths consistently.
+inline std::string resolveWsClientIp(QWebSocket* socket) {
+    if (!socket) return {};
+    const std::string peer = socket->peerAddress().toString().toStdString();
+    const auto& trusted = vms::Config::getInstance().getSecurityConfig().trusted_proxies;
+    if (trusted.empty()) return peer;
+
+    bool peer_is_trusted = false;
+    for (const auto& t : trusted) {
+        if (t == peer) { peer_is_trusted = true; break; }
+    }
+    if (!peer_is_trusted) return peer;
+
+    const QByteArray xff_q = socket->request().rawHeader(QByteArrayLiteral("X-Forwarded-For"));
+    if (xff_q.isEmpty()) return peer;
+    std::string xff = xff_q.toStdString();
+    auto comma = xff.find(',');
+    std::string client = (comma == std::string::npos) ? xff : xff.substr(0, comma);
+    auto lstart = client.find_first_not_of(" \t");
+    auto lend   = client.find_last_not_of(" \t");
+    if (lstart == std::string::npos) return peer;
+    return client.substr(lstart, lend - lstart + 1);
+}
+
 // 2026-05-17 BUG-WS-GLOBAL-FANOUT-01: broadcast-side scope check for the
 // camera-0 fan-out. Same map, same mutex — but called from arbitrary
 // producer threads (EventManager, AiEventProcessor, ZmqEventBridge, alert
@@ -242,7 +284,10 @@ void CameraStreamManager::onNewConnection() {
         return;
     }
 
-    const std::string peer_ip = socket->peerAddress().toString().toStdString();
+    // 2026-05-19 BUG-WS-HANDSHAKE-XFF-01: resolve via trusted_proxies gate
+    // so the per-IP cap and the `vms_peer_ip` property used for cap
+    // release both reflect the real client IP behind a reverse proxy.
+    const std::string peer_ip = resolveWsClientIp(socket);
     const auto& ws_cfg = vms::Config::getInstance().getWebSocketConfig();
 
     // 2026-05-17 BUG-WS-NO-CONN-CAP-01: enforce per-IP + global connection
@@ -398,7 +443,11 @@ void CameraStreamManager::processTextMessage(const QString& message) {
             }
             vms::core::User user;
             std::string jti;
-            std::string client_ip = socket->peerAddress().toString().toStdString();
+            // 2026-05-19 BUG-WS-HANDSHAKE-XFF-01: match the IP the ticket
+            // issuer saw via resolveClientIp on /api/ws/ticket. Without
+            // this, every reverse-proxied connection's ticket fails the
+            // IP-binding check because peerAddress() is the proxy.
+            std::string client_ip = resolveWsClientIp(socket);
 
             if (vms::utils::decodeWsTicketJwt(j["token"].get<std::string>(), user, jti, client_ip)) {
                 // One-time-use ticket enforcement with bounded TTL eviction.
