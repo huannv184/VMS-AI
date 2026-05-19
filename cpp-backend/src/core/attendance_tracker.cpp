@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "database/db_manager.h"
+#include "utils/bulk_writer.h"
 #include "utils/logger.h"
 
 namespace vms::core {

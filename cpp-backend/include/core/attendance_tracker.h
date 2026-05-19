@@ -18,7 +18,13 @@
 #include <string>
 #include <unordered_map>
 
-#include "utils/bulk_writer.h"
+// BulkWriter is template — forward-declare so this header stays Qt-free.
+// The header's "tests link via header alone" intent (see comment block
+// below) breaks if we pull bulk_writer.h, which transitively brings in
+// <QSqlDatabase>. unique_ptr<BulkWriter<Row>> only needs the complete
+// type at the destructor's point of use; attendance_tracker.cpp owns
+// that out-of-line and includes the real header.
+namespace vms::utils { template <typename> class BulkWriter; }
 
 namespace vms::core {
 
@@ -90,17 +96,19 @@ public:
     std::size_t pendingRows();
     std::uint64_t droppedRows();
 
-private:
-    AttendanceTracker();
-    ~AttendanceTracker();
-    AttendanceTracker(const AttendanceTracker&) = delete;
-    AttendanceTracker& operator=(const AttendanceTracker&) = delete;
-
+    // Pure key-pack — exposed for unit test (test_attendance_dedup.cpp
+    // exercises the real packing rule so prod + test cannot drift).
     // person_id (int32) ⊕ camera_id (int32) packed into uint64 for dedup map.
     static inline uint64_t packKey(int person_id, int camera_id) {
         return (static_cast<uint64_t>(static_cast<uint32_t>(person_id)) << 32)
              |  static_cast<uint64_t>(static_cast<uint32_t>(camera_id));
     }
+
+private:
+    AttendanceTracker();
+    ~AttendanceTracker();
+    AttendanceTracker(const AttendanceTracker&) = delete;
+    AttendanceTracker& operator=(const AttendanceTracker&) = delete;
 
     std::string resolveKind(int camera_id, uint64_t key);
     int         resolveEmployeeId(int person_id);
