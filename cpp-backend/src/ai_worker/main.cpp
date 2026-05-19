@@ -795,9 +795,19 @@ int main(int argc, char** argv) {
                     //   person fewer than ~40 px tall is either too far for face
                     //   recognition to be useful or noise. Per-camera override via
                     //   VMS_MIN_PERSON_HEIGHT_PX.
+                    // 2026-05-19 default lowered 40→20 px after operator hit
+                    // "AI không có" out-of-box: a typical deployment sees real
+                    // people at <40 px in the source frame (wide-angle PTZ,
+                    // upper-corner mounts, or 720p streams) so 40 dropped
+                    // legitimate detections. 20 still filters obvious noise
+                    // (vegetation, fence texture, 1-pixel motion blobs). The
+                    // env var is the operator's emergency override; parent
+                    // vms_backend exports it from config.ai.min_person_height_px
+                    // when present, so this hardcoded value is a last-resort
+                    // fallback when both env and yaml are absent.
                     static const float min_person_height_px = []() {
                         const char* e = std::getenv("VMS_MIN_PERSON_HEIGHT_PX");
-                        return (e && *e) ? std::strtof(e, nullptr) : 40.0f;
+                        return (e && *e) ? std::strtof(e, nullptr) : 20.0f;
                     }();
 
                     std::vector<inference::BBox> det_bboxes;

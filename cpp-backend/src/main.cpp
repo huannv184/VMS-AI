@@ -270,6 +270,30 @@ int main(int argc, char* argv[]) {
         LOG_INFO("VMS AI Backend v1.1 Starting...");
         LOG_INFO("============================================");
 
+        // 2026-05-19 Export AI detection tuning into env BEFORE any
+        // ai_worker_v2 spawn. QProcess in camera_pipeline_manager inherits
+        // env from this process, so children read the same value via
+        // std::getenv. We DO NOT overwrite if the env var is already set:
+        // an operator running with `$env:VMS_MIN_PERSON_HEIGHT_PX=...`
+        // expects emergency override to beat the yaml. Layering:
+        //   env var > yaml > ai_worker hardcoded fallback.
+        {
+            const auto& ai_det = config.getAIDetectionConfig();
+            if (std::getenv("VMS_MIN_PERSON_HEIGHT_PX") == nullptr &&
+                ai_det.min_person_height_px > 0.0f) {
+                const std::string v = std::to_string(ai_det.min_person_height_px);
+#ifdef _WIN32
+                _putenv_s("VMS_MIN_PERSON_HEIGHT_PX", v.c_str());
+#else
+                setenv("VMS_MIN_PERSON_HEIGHT_PX", v.c_str(), /*overwrite=*/0);
+#endif
+                LOG_INFO("AI detection: VMS_MIN_PERSON_HEIGHT_PX={} (from config.ai.min_person_height_px)",
+                         v);
+            } else if (const char* e = std::getenv("VMS_MIN_PERSON_HEIGHT_PX")) {
+                LOG_INFO("AI detection: VMS_MIN_PERSON_HEIGHT_PX={} (from operator env override)", e);
+            }
+        }
+
         config.print();
         
         const auto& serverConfig = config.getServerConfig();

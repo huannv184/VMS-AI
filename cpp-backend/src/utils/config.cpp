@@ -267,6 +267,15 @@ bool Config::loadFromFile(const std::string& filepath) {
             ai_server_.zmq_timeout_ms = ai["zmq_timeout_ms"].as<int>(ai_server_.zmq_timeout_ms);
             ai_server_.reconnect_interval_sec = ai["reconnect_interval_sec"].as<int>(ai_server_.reconnect_interval_sec);
         }
+
+        // 2026-05-19 AI detection tuning thresholds — see config.h comment
+        // for trade-offs. Exported into the parent process env in main.cpp
+        // so ai_worker_v2 children inherit via QProcess.
+        if (config_["ai"]) {
+            auto ai = config_["ai"];
+            ai_detection_.min_person_height_px =
+                ai["min_person_height_px"].as<float>(ai_detection_.min_person_height_px);
+        }
         
         // Parse batch inference configuration
         if (config_["batch_inference"]) {

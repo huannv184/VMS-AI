@@ -103,7 +103,33 @@ ai_server:
   base_zmq_port: 5555  # Port = base_port + camera_id
   zmq_timeout_ms: 1000
   reconnect_interval_sec: 5
-  
+
+# ============================================================================
+# AI DETECTION TUNING THRESHOLDS
+# ============================================================================
+# These knobs are read by the parent vms_backend at boot and exported into
+# the process env BEFORE spawning ai_worker_v2 children. The child reads via
+# std::getenv so the same values apply to every spawned camera worker.
+#
+# Override order: env var > yaml > hardcoded fallback. If you set the env
+# var yourself (e.g. PowerShell `$env:VMS_MIN_PERSON_HEIGHT_PX = "30"`),
+# this yaml value is ignored — that lets you A/B tune in a single session
+# without editing yaml.
+ai:
+  # min_person_height_px: drop person-class (COCO class_id 0) detections
+  # with bbox height smaller than this many pixels in the source frame.
+  # Combats distant-noise false positives (vegetation, fence texture,
+  # shadow). Trade-off:
+  #   - Lower  → see people farther from camera; more false-positive risk
+  #     on cluttered backgrounds.
+  #   - Higher → cleaner alerts; miss legitimately distant subjects.
+  # Default 20 is a permissive baseline that works for typical
+  # human-scale-mounted cameras. The 2026-05-08 Fix-B operator
+  # ("thùng rác cũng ra người, mặt đường lại ra khuôn mặt tôi") chose
+  # 40 for their specific deployment with clutter-heavy backgrounds.
+  # Maps to env var VMS_MIN_PERSON_HEIGHT_PX consumed by ai_worker_v2.
+  min_person_height_px: 20
+
 # ============================================================================
 # MEDIA SIGNING (presigned URLs for snapshots, recordings, etc.)
 # ============================================================================

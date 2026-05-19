@@ -127,6 +127,25 @@ public:
         int reconnect_interval_sec = 5;
     };
 
+    // 2026-05-19 AI detection tuning thresholds. Exported into the parent
+    // process env BEFORE ai_worker_v2 spawn (camera_pipeline_manager uses
+    // QProcess which inherits env). Operators can also set env vars
+    // directly — env takes precedence so emergency override doesn't need
+    // a config edit + restart cycle. Values land in ai_worker_v2's
+    // post-detection filter (src/ai_worker/main.cpp).
+    //
+    // min_person_height_px: drop person-class detections with bbox height
+    // smaller than this (px in the source frame). Combats distant-noise
+    // false positives (vegetation, fence texture, shadow). Default 20 is
+    // a permissive baseline; the 2026-05-08 Fix-B operator
+    // ("thùng rác cũng ra người") chose 40 for their specific deployment.
+    // If your camera mount sees people at <20 px height your scene is
+    // either very wide-angle or the camera is too far for face
+    // recognition to be useful anyway.
+    struct AIDetectionConfig {
+        float min_person_height_px = 20.0f;
+    };
+
     // Batch inference configuration (M-1)
     struct BatchInferenceConfig {
         bool enabled = false;
@@ -243,6 +262,11 @@ public:
     const AIServerConfig& getAIServerConfig() const { return ai_server_; }
 
     /**
+     * @brief Get AI detection tuning thresholds (min_person_height_px etc.)
+     */
+    const AIDetectionConfig& getAIDetectionConfig() const { return ai_detection_; }
+
+    /**
      * @brief Get batch inference configuration
      */
     const BatchInferenceConfig& getBatchInferenceConfig() const { return batch_inference_; }
@@ -291,6 +315,7 @@ private:
     CorsConfig cors_;
     WebSocketConfig websocket_;
     AIServerConfig ai_server_;
+    AIDetectionConfig ai_detection_;
     BatchInferenceConfig batch_inference_;
     LoggingConfig logging_;
     StorageConfig storage_;
