@@ -54,6 +54,29 @@ public:
     /**
      * @brief Get a QSqlDatabase connection for the calling thread.
      * If no connection exists for this thread, one is created (cloned from primary).
+     *
+     * @warning Caller-thread lifetime assumption (BUG-DB-CONN-REGISTRY-AUDIT-01,
+     * audited 2026-05-19): we DO NOT close the per-thread QSqlDatabase when the
+     * thread itself exits. Both Qt's static QSqlDatabase registry and
+     * `registered_connections_` retain the connection until DbManager::close()
+     * fires at process shutdown. This is safe in the current architecture:
+     *   - Crow HTTP threads come from a fixed pool sized by hardware_concurrency.
+     *     Threads are stable from start to shutdown.
+     *   - Background workers (batch writer, bulk writers, ReID flush, AI ingest)
+     *     are long-lived dedicated threads with deterministic lifetimes.
+     *   - No code currently does spawn-per-request or default-policy std::async
+     *     that would create transient threads invoking this method.
+     *
+     * BEFORE ADDING a short-lived-thread caller (e.g. std::thread joined inside
+     * a request scope, or std::async with default launch policy that may spawn),
+     * either:
+     *   1. Don't call getThreadConnection from that thread — marshal the DB
+     *      work to a long-lived worker, OR
+     *   2. Add a thread-exit hook that calls QSqlDatabase::removeDatabase and
+     *      erases from registered_connections_. Without this, std::thread::id
+     *      reuse can hand a NEW thread its predecessor's stale connection
+     *      (Qt's registry is keyed by name string, not by live thread).
+     *
      * @return QSqlDatabase for the calling thread
      */
     QSqlDatabase getThreadConnection();
