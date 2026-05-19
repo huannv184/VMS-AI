@@ -1,6 +1,11 @@
 #include "core/brands/uniview_core.hpp"
 #include "core/brands/http_client.h"
+#include "core/runtime_state.h"
 #include "utils/logger.h"
+
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 namespace vms {
 namespace core {
@@ -77,22 +82,54 @@ nlohmann::json UniviewCore::getSpecializedConfig(const CameraDiscovery::Discover
 
 void UniviewCore::pullEvents(const CameraDiscovery::DiscoveryConfig& cfg, std::function<bool(const std::string&)> onEvent) {
     CameraDiscovery::HttpClient http(cfg);
-    // Uniview uses long-polling or HTTP multipart for VCA/Alarm
-    // GET /LAPI/V1.0/System/Event/Subscription (HTTP Stream)
-    
-    std::string path = "/LAPI/V1.0/System/Event/Subscription";
-    bool running = true;
-    
-    while (running) {
-        http.streamGet(path, [onEvent](const std::string& chunk) -> bool {
-            // Simplified: extract event types from Uniview LAPI message
-            if (chunk.find("\"EventType\"") != std::string::npos) {
-                  return onEvent(chunk);
-            }
-            return true; // Continue streaming
-        });
-        
-        if (running) std::this_thread::sleep_for(std::chrono::seconds(5)); // Retry delay
+    // Uniview LAPI HTTP-stream subscription. Each chunk that contains an
+    // `EventType` key is forwarded to onEvent. onEvent's return value is
+    // honoured — returning false breaks the stream.
+    const std::string path = "/LAPI/V1.0/System/Event/Subscription";
+
+    // 2026-05-19 BUG-UNIVIEW-LOOP-01 fix: pre-fix used `bool running = true`
+    // that was NEVER mutated, so a streamGet exit (camera reboot, auth
+    // expired, network drop) sleep-5s'd and retried forever — thread leak.
+    // The fix mirrors the brand-events sprint pattern (Axis / ONVIF /
+    // Dahua / Hanwha): bounded retry loop with shutdown gate + exponential
+    // backoff, cap at 5 consecutive failures, log and exit so the caller
+    // (CameraEventService) can decide whether to relaunch with backoff of
+    // its own.
+    int consecutive_failures = 0;
+    constexpr int kMaxConsecutiveFailures = 5;
+    auto backoff_ms = std::chrono::milliseconds(2000);
+    constexpr auto kMaxBackoff = std::chrono::milliseconds(30'000);
+
+    while (!vms::core::shutting_down.load(std::memory_order_acquire) &&
+           consecutive_failures < kMaxConsecutiveFailures) {
+        // streamGet returns void; any return path (clean disconnect, curl
+        // error, onEvent returning false) means the long-poll connection
+        // is no longer live. Caller-side restart with backoff is the only
+        // recovery channel we have.
+        http.streamGet(path,
+            [&onEvent](const std::string& chunk) -> bool {
+                if (chunk.find("\"EventType\"") != std::string::npos) {
+                    return onEvent(chunk);
+                }
+                return true; // keep streaming through unrelated chunks
+            });
+
+        if (vms::core::shutting_down.load(std::memory_order_acquire)) break;
+
+        ++consecutive_failures;
+        LOG_WARN("[UniviewCore] event stream ended on {} (#{}/{}), "
+                 "backing off {} ms",
+                 cfg.host, consecutive_failures, kMaxConsecutiveFailures,
+                 static_cast<long long>(backoff_ms.count()));
+        std::this_thread::sleep_for(backoff_ms);
+        backoff_ms = std::min(backoff_ms * 2, kMaxBackoff);
+    }
+
+    if (consecutive_failures >= kMaxConsecutiveFailures) {
+        LOG_WARN("[UniviewCore] giving up event subscription on {} after "
+                 "{} consecutive failures — CameraEventService may relaunch "
+                 "with its own outer backoff",
+                 cfg.host, kMaxConsecutiveFailures);
     }
 }
 
