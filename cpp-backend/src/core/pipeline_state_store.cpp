@@ -63,6 +63,7 @@ void PipelineStateStore::updateFrame(int camera_id,
                                                               jpeg_data.end());
     }
     auto new_objects = std::make_shared<const std::vector<inference::TrackedObject>>(objects);
+    auto new_metadata = std::make_shared<const nlohmann::json>(metadata);
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& snapshot = getOrCreateLocked(camera_id);
@@ -72,15 +73,17 @@ void PipelineStateStore::updateFrame(int camera_id,
         snapshot.latest_frame_jpeg = std::move(new_jpeg);
     }
     snapshot.latest_objects = std::move(new_objects);
-    snapshot.latest_metadata = metadata;
+    snapshot.latest_metadata = std::move(new_metadata);
     snapshot.last_frame_ts = static_cast<long long>(timestamp_ms);
 }
 
 void PipelineStateStore::updateMetadata(int camera_id, const nlohmann::json& metadata) {
     if (shuttingDown()) return;
+    // Build the immutable copy outside the lock — same shape as updateFrame.
+    auto new_metadata = std::make_shared<const nlohmann::json>(metadata);
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& snapshot = getOrCreateLocked(camera_id);
-    snapshot.latest_metadata = metadata;
+    snapshot.latest_metadata = std::move(new_metadata);
 }
 
 void PipelineStateStore::updateStats(int camera_id,
@@ -162,12 +165,20 @@ std::vector<inference::TrackedObject> PipelineStateStore::latestObjects(int came
 }
 
 nlohmann::json PipelineStateStore::latestMetadata(int camera_id) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    auto it = snapshots_.find(camera_id);
-    if (it == snapshots_.end()) {
-        return nlohmann::json::object();
+    // Acquire the refcounted handle under shared_lock, deep-copy outside —
+    // same pattern as latestFrameJpeg(). Backward-compatible return-by-value
+    // shape preserved (callers can't migrate to shared API cheaply since
+    // nlohmann::json's value semantics are baked into the call sites).
+    std::shared_ptr<const nlohmann::json> handle;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto it = snapshots_.find(camera_id);
+        if (it == snapshots_.end() || !it->second.latest_metadata) {
+            return nlohmann::json::object();
+        }
+        handle = it->second.latest_metadata;
     }
-    return it->second.latest_metadata;
+    return *handle;
 }
 
 std::optional<PipelineStateSnapshot> PipelineStateStore::snapshot(int camera_id) const {

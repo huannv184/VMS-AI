@@ -40,11 +40,20 @@ struct PipelineStateSnapshot {
     std::shared_ptr<const std::vector<char>> latest_frame_jpeg;
     std::shared_ptr<const std::vector<inference::TrackedObject>> latest_objects;
 
-    // Metadata is updated by BOTH updateFrame AND the rare updateMetadata path
-    // (ZmqEventBridge metadata messages). Kept as plain JSON because (a) its
-    // copy cost is bounded — usually <2 KB per metadata blob — and (b) the
-    // partial-update path doesn't have a frame bundle to swap with.
-    nlohmann::json latest_metadata{nlohmann::json::object()};
+    // 2026-05-19 latest_metadata promoted to shared_ptr<const ...> for the
+    // same reason latest_frame_jpeg + latest_objects are: writer builds the
+    // immutable object OUTSIDE the unique_lock and swaps the pointer
+    // inside. Earlier comment ("kept as plain JSON because copy is small")
+    // was technically true — typical 1-2 KB per blob — but kept readers
+    // paying for a deep nlohmann::json copy under shared_lock on every
+    // snapshot() / latestMetadata() call. Symmetric with frame + objects
+    // is also easier to reason about: ONE rule for ALL hot fields.
+    //
+    // Null pointer == "no metadata yet"; latestMetadata() materialises an
+    // empty object in that case for backward compat. updateMetadata() and
+    // updateFrame() construct via std::make_shared before acquiring the
+    // unique_lock.
+    std::shared_ptr<const nlohmann::json> latest_metadata;
 };
 
 class PipelineStateStore {
