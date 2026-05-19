@@ -534,8 +534,14 @@ int main(int argc, char** argv) {
 
     // Fire/Smoke - Disabled for optimization
     ai_config.enable_fire_detection = false;
-    ai_config.fire_model_path = resolveModelPath("fire_smoke_best.onnx", exe_path); 
-    
+    ai_config.fire_model_path = resolveModelPath("fire_smoke_best.onnx", exe_path);
+
+    // 2026-05-19 PPE — disabled by default; operator opts in via cmdline
+    // JSON {"ppe":true} or env VMS_AI_ENABLE_PPE=1. Engine ~55 MB; class
+    // mapping per PPEClass enum (see header comment in MultiModelInfer).
+    ai_config.enable_ppe = false;
+    ai_config.ppe_model_path = resolveModelPath("PPE-YOLOv8m.engine", exe_path);
+
     // LPR - Disabled for optimization
     ai_config.enable_lpr = false;
     ai_config.plate_detect_model_path = resolveModelPath("yolov8n_plate.onnx", exe_path);
@@ -555,6 +561,7 @@ int main(int argc, char** argv) {
             }
             if (j_config.contains("lpr")) ai_config.enable_lpr = j_config["lpr"];
             if (j_config.contains("fire")) ai_config.enable_fire_detection = j_config["fire"];
+            if (j_config.contains("ppe")) ai_config.enable_ppe = j_config["ppe"];
             if (j_config.contains("face_match_threshold")) {
                 ai_config.face_match_threshold = j_config["face_match_threshold"].get<float>();
                 std::cerr << "[AI-Worker-" << camera_id << "] Custom face_match_threshold: " 
@@ -590,6 +597,16 @@ int main(int argc, char** argv) {
     if (env_truthy("VMS_AI_DISABLE_FIRE")) {
         ai_config.enable_fire_detection = false;
         std::cerr << "[AI-Worker-" << camera_id << "] VMS_AI_DISABLE_FIRE=1 — fire OFF" << std::endl;
+    }
+    // 2026-05-19 PPE env override (parallel to other DISABLE/ENABLE knobs).
+    // VMS_AI_ENABLE_PPE=1 force-on; VMS_AI_DISABLE_PPE=1 force-off.
+    if (env_truthy("VMS_AI_ENABLE_PPE")) {
+        ai_config.enable_ppe = true;
+        std::cerr << "[AI-Worker-" << camera_id << "] VMS_AI_ENABLE_PPE=1 — ppe ON" << std::endl;
+    }
+    if (env_truthy("VMS_AI_DISABLE_PPE")) {
+        ai_config.enable_ppe = false;
+        std::cerr << "[AI-Worker-" << camera_id << "] VMS_AI_DISABLE_PPE=1 — ppe OFF" << std::endl;
     }
 
     // ========================================
@@ -1053,6 +1070,46 @@ int main(int argc, char** argv) {
                     });
                 }
                 
+                // 2026-05-19 PPE detections — class_ids 0-8 from the PPE
+                // engine collide with COCO (person=0) so we remap to a
+                // dedicated 300+ namespace. AiEventProcessor (vms_backend
+                // side) dispatches 303 / 304 as PPE_VIOLATION.
+                //
+                //   PPEClass enum (see commit comment restored from ed4be5c^):
+                //     0 person -> 300, 1 safety_vest -> 301, 2 hard_hat -> 302,
+                //     3 no_safety_vest -> 303 (violation),
+                //     4 no_hard_hat    -> 304 (violation),
+                //     5/6/7/8 uniform colors -> 305/306/307/308.
+                //
+                // Operator who trained their own PPE engine with different
+                // class order MUST adjust this mapping or the labels lie.
+                static const char* kPPELabels[] = {
+                    "PPE_Person", "SafetyVest", "HardHat",
+                    "NoSafetyVest", "NoHardHat",
+                    "UniformBlue", "UniformWhite", "UniformOrange", "UniformOther"
+                };
+                for (const auto& ppe : result.ppe_objects) {
+                    const int src_cls = ppe.class_id;
+                    if (src_cls < 0 || src_cls > 8) continue; // out of expected range
+                    inference::TrackedObject to;
+                    to.bbox.x1 = ppe.x1; to.bbox.y1 = ppe.y1;
+                    to.bbox.x2 = ppe.x2; to.bbox.y2 = ppe.y2;
+                    to.confidence = ppe.score;
+                    to.bbox.score = ppe.score;
+                    to.bbox.class_id = 300 + src_cls;
+                    to.label = kPPELabels[src_cls];
+                    to.track_id = -1;
+                    tracked_objects.push_back(to);
+
+                    j_out["objects"].push_back({
+                        {"label", to.label},
+                        {"class_id", to.bbox.class_id},
+                        {"confidence", to.confidence},
+                        {"track_id", to.track_id},
+                        {"box", {to.bbox.x1, to.bbox.y1, to.bbox.x2, to.bbox.y2}}
+                    });
+                }
+
                 // License Plates
                 for (const auto& plate : result.plates) {
                     inference::TrackedObject to;

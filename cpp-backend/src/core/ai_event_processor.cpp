@@ -163,6 +163,11 @@ void AiEventProcessor::eventWorkerLoop() {
                     processIntrusion(job.camera_id, obj, job.frame);
                 } else if (class_id == 200 || label == "LicensePlate") {
                     processLicensePlate(job.camera_id, obj, job.frame);
+                } else if (class_id == 303 || class_id == 304 ||
+                           label == "NoSafetyVest" || label == "NoHardHat") {
+                    // 2026-05-19 PPE violation classes from PPE-YOLOv8 engine
+                    // (class_ids 303/304 after 300-offset remap in ai_worker).
+                    processPPEViolation(job.camera_id, obj, job.frame);
                 }
             }
             // Single tracker advance + line crossing pass per frame so the
@@ -341,6 +346,85 @@ void AiEventProcessor::processIntrusion(int camera_id, const nlohmann::json& obj
     setCooldown(key);
 
     LOG_INFO("Person event: camera={} track={} conf={:.2f}", camera_id, track_id, confidence);
+}
+
+// ── PPE violation handler ────────────────────────────────────────────────────
+//
+// 2026-05-19 BUG-PPE-PHANTOM-FEATURE fix: ai_worker_v2 now feeds PPE-YOLOv8
+// detections through the metadata.objects channel with class_ids 300-308
+// (300-offset over PPE engine's 0-8 to avoid COCO class collision).
+// Classes 303 (NO_SAFETY_VEST) and 304 (NO_HARD_HAT) are the violation
+// classes; this handler emits one PPE_VIOLATION Event row per cooldown
+// window per camera+location, matching the shape already consumed by
+// PpeMonitorView via getEvents({event_type: 'PPE_VIOLATION'}).
+//
+// Cooldown is by bbox center bucket (50px grid) per camera + violation
+// kind, NOT by track_id — PPE detections have track_id=-1 today (the
+// engine outputs raw bboxes; tracker_state_manager only ingests COCO
+// person class). 50 px bucket lets the same person re-trigger if they
+// walk meaningfully across frame but suppresses static re-detection.
+//
+// Confidence floor 0.50: PPE conf_threshold in MultiModelInfer::Config
+// is 0.45 (model-side NMS) — this 0.50 is the policy-side filter so an
+// operator's PpeMonitorView never sees borderline detections that the
+// model itself flagged with low confidence.
+void AiEventProcessor::processPPEViolation(int camera_id,
+                                          const nlohmann::json& obj,
+                                          const cv::Mat& frame) {
+    int class_id = obj.value("class_id", -1);
+    std::string label = obj.value("label", std::string(""));
+    double confidence = obj.value("confidence", 0.0);
+    if (confidence < 0.50) return;
+
+    // Build a stable kind tag for the cooldown key + event description.
+    std::string kind;
+    std::string desc;
+    if (class_id == 303 || label == "NoSafetyVest") {
+        kind = "no_vest";
+        desc = "Phát hiện nhân viên không mặc áo phản quang";
+    } else if (class_id == 304 || label == "NoHardHat") {
+        kind = "no_hat";
+        desc = "Phát hiện nhân viên không đội mũ bảo hộ";
+    } else {
+        return; // not a violation class
+    }
+
+    auto j_bbox = obj.value("box",
+                            obj.value("bbox", nlohmann::json::array()));
+
+    // Position bucket for cooldown (same idea as processIntrusion fallback).
+    int cx = 0, cy = 0;
+    if (j_bbox.is_array() && j_bbox.size() >= 4) {
+        cx = (j_bbox[0].get<int>() + j_bbox[2].get<int>()) / 2;
+        cy = (j_bbox[1].get<int>() + j_bbox[3].get<int>()) / 2;
+    }
+    std::string key = std::to_string(camera_id) + ":" + kind +
+                      ":" + std::to_string(cx / 50) +
+                      ":" + std::to_string(cy / 50);
+    if (isOnCooldown(key)) return;
+
+    cv::Mat crop = cropSnapshot(frame, j_bbox);
+    std::string snapshot_path = saveSnapshot(camera_id, crop);
+
+    Event event;
+    event.id = EventManager::generateEventId();
+    event.camera_id = camera_id;
+    event.event_type = "PPE_VIOLATION";
+    event.description = desc;
+    event.snapshot_path = snapshot_path;
+    event.timestamp = std::chrono::time_point_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now()).time_since_epoch().count();
+
+    nlohmann::json enhanced_meta = obj;
+    enhanced_meta["snapshot_url"] = snapshot_path;
+    enhanced_meta["violation_kind"] = kind;   // "no_vest" | "no_hat"
+    event.metadata_json = enhanced_meta.dump();
+
+    EventManager::getInstance().createEvent(event);
+    setCooldown(key);
+
+    LOG_INFO("PPE violation: camera={} kind={} conf={:.2f} at ({},{})",
+             camera_id, kind, confidence, cx, cy);
 }
 
 // ── License plate handler ────────────────────────────────────────────────────

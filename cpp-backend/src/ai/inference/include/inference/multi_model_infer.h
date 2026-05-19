@@ -45,16 +45,24 @@ struct LicensePlateResult {
 struct MultiModelResult {
     std::vector<BBox> objects;      // YOLO detections
     std::vector<BBox> fire_objects; // Fire/Smoke detections
+    // 2026-05-19 PPE detections. class_id maps to vms_ai::PPEClass:
+    //   0 person, 1 safety_vest, 2 hard_hat,
+    //   3 no_safety_vest (violation), 4 no_hard_hat (violation),
+    //   5-8 uniform colors (blue/white/orange/other).
+    // Violation pairing (which person is missing which PPE) is done in
+    // ai_worker post-processing — keep this layer just the raw boxes.
+    std::vector<BBox> ppe_objects;
     std::vector<FaceDetectionResult> faces; // SCRFD + ArcFace
     std::vector<LicensePlateResult> plates; // LPR
     uint32_t frame_id;
     uint64_t timestamp_ms;
-    
+
     // Processing times
     double yolo_time_ms;
     double face_detect_time_ms;
     double face_recog_time_ms;
     double lpr_time_ms;
+    double ppe_time_ms = 0.0;
     double total_time_ms;
 };
 
@@ -89,6 +97,19 @@ public:
         std::string fire_model_path;
         int fire_input_size = 640;
         float fire_conf_threshold = 0.25f;
+
+        // 2026-05-19 PPE Detection (YOLOv8 custom-trained, 9 classes).
+        // Default OFF so operators opt in: the engine adds ~80 MB GPU
+        // memory + per-frame inference cost (~10-15 ms on a 3060). Class
+        // mapping matches the original PPEDetector spec restored from
+        // commit ed4be5c^ — operators who built their own engine with a
+        // different class order MUST validate before relying on
+        // violation events.
+        bool enable_ppe = false;
+        std::string ppe_model_path;
+        int ppe_input_size = 640;
+        float ppe_conf_threshold = 0.45f;
+        float ppe_nms_threshold = 0.45f;
 
         // LPR (License Plate Recognition)
         std::string plate_detect_model_path; // YOLOv8-plate
@@ -143,6 +164,7 @@ private:
     // Model instances
     std::unique_ptr<AdvancedInfer> yolo_infer_;
     std::unique_ptr<AdvancedInfer> fire_infer_;
+    std::unique_ptr<AdvancedInfer> ppe_infer_;
     std::unique_ptr<AdvancedInfer> plate_detect_infer_;
     std::unique_ptr<TrtEngine> scrfd_engine_;
     std::unique_ptr<TrtEngine> arcface_engine_;

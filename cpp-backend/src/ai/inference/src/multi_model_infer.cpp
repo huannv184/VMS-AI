@@ -91,7 +91,37 @@ bool MultiModelInfer::init() {
     } else {
         config_.enable_fire_detection = false;
     }
-    
+
+    // 2026-05-19 PPE INITIALIZATION (mirror fire-detection pattern)
+    if (config_.enable_ppe && !config_.ppe_model_path.empty()) {
+        std::cerr << "[MultiModelInfer] Loading PPE model..." << std::endl;
+        std::ifstream ppe_file(config_.ppe_model_path);
+        if (!ppe_file.good()) {
+            std::cerr << "[MultiModelInfer] WARNING: PPE model not found: " << config_.ppe_model_path << std::endl;
+            config_.enable_ppe = false;
+        } else {
+            ppe_file.close();
+            InferConfig ppe_cfg;
+            ppe_cfg.model_path = config_.ppe_model_path;
+            ppe_cfg.input_width = config_.ppe_input_size;
+            ppe_cfg.input_height = config_.ppe_input_size;
+            ppe_cfg.conf_threshold = config_.ppe_conf_threshold;
+            ppe_cfg.nms_threshold = config_.ppe_nms_threshold;
+
+            ppe_infer_ = std::make_unique<AdvancedInfer>(ppe_cfg);
+            if (!ppe_infer_->init()) {
+                std::cerr << "[MultiModelInfer] PPE model init failed - disabling" << std::endl;
+                config_.enable_ppe = false;
+                ppe_infer_.reset();
+            } else {
+                std::cerr << "[MultiModelInfer] ✓ PPE model loaded ("
+                          << config_.ppe_model_path << ")" << std::endl;
+            }
+        }
+    } else {
+        config_.enable_ppe = false;
+    }
+
     // SCRFD INITIALIZATION
     if (config_.enable_face_detection && !config_.scrfd_model_path.empty()) {
         std::cerr << "[MultiModelInfer] Loading SCRFD..." << std::endl;
@@ -221,7 +251,7 @@ MultiModelResult MultiModelInfer::infer(const cv::Mat& frame, uint32_t frame_id)
     // FIRE / SMOKE
     if (config_.enable_fire_detection && fire_infer_) {
         try {
-            // We reuse yolo_time_ms accumulator or add a new one? 
+            // We reuse yolo_time_ms accumulator or add a new one?
             // For now, let's include it in total time but not break struct
             // Ideally we should add fire_time_ms to struct, but keeping it simple for now.
             result.fire_objects = fire_infer_->detectObjects(frame);
@@ -229,7 +259,19 @@ MultiModelResult MultiModelInfer::infer(const cv::Mat& frame, uint32_t frame_id)
              std::cerr << "[MultiModelInfer] Fire Infer error: " << e.what() << std::endl;
         }
     }
-    
+
+    // 2026-05-19 PPE (parallel to fire — independent post-detect classifier)
+    if (config_.enable_ppe && ppe_infer_) {
+        try {
+            auto start = std::chrono::high_resolution_clock::now();
+            result.ppe_objects = ppe_infer_->detectObjects(frame);
+            auto end = std::chrono::high_resolution_clock::now();
+            result.ppe_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        } catch (const std::exception& e) {
+            std::cerr << "[MultiModelInfer] PPE error: " << e.what() << std::endl;
+        }
+    }
+
     // SCRFD
     if (config_.enable_face_detection && scrfd_engine_ && scrfd_engine_->isLoaded()) {
         try {
@@ -240,7 +282,7 @@ MultiModelResult MultiModelInfer::infer(const cv::Mat& frame, uint32_t frame_id)
         } catch (const std::exception& e) {
             std::cerr << "[MultiModelInfer] SCRFD error: " << e.what() << std::endl;
         }
-        
+
         // ARCFACE (Nested under face detection)
         if (config_.enable_face_recognition && arcface_engine_ && 
             arcface_engine_->isLoaded() && !result.faces.empty()) {
@@ -310,6 +352,18 @@ MultiModelResult MultiModelInfer::inferNonYolo(
             result.fire_objects = fire_infer_->detectObjects(frame);
         } catch (const std::exception& e) {
             std::cerr << "[MultiModelInfer] Fire Infer error: " << e.what() << std::endl;
+        }
+    }
+
+    // 2026-05-19 PPE (mirror fire pattern on the non-YOLO path)
+    if (config_.enable_ppe && ppe_infer_) {
+        try {
+            auto start = std::chrono::high_resolution_clock::now();
+            result.ppe_objects = ppe_infer_->detectObjects(frame);
+            auto end = std::chrono::high_resolution_clock::now();
+            result.ppe_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        } catch (const std::exception& e) {
+            std::cerr << "[MultiModelInfer] PPE error: " << e.what() << std::endl;
         }
     }
 
