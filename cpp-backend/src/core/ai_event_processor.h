@@ -70,11 +70,11 @@ private:
     void processFace(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
     void processIntrusion(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
     void processLicensePlate(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
-    // 2026-05-19 PPE violation handler. Triggered by class_ids 303
-    // (NO_SAFETY_VEST) and 304 (NO_HARD_HAT) from the PPE-YOLOv8 engine
-    // (ai_worker remaps engine's 3/4 → 303/304 to avoid collision with
-    // COCO person=0). Emits an Event row of type PPE_VIOLATION with
-    // snapshot + cooldown by camera+location.
+    // 2026-05-19 PPE violation handler. Triggered by class_ids 302
+    // (NoHelmet) and 304 (NoVest) from the PPE-YOLOv8 engine (ai_worker
+    // remaps engine's 0-5 → 300-305 to avoid collision with COCO
+    // person=0). Emits an Event row of type PPE_VIOLATION with snapshot
+    // + cooldown by camera+location.
     void processPPEViolation(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
     // BUG-REID-DEAD-PIPELINE producer: cross-camera ReID enrichment for every
     // person detection with a stable track_id. Engine handles its own cache

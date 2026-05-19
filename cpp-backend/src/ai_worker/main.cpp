@@ -539,8 +539,22 @@ int main(int argc, char** argv) {
     // 2026-05-19 PPE — disabled by default; operator opts in via cmdline
     // JSON {"ppe":true} or env VMS_AI_ENABLE_PPE=1. Engine ~55 MB; class
     // mapping per PPEClass enum (see header comment in MultiModelInfer).
+    // Conf threshold env-tunable: PPE-YOLOv8m calibration differs from
+    // COCO YOLO; 0.45 may be too strict for some training configs.
+    // Operator dials VMS_PPE_CONF_THRESHOLD=0.20 etc. without rebuild.
     ai_config.enable_ppe = false;
     ai_config.ppe_model_path = resolveModelPath("PPE-YOLOv8m.engine", exe_path);
+    {
+        const char* env = std::getenv("VMS_PPE_CONF_THRESHOLD");
+        if (env && *env) {
+            float v = std::strtof(env, nullptr);
+            if (v > 0.0f && v < 1.0f) {
+                ai_config.ppe_conf_threshold = v;
+                std::cerr << "[AI-Worker-" << camera_id
+                          << "] VMS_PPE_CONF_THRESHOLD=" << v << std::endl;
+            }
+        }
+    }
 
     // LPR - Disabled for optimization
     ai_config.enable_lpr = false;
@@ -1070,27 +1084,34 @@ int main(int argc, char** argv) {
                     });
                 }
                 
-                // 2026-05-19 PPE detections — class_ids 0-8 from the PPE
-                // engine collide with COCO (person=0) so we remap to a
-                // dedicated 300+ namespace. AiEventProcessor (vms_backend
-                // side) dispatches 303 / 304 as PPE_VIOLATION.
+                // 2026-05-19 PPE detections — engine outputs 6 classes
+                // (confirmed via output-tensor size 8,400 × 10 = 84,000).
+                // Class ids 0-5 are remapped to 300-305 to avoid COCO
+                // collision (COCO already uses class_id=0 for person).
                 //
-                //   PPEClass enum (see commit comment restored from ed4be5c^):
-                //     0 person -> 300, 1 safety_vest -> 301, 2 hard_hat -> 302,
-                //     3 no_safety_vest -> 303 (violation),
-                //     4 no_hard_hat    -> 304 (violation),
-                //     5/6/7/8 uniform colors -> 305/306/307/308.
+                // EDUCATED-GUESS mapping (operator validates by physical
+                // test — walk in frame with/without each PPE item and see
+                // which label fires):
+                //   0 → 300 PPE_Person
+                //   1 → 301 Helmet         (hard hat present)
+                //   2 → 302 NoHelmet       (violation)
+                //   3 → 303 Vest           (safety vest present)
+                //   4 → 304 NoVest         (violation)
+                //   5 → 305 PPE_Class5     (unknown 6th class — operator
+                //                            sees the label fire and tells
+                //                            us what it actually detected)
                 //
-                // Operator who trained their own PPE engine with different
-                // class order MUST adjust this mapping or the labels lie.
+                // AiEventProcessor::processPPEViolation fires on class_ids
+                // 302 / 304 (the violation classes after offset). If the
+                // engine's actual class order differs, edit kPPELabels[]
+                // AND the dispatch in ai_event_processor.cpp.
                 static const char* kPPELabels[] = {
-                    "PPE_Person", "SafetyVest", "HardHat",
-                    "NoSafetyVest", "NoHardHat",
-                    "UniformBlue", "UniformWhite", "UniformOrange", "UniformOther"
+                    "PPE_Person", "Helmet", "NoHelmet",
+                    "Vest", "NoVest", "PPE_Class5"
                 };
                 for (const auto& ppe : result.ppe_objects) {
                     const int src_cls = ppe.class_id;
-                    if (src_cls < 0 || src_cls > 8) continue; // out of expected range
+                    if (src_cls < 0 || src_cls > 5) continue; // out of expected range
                     inference::TrackedObject to;
                     to.bbox.x1 = ppe.x1; to.bbox.y1 = ppe.y1;
                     to.bbox.x2 = ppe.x2; to.bbox.y2 = ppe.y2;

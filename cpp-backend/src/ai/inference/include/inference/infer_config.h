@@ -25,7 +25,13 @@ struct InferConfig {
     // Detection thresholds
     float conf_threshold = 0.25f;
     float nms_threshold = 0.45f;
-    
+
+    // 2026-05-19 num_classes override. Default 80 = COCO YOLOv8/v11 (what
+    // AdvancedInfer was hardcoded to before). PPE engine uses 9; custom
+    // models can use any positive value. Parser reads output_dims = 4 +
+    // num_classes (Ultralytics YOLOv8 export convention).
+    int num_classes = 80;
+
     // Performance settings
     int batch_size = 1;
     bool use_fp16 = true;

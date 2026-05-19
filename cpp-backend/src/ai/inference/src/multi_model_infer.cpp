@@ -107,6 +107,15 @@ bool MultiModelInfer::init() {
             ppe_cfg.input_height = config_.ppe_input_size;
             ppe_cfg.conf_threshold = config_.ppe_conf_threshold;
             ppe_cfg.nms_threshold = config_.ppe_nms_threshold;
+            // 2026-05-19 PPE engine output_dims discovered via DIAG log:
+            // 84,000 floats = 8,400 anchors × 10 dims = 4 box + 6 classes.
+            // The original PPEDetector spec from commit ed4be5c^ listed 9
+            // classes (4 violation + person + 4 uniform colors), but the
+            // currently-deployed PPE-YOLOv8m.engine was retrained with 6
+            // classes — likely the operationally-meaningful subset. Operator
+            // validates exact class meanings by physical test (see ai_worker
+            // kPPELabels[] inline comment).
+            ppe_cfg.num_classes = 6;
 
             ppe_infer_ = std::make_unique<AdvancedInfer>(ppe_cfg);
             if (!ppe_infer_->init()) {
@@ -267,6 +276,24 @@ MultiModelResult MultiModelInfer::infer(const cv::Mat& frame, uint32_t frame_id)
             result.ppe_objects = ppe_infer_->detectObjects(frame);
             auto end = std::chrono::high_resolution_clock::now();
             result.ppe_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            // 2026-05-19 PPE diag: log every 30th inference call so we can
+            // tell parse-issue (always 0) apart from idle-scene (sometimes
+            // non-zero). Histogram per class so the operator can sanity-check
+            // class mapping against the trained engine.
+            static thread_local int ppe_diag_counter = 0;
+            if ((ppe_diag_counter++ % 30) == 0) {
+                int cls_hist[16] = {0};
+                for (const auto& obj : result.ppe_objects) {
+                    int c = obj.class_id;
+                    if (c >= 0 && c < 16) cls_hist[c]++;
+                }
+                std::cerr << "[MultiModelInfer] PPE-DIAG raw="
+                          << result.ppe_objects.size()
+                          << " t=" << result.ppe_time_ms << "ms"
+                          << " hist[0..8]=";
+                for (int i = 0; i <= 8; ++i) std::cerr << cls_hist[i] << ",";
+                std::cerr << std::endl;
+            }
         } catch (const std::exception& e) {
             std::cerr << "[MultiModelInfer] PPE error: " << e.what() << std::endl;
         }

@@ -218,9 +218,14 @@ std::vector<BBox> AdvancedInfer::parseYOLOv8Output(
 {
     std::vector<BBox> boxes;
 
-    const int num_classes = 80;
+    // 2026-05-19 num_classes is now config-driven (PPE engine uses 9, COCO
+    // YOLO uses 80). output_dims = 4 box + num_classes (Ultralytics YOLOv8
+    // export convention). Pre-fix hardcoded num_classes=80 made the parser
+    // walk past valid data for any non-COCO engine — every detection got
+    // rejected as garbage (max class score on cross-feature noise <0.2).
+    const int num_classes = (config_.num_classes > 0) ? config_.num_classes : 80;
     const int num_predictions = 8400;
-    const int output_dims = 84;
+    const int output_dims = 4 + num_classes;
 
     // DIAG: log output size + max confidence once every 200 calls so we can verify
     // the engine output matches the (1, 84, 8400) layout this parser assumes.
@@ -381,10 +386,15 @@ std::vector<BBox> AdvancedInfer::parseYOLOv8Output(
         box.score = best_conf;
         box.class_id = best_class;
 
-        if (best_class >= 0 && best_class < 80) {
+        // 2026-05-19 COCO_CLASSES lookup only valid when num_classes==80
+        // and class_id is a COCO id. For custom models (PPE, etc.) the
+        // class_id is meaningful but the COCO_CLASSES name is not — leave
+        // label empty for the consumer to map. ai_worker (PPE consumer)
+        // already remaps 0-8 → 300-308 with its own kPPELabels array.
+        if (num_classes == 80 && best_class >= 0 && best_class < 80) {
             box.label = COCO_CLASSES[best_class];
         } else {
-            box.label = "unknown";
+            box.label = "";
         }
 
         boxes.push_back(box);
