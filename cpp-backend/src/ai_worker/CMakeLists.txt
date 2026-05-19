@@ -103,20 +103,27 @@ set_target_properties(ai_worker_v2 PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
 )
 
-# Auto copy models next to the executables after build
+# Auto copy AI models next to the executables after build.
+# The .engine is a TensorRT artifact generated on the deploy host (not in
+# repo), so each copy is gated on EXISTS via copy_if_exists.cmake — build
+# always succeeds, missing artifacts produce a single STATUS line. See the
+# script's header for the BUG-AI-MODEL-DEPLOY-POSTBUILD-01 context.
 set(MODEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../ai/inference/models")
 set(MODEL_DST "${CMAKE_BINARY_DIR}/models")
 set(MODEL_DST_RELEASE "${CMAKE_BINARY_DIR}/Release/models")
+set(COPY_IF_EXISTS_SCRIPT "${CMAKE_SOURCE_DIR}/cmake/copy_if_exists.cmake")
 
 add_custom_command(TARGET ai_worker_v2 POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${MODEL_DST}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${MODEL_DST_RELEASE}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${MODEL_SRC}/yolo11m.engine"
-        "${MODEL_DST}/yolo11m.engine"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${MODEL_SRC}/yolo11m.engine"
-        "${MODEL_DST_RELEASE}/yolo11m.engine"
-    COMMENT "Copying AI model to Release/models/..."
+    COMMAND ${CMAKE_COMMAND}
+        -DSRC=${MODEL_SRC}/yolo11m.engine
+        -DDST=${MODEL_DST}/yolo11m.engine
+        -DLABEL=yolo11m.engine
+        -P ${COPY_IF_EXISTS_SCRIPT}
+    COMMAND ${CMAKE_COMMAND}
+        -DSRC=${MODEL_SRC}/yolo11m.engine
+        -DDST=${MODEL_DST_RELEASE}/yolo11m.engine
+        -DLABEL=yolo11m.engine
+        -P ${COPY_IF_EXISTS_SCRIPT}
+    COMMENT "Deploying AI models (if generated)..."
     VERBATIM
 )
