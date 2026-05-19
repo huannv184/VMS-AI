@@ -202,8 +202,17 @@ private:
     // Initialization flag
     std::atomic<bool> initialized_{false};
 
-    // Transaction mutex: prevents concurrent transactions from different threads
-    std::mutex transaction_mutex_;
+    // 2026-05-19 transaction_mutex_ removed (was a global app-level
+    // serializer). Per-thread QSqlDatabase via getThreadConnection()
+    // already isolates transactions at the connection level — two
+    // threads cannot share a connection, and Qt's transaction() is
+    // per-connection by definition. The mutex's stated DB-004 purpose
+    // ("prevent interleaving") was a vestige of an earlier shared-
+    // connection model; with the per-thread registry it bought nothing
+    // at the SQL layer and cost (a) global serialization of zone/rule/
+    // reid saves that have no SQL conflict, and (b) permanent deadlock
+    // if any begin/commit path threw before unlocking. Audit + risk
+    // analysis logged in past-bugs.md.
 
     // Mutex protecting connection name registry (for close/cleanup)
     std::mutex connection_registry_mutex_;
@@ -241,14 +250,15 @@ private:
 };
 
 // ── RAII Transaction Guard ─────────────────────────────────────────────────
-// Ensures DbManager::transaction_mutex_ is always released, even if an
-// exception is thrown between beginTransaction() and commit()/rollback().
+// Auto-rollback if begin succeeded but commit() was never called (e.g. an
+// exception thrown between beginTransaction() and commit()). Each thread
+// has its own QSqlDatabase, so rollback is local to the caller's connection.
 // Usage:
 //   {
 //       TransactionGuard txn(DbManager::getInstance());
 //       // ... execute queries ...
 //       txn.commit();  // explicit commit
-//   }  // auto-rollback + unlock if commit() was never called
+//   }  // auto-rollback if commit() was never called
 //
 class TransactionGuard {
 public:

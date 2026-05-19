@@ -1256,71 +1256,69 @@ bool DbManager::executeParameterized(const std::string& sql, const std::vector<s
     return true;
 }
 
+// 2026-05-19 transaction_mutex_ removed (was DB-004 vestige).
+//
+// Each thread has its own QSqlDatabase via getThreadConnection() — keyed
+// on std::this_thread::get_id() — so two threads cannot share a
+// connection and SQL-level transactions are isolated per-connection by
+// definition (Qt's QSqlDatabase::transaction()/commit()/rollback() act
+// on the per-connection driver). The mutex was a global app-level
+// serializer that cost (a) needless serialization of zone/rule/reid
+// saves with no SQL conflict, and (b) catastrophic deadlock if any
+// code path threw between begin and commit/rollback without unlock.
+//
+// Same-thread nested begin pre-fix → deadlock on std::mutex; post-fix
+// → db.transaction() returns false (Qt rejects double-begin on the
+// same connection) → LOG_ERROR + caller can recover. Strictly better.
 void DbManager::beginTransaction() {
-    // DB-004 FIX: Acquire cross-call transaction mutex to prevent interleaving
-    transaction_mutex_.lock();
-
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG_THROTTLED_WARN(5000, "beginTransaction: Database not initialized");
-        transaction_mutex_.unlock();
         return;
     }
 
     QSqlDatabase db = getThreadConnection();
     if (!db.isValid() || !db.isOpen()) {
         LOG_THROTTLED_ERROR(5000, "Failed to get thread connection for beginTransaction");
-        transaction_mutex_.unlock();
         return;
     }
 
     if (!db.transaction()) {
         LOG_ERROR("Failed to begin transaction: {}", db.lastError().text().toStdString());
-        transaction_mutex_.unlock();
     }
 }
 
 void DbManager::commit() {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG_THROTTLED_WARN(5000, "commit: Database not initialized");
-        transaction_mutex_.unlock();
         return;
     }
 
     QSqlDatabase db = getThreadConnection();
     if (!db.isValid() || !db.isOpen()) {
         LOG_THROTTLED_ERROR(5000, "Failed to get thread connection for commit");
-        transaction_mutex_.unlock();
         return;
     }
 
     if (!db.commit()) {
         LOG_ERROR("Failed to commit transaction: {}", db.lastError().text().toStdString());
     }
-
-    // DB-004 FIX: Release cross-call transaction mutex
-    transaction_mutex_.unlock();
 }
 
 void DbManager::rollback() {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG_THROTTLED_WARN(5000, "rollback: Database not initialized");
-        transaction_mutex_.unlock();
         return;
     }
 
     QSqlDatabase db = getThreadConnection();
     if (!db.isValid() || !db.isOpen()) {
         LOG_THROTTLED_ERROR(5000, "Failed to get thread connection for rollback");
-        transaction_mutex_.unlock();
         return;
     }
 
     if (!db.rollback()) {
         LOG_ERROR("Failed to rollback transaction: {}", db.lastError().text().toStdString());
     }
-
-    // DB-004 FIX: Release cross-call transaction mutex
-    transaction_mutex_.unlock();
 }
 
 std::string DbManager::getSetting(const std::string& key, const std::string& default_val) {
