@@ -1176,6 +1176,48 @@ int main(int argc, char** argv) {
                     bool has_helmet = false, has_vest = false;
                     for (const auto* h : ppe_helmets) if (contained_in(*h, *person)) { has_helmet = true; break; }
                     for (const auto* v : ppe_vests)   if (contained_in(*v, *person)) { has_vest   = true; break; }
+
+                    // 2026-05-20 PPE-person ↔ COCO-tracked-person IoU pairing.
+                    // PPE engine runs as a parallel AdvancedInfer, NOT through
+                    // the ObjectTracker, so PPE persons carry track_id=-1.
+                    // Match each PPE-person bbox to the best COCO-tracked
+                    // person bbox via IoU and adopt that track_id so the
+                    // consumer-side cooldown can bucket per stable identity
+                    // instead of a 50px center grid. Threshold 0.40: two
+                    // models seeing the same physical person typically agree
+                    // at IoU 0.6-0.8; 0.40 catches shape disagreements
+                    // (PPE tighter / COCO more generous) without collapsing
+                    // across two distinct adjacent persons (typ. IoU ≤ 0.2).
+                    // No match → track_id stays -1 and the consumer falls
+                    // back to the 50px bucket (preserves prior behaviour
+                    // when COCO YOLO is disabled OR PPE / COCO disagree on
+                    // person presence).
+                    int adopted_track_id = -1;
+                    {
+                        float best_iou = 0.40f;
+                        for (const auto& t : tracked_objects) {
+                            if (t.bbox.class_id != 0) continue; // COCO person only
+                            if (t.track_id < 0) continue;       // no stable id
+                            const auto& a = t.bbox;
+                            const float ix1 = std::max(a.x1, person->x1);
+                            const float iy1 = std::max(a.y1, person->y1);
+                            const float ix2 = std::min(a.x2, person->x2);
+                            const float iy2 = std::min(a.y2, person->y2);
+                            if (ix2 <= ix1 || iy2 <= iy1) continue;
+                            const float inter = (ix2 - ix1) * (iy2 - iy1);
+                            const float a_area = std::max(1.0f,
+                                (a.x2 - a.x1) * (a.y2 - a.y1));
+                            const float p_area = std::max(1.0f,
+                                (person->x2 - person->x1) *
+                                (person->y2 - person->y1));
+                            const float iou = inter / (a_area + p_area - inter);
+                            if (iou > best_iou) {
+                                best_iou = iou;
+                                adopted_track_id = t.track_id;
+                            }
+                        }
+                    }
+
                     auto emit_violation = [&](int class_id, const char* label) {
                         inference::TrackedObject to;
                         to.bbox.x1 = person->x1; to.bbox.y1 = person->y1;
@@ -1184,7 +1226,7 @@ int main(int argc, char** argv) {
                         to.bbox.score = person->score;
                         to.bbox.class_id = class_id;
                         to.label = label;
-                        to.track_id = -1;
+                        to.track_id = adopted_track_id;
                         tracked_objects.push_back(to);
                         j_out["objects"].push_back({
                             {"label", to.label},

@@ -396,15 +396,28 @@ void AiEventProcessor::processPPEViolation(int camera_id,
     auto j_bbox = obj.value("box",
                             obj.value("bbox", nlohmann::json::array()));
 
-    // Position bucket for cooldown (same idea as processIntrusion fallback).
     int cx = 0, cy = 0;
     if (j_bbox.is_array() && j_bbox.size() >= 4) {
         cx = (j_bbox[0].get<int>() + j_bbox[2].get<int>()) / 2;
         cy = (j_bbox[1].get<int>() + j_bbox[3].get<int>()) / 2;
     }
-    std::string key = std::to_string(camera_id) + ":" + kind +
-                      ":" + std::to_string(cx / 50) +
-                      ":" + std::to_string(cy / 50);
+
+    // 2026-05-20: prefer track_id when ai_worker's PPE-person↔COCO-tracked
+    // IoU pairing found a stable identity. Falls back to a 50px center
+    // bucket when track_id=-1 (COCO YOLO disabled on this camera, OR PPE
+    // and COCO disagreed on the person bbox and no IoU≥0.40 match landed).
+    // Mirror of the processIntrusion cooldown shape so the same person
+    // walking through the frame doesn't refire on every violation tick.
+    int track_id = obj.value("track_id", -1);
+    std::string key;
+    if (track_id >= 0) {
+        key = std::to_string(camera_id) + ":" + kind +
+              ":track:" + std::to_string(track_id);
+    } else {
+        key = std::to_string(camera_id) + ":" + kind +
+              ":" + std::to_string(cx / 50) +
+              ":" + std::to_string(cy / 50);
+    }
     if (isOnCooldown(key)) return;
 
     cv::Mat crop = cropSnapshot(frame, j_bbox);
@@ -427,8 +440,8 @@ void AiEventProcessor::processPPEViolation(int camera_id,
     EventManager::getInstance().createEvent(event);
     setCooldown(key);
 
-    LOG_INFO("PPE violation: camera={} kind={} conf={:.2f} at ({},{})",
-             camera_id, kind, confidence, cx, cy);
+    LOG_INFO("PPE violation: camera={} kind={} track_id={} conf={:.2f} at ({},{})",
+             camera_id, kind, track_id, confidence, cx, cy);
 }
 
 // ── License plate handler ────────────────────────────────────────────────────
