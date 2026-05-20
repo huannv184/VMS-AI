@@ -1172,10 +1172,22 @@ int main(int argc, char** argv) {
                         std::max(1.0f, (small.x2 - small.x1) * (small.y2 - small.y1));
                     return (inter / small_area) >= 0.50f; // ≥50% of helmet
                 };
+                // 2026-05-20 compliance telemetry: count fully-compliant
+                // (has_helmet AND has_vest) vs violating PPE-persons in this
+                // frame. Emitted in j_out["ppe_summary"] for the consumer to
+                // roll into a per-camera rolling window. Compliant persons
+                // don't fire individual events (would flood the events
+                // table); the summary is the only signal the operator's
+                // dashboard has for "denominator" — what fraction of
+                // observed persons were OK vs violating.
+                int compliant_count = 0;
+                int violating_count = 0;
                 for (const auto* person : ppe_persons) {
                     bool has_helmet = false, has_vest = false;
                     for (const auto* h : ppe_helmets) if (contained_in(*h, *person)) { has_helmet = true; break; }
                     for (const auto* v : ppe_vests)   if (contained_in(*v, *person)) { has_vest   = true; break; }
+                    if (has_helmet && has_vest) ++compliant_count;
+                    else                        ++violating_count;
 
                     // 2026-05-20 PPE-person ↔ COCO-tracked-person IoU pairing.
                     // PPE engine runs as a parallel AdvancedInfer, NOT through
@@ -1238,6 +1250,12 @@ int main(int argc, char** argv) {
                     };
                     if (!has_helmet) emit_violation(406, "NoHelmet");
                     if (!has_vest)   emit_violation(407, "NoVest");
+                }
+                if (compliant_count + violating_count > 0) {
+                    j_out["ppe_summary"] = {
+                        {"compliant", compliant_count},
+                        {"violating", violating_count}
+                    };
                 }
 
                 // License Plates

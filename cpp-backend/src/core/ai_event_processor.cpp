@@ -177,10 +177,110 @@ void AiEventProcessor::eventWorkerLoop() {
             // Single tracker advance + line crossing pass per frame so the
             // greedy IoU matching sees all person detections together.
             processLineCrossings(job.camera_id, job.metadata, job.frame, job.ts_ms);
+
+            // 2026-05-20 PPE compliance telemetry. ai_worker pushes per-
+            // frame counts when PPE-persons were evaluated (only when the
+            // PPE engine is enabled for this camera AND detected at least
+            // one PPE-person bbox). Each frame contributes one tick per
+            // observed person to the rolling 60-minute aggregator; the
+            // compliance dashboard reads it through analytics_controller.
+            if (job.metadata.contains("ppe_summary") &&
+                job.metadata["ppe_summary"].is_object()) {
+                const auto& s = job.metadata["ppe_summary"];
+                int c = s.value("compliant", 0);
+                int v = s.value("violating", 0);
+                if (c > 0 || v > 0) {
+                    PpeComplianceAggregator::getInstance()
+                        .recordTick(job.camera_id, job.ts_ms, c, v);
+                }
+            }
         } catch (const std::exception& e) {
             LOG_ERROR("AiEventProcessor: Failed to process metadata: {}", e.what());
         }
     }
+}
+
+// ── PPE compliance aggregator ────────────────────────────────────────────────
+
+PpeComplianceAggregator& PpeComplianceAggregator::getInstance() {
+    static PpeComplianceAggregator inst;
+    return inst;
+}
+
+void PpeComplianceAggregator::recordTick(int camera_id,
+                                         int64_t ts_ms,
+                                         int compliant_count,
+                                         int violating_count) {
+    if (compliant_count <= 0 && violating_count <= 0) return;
+    const int64_t minute = ts_ms / 60000;
+    const size_t idx = static_cast<size_t>(((minute % kSlotCount) + kSlotCount) % kSlotCount);
+
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto& ring = rings_[camera_id];
+    auto& slot = ring[idx];
+    if (slot.epoch_minute != minute) {
+        // Slot is stale (60 minutes have wrapped past it OR first write).
+        // Reset the bucket before accumulating into the new minute.
+        slot.epoch_minute    = minute;
+        slot.compliant_ticks = 0;
+        slot.violating_ticks = 0;
+    }
+    if (compliant_count > 0) slot.compliant_ticks += static_cast<uint64_t>(compliant_count);
+    if (violating_count > 0) slot.violating_ticks += static_cast<uint64_t>(violating_count);
+}
+
+nlohmann::json PpeComplianceAggregator::snapshot(int window_minutes) const {
+    if (window_minutes < 1)  window_minutes = 1;
+    if (window_minutes > kSlotCount) window_minutes = kSlotCount;
+
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t now_minute = now_ms / 60000;
+    const int64_t window_start_minute = now_minute - (window_minutes - 1);
+
+    nlohmann::json per_camera = nlohmann::json::object();
+    uint64_t global_compliant = 0;
+    uint64_t global_violating = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (const auto& [cam_id, ring] : rings_) {
+            uint64_t c = 0, v = 0;
+            int samples = 0;
+            for (const auto& slot : ring) {
+                if (slot.epoch_minute < window_start_minute) continue;
+                if (slot.epoch_minute > now_minute)         continue;
+                c += slot.compliant_ticks;
+                v += slot.violating_ticks;
+                if (slot.compliant_ticks + slot.violating_ticks > 0) ++samples;
+            }
+            const uint64_t total = c + v;
+            double rate = (total > 0) ? (static_cast<double>(c) / static_cast<double>(total)) : 1.0;
+            per_camera[std::to_string(cam_id)] = {
+                {"compliant_ticks", c},
+                {"violating_ticks", v},
+                {"compliance_rate", rate},
+                {"samples",         samples}
+            };
+            global_compliant += c;
+            global_violating += v;
+        }
+    }
+
+    const uint64_t global_total = global_compliant + global_violating;
+    const double global_rate = (global_total > 0)
+        ? (static_cast<double>(global_compliant) / static_cast<double>(global_total))
+        : 1.0;
+    return {
+        {"window_minutes",  window_minutes},
+        {"generated_at_ms", now_ms},
+        {"global", {
+            {"compliant_ticks", global_compliant},
+            {"violating_ticks", global_violating},
+            {"compliance_rate", global_rate}
+        }},
+        {"per_camera", per_camera}
+    };
 }
 
 // ── Per-event handlers ────────────────────────────────────────────────────────

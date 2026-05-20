@@ -459,6 +459,8 @@ const apiClient = {
   getTrafficHistory: (cameraId) => apiClient.request(`/api/analytics/traffic/${cameraId}`),
   getAnalyticsHeatmap: (cameraId) => apiClient.request(`/api/analytics/heatmap/${cameraId}`),
   exportAnalyticsCsv: (params = {}) => apiClient.download(`/api/analytics/export${buildQuery(params)}`),
+  getPpeCompliance: (windowMinutes = 60) =>
+    apiClient.request(`/api/analytics/ppe_compliance${buildQuery({ window_minutes: windowMinutes })}`),
 
   getSystemStats: () => apiClient.request('/api/system/stats'),
   getHealth: () => apiClient.request('/api/health'),

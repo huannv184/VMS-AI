@@ -12,6 +12,7 @@ const PpeMonitorView = () => {
   const [violations, setViolations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [actionMsg, setActionMsg] = useState(null);
+  const [compliance, setCompliance] = useState(null); // {compliant_ticks, violating_ticks, compliance_rate} | null
 
   const fetchPpeEvents = async () => {
     setLoading(true);
@@ -41,8 +42,24 @@ const PpeMonitorView = () => {
     }
   };
 
+  const fetchCompliance = async () => {
+    try {
+      const res = await apiClient.getPpeCompliance(60);
+      if (res?.success && res?.data?.global) {
+        setCompliance(res.data.global);
+      }
+    } catch (err) {
+      console.error('PpeMonitorView: compliance fetch error', err);
+    }
+  };
+
   useEffect(() => {
     fetchPpeEvents();
+    fetchCompliance();
+    // Refresh compliance every 30s — rolling 60-min window changes slowly,
+    // no need to refresh on the events cadence.
+    const id = setInterval(fetchCompliance, 30000);
+    return () => clearInterval(id);
   }, []);
 
   // Aggregate by hour for the bar chart (16 buckets, 7h..22h)
@@ -63,9 +80,23 @@ const PpeMonitorView = () => {
     setTimeout(() => setActionMsg(null), 2500);
   };
 
-  const complianceRate = violations.length > 0 
-    ? Math.max(0, 100 - (violations.length * 2)).toFixed(1) 
-    : '100.0';
+  // 2026-05-20: real compliance metric from /api/analytics/ppe_compliance
+  // (60-min rolling window, denominator = compliant_ticks + violating_ticks
+  // accumulated by ai_worker per PPE-person per frame). Falls back to "—"
+  // if PPE engine hasn't ticked yet (cold start, or PPE disabled on every
+  // camera). Pre-fix this was "100 - violations*2" which drifted with
+  // absolute event count and had no concept of compliant observations.
+  const totalTicks = compliance
+    ? Number(compliance.compliant_ticks || 0) + Number(compliance.violating_ticks || 0)
+    : 0;
+  const complianceRate = totalTicks > 0
+    ? (Number(compliance.compliance_rate) * 100).toFixed(1)
+    : null;
+  const complianceSubLabel = compliance == null
+    ? 'Đang đo...'
+    : totalTicks === 0
+      ? 'Chưa có dữ liệu PPE 60p qua'
+      : `${totalTicks.toLocaleString('vi-VN')} quan sát · 60 phút`;
 
   return (
     <div className="analytics-view">
@@ -84,8 +115,8 @@ const PpeMonitorView = () => {
         <div className="analytics-grid">
           <div className="analytics-card glass">
             <div className="analytics-card-title">Tỷ lệ tuân thủ <CheckCircle size={12} color="var(--accent3)" /></div>
-            <div className="big-number green">{complianceRate}%</div>
-            <div className="big-sub">Dựa trên dữ liệu thực</div>
+            <div className="big-number green">{complianceRate === null ? '—' : `${complianceRate}%`}</div>
+            <div className="big-sub">{complianceSubLabel}</div>
           </div>
           <div className="analytics-card glass">
             <div className="analytics-card-title">Vi phạm hôm nay <AlertTriangle size={12} color="var(--danger)" /></div>
