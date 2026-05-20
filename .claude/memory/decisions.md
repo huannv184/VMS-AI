@@ -1,5 +1,37 @@
 # Architectural Decisions — AI Camera System
 
+## 2026-05-19 PPE pipeline — containment-based violation derivation, not IoU; synthetic class_ids in 400-range
+
+### Decision: Derive NoHelmet/NoVest synthetically from person + missing-PPE containment
+- **Choice**: Engine produces 6 detection-only classes (`helmet`, `vest`, `person`, `gloves`, `mask`, `boots`). For each "person" bbox, check whether any "helmet"/"vest" bbox is CONTAINED in the person bbox (intersection / smaller_area ≥ 50%). On containment-fail emit a synthetic class_id 406/407 detection with `bbox=person.bbox`. `ai_event_processor` dispatch keys on 406/407 → `processPPEViolation` maps to `no_helmet`/`no_vest`.
+- **Rationale**: the deployed engine ships ONLY positive detection classes — no direct NoHelmet/NoVest output classes. Two alternatives: (a) retrain with violation classes added to the label set, (b) derive violations post-detection in `ai_worker`. Option (b) is zero-cost (just a containment loop) and preserves the engine's accuracy on the positive classes. Operator can drop in any future PPE engine — as long as it emits person + helmet + vest, the violation logic works.
+- **Trade-off**: a person fully occluded behind a wall (only legs visible) might fail the helmet-containment check and fire a false NoHelmet. Acceptable: false-positive on a partially-visible person is bounded by the existing 50px cooldown bucket + the 0.50 confidence floor on the person detection itself. Operator-side calibration via cooldown tuning + person-conf threshold is the right control.
+- **Why containment, not IoU**: helmet bbox is small (~10-15% of person area). Tight IoU of helmet ∩ person would be ≤0.15 even for compliant workers, making IoU a noisy signal that requires a very low threshold (which itself becomes noisy). Containment of the SMALLER bbox into the larger gives a clean ≥0.50 cutoff for "this helmet belongs to this person" with no confusing edge cases.
+- **Alternative considered**: Hungarian-algorithm bipartite matching between persons and PPE items (proper assignment problem). Rejected — overkill at ≤ few dozen persons/frame; greedy containment-loop is O(P×H) and produces identical results when there's no contention between persons claiming the same helmet.
+
+### Decision: Synthetic violation class_ids in 400-range, NOT reuse 300-range
+- **Choice**: PPE raw detections occupy class_id 300-305 (helmet/vest/person/gloves/mask/boots). Synthetic violations occupy 406 (NoHelmet) / 407 (NoVest). 400-range is reserved for synthetic derivations from 300-range raw data.
+- **Rationale**: keeps consumer dispatch simple — `ai_event_processor` checks class_id alone to decide handler routing; no `is_synthetic` flag needed. A future "NoMask" derivation slots in as 408 without changing dispatch logic. Range separation also makes log-grep visually unambiguous when an operator scrubs through `cpp_backend.log` for "did we have raw helmet detections that didn't get paired?".
+- **Trade-off**: harder to reason about when a class_id is "model-emitted" vs "derived" — needs a comment in the dispatch handler explaining the namespace. Acceptable given the clean dispatch logic.
+- **Why not negative class_ids for synthetic** (e.g. -1 for NoHelmet): negative IDs would also disambiguate but break the `class_id >= 0` invariant assumed elsewhere (DB column INT, JSON serialization). 400-range stays positive + integer + within typical model class_id space.
+
+### Decision: PPE cooldown by camera + kind + 50px center bucket; defer track_id pairing
+- **Choice**: `processPPEViolation` cooldown key is `(camera_id, kind, center_x/50, center_y/50)`. A new event fires every 10s per bucket. `track_id` is always -1 for PPE detections (they pass through MultiModel before the tracker).
+- **Rationale**: PPE objects (and the synthetic violations derived from them) aren't run through the tracker — tracker is downstream of MultiModel in the worker pipeline. Without a track_id, we can't bucket by tracked-person identity. 50px center grid is the next-best signal: a stationary worker stays in one bucket (no re-fire spam), a worker walking through stays at most ~3 cells (re-fires every ~10s as they cross bucket boundaries, acceptable).
+- **Trade-off**: a worker who removes their helmet, walks 60px, replaces it, walks back — fires twice. Not a real-world frequent pattern; the operator-tunable cooldown duration absorbs the edge cases.
+- **What this enables future**: when the tracker is wired into the PPE post-process (deferred), cooldown key becomes `(camera_id, kind, track_id)` for cleaner semantics. The 50px-bucket fallback can stay for `track_id=-1` cases (e.g., violation detection on a partially-occluded person the tracker missed).
+
+### Decision: Class label mapping hardcoded in C++; defer YAML config block
+- **Choice**: `kPPELabels[]` is a C++ `static constexpr` array in `ai_worker_v2/main.cpp`. An operator retraining the engine with different class order edits source + rebuilds.
+- **Rationale**: class order is a model-export artefact, not an operator-tuning surface. Most operators consume a pre-built engine. The handful who retrain are already in the build-from-source workflow. A YAML knob adds parsing code + a "what happens if the YAML and the engine disagree" failure mode (silently mismatched labels).
+- **Trade-off**: a retraining operator can't ship a new engine + new label order without a rebuild. Acceptable at current operator scale; revisit if a pre-built engine zoo emerges with multiple class orderings.
+
+### Decision: Standalone Python smoke test for engines (`tools/test_ppe_engine.py`)
+- **Choice**: a dedicated diagnostic that loads any TRT engine via Ultralytics runtime (applies engine's `metadata.json` sidecar preprocessing) and runs a permissive-threshold prediction. Output: detection count + class distribution + class-name metadata presence.
+- **Rationale**: when the cpp-backend pipeline reports "raw=0", the failure could be in any of: preprocessing mismatch, threshold too high, engine corrupted, engine trained on the wrong scene, parser bug. A standalone test that bypasses cpp-backend entirely cuts 4 of those 5 in one run. If standalone Ultralytics also reports 0, the engine itself is the problem — operator action (retrain / rebuild / swap engine). If standalone works but cpp-backend doesn't, the preprocessing or parser is the problem.
+- **Pattern to repeat**: every model integration (face, ANPR, ReID, fire, future) should have an analogous standalone test. The 30-minute investment pays back the first time a model integration fails end-to-end.
+- **Why not a C++ TRT-direct test**: would require linking TRT + recreating preprocessing in another binary. Ultralytics is the engine's "source of truth" for preprocessing (it baked the preprocessing INTO the engine at export), so using it for validation is by-construction correct.
+
 ## 2026-05-17 alert_delivery per-channel pool split — close BUG-ALERT-CASCADE-POOL-01
 
 ### Decision: 4 independent BackgroundJobRunner pools, one per channel class
