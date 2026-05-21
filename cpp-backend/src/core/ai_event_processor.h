@@ -108,6 +108,38 @@ private:
     static constexpr int COOLDOWN_SECONDS = 10;
     static constexpr int MAX_COOLDOWN_CACHE = 1000;
 
+    // ── 2026-05-21 Path-1 — Multi-frame track confirmation ────────────────────
+    // Operator complaint: dogs / shadows / transient blobs that COCO YOLO
+    // briefly classifies as "person" still fire an event on the SINGLE
+    // first frame — by the time the tracker drops them as ephemeral,
+    // damage is done (event row, snapshot, push). Required N consecutive
+    // tracked observations before promoting any track_id to an Event.
+    // Real persons consistently re-detect every frame for their dwell
+    // time; single-frame hallucinations don't.
+    //
+    // State: per-(camera, track) observation count + last-seen ts. Lazy
+    // GC drops entries idle for > kTrackObsTTLSec on each insert when
+    // the map grows past a soft cap. Map written by event_workers (2
+    // threads) so mutex-guarded.
+    //
+    // Bypass: track_id == -1 (tracker disabled / PPE-only path) skips
+    // the confirmation check — the position-bucket cooldown still
+    // gates re-fires. Aspect-ratio + min-height filters at ai_worker
+    // already cut most FPs at the parser level when tracker is off.
+    struct TrackObservation {
+        int count{0};
+        std::chrono::steady_clock::time_point last_seen;
+    };
+    std::unordered_map<std::string, TrackObservation> track_observations_;
+    std::mutex track_obs_mutex_;
+    static constexpr int kTrackConfirmCount = 3;       // override via VMS_INTRUSION_CONFIRM_FRAMES
+    static constexpr int kTrackObsTTLSec = 30;
+    static constexpr size_t kTrackObsSoftCap = 5000;   // GC trigger
+    // Returns true when this observation should produce an Event (count
+    // >= confirm threshold OR track_id == -1 bypass). Always increments
+    // the per-track counter.
+    bool observeTrackAndCheckConfirmed(int camera_id, int track_id);
+
     // Accepts pre-decoded frame to avoid repeated imdecode per object
     void processFace(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);
     void processIntrusion(int camera_id, const nlohmann::json& obj, const cv::Mat& frame);

@@ -841,8 +841,31 @@ int main(int argc, char** argv) {
                         return (e && *e) ? std::strtof(e, nullptr) : 20.0f;
                     }();
 
+                    // 2026-05-21 Path-1 fix: aspect-ratio filter for COCO
+                    //   person (class 0). Real standing humans have bbox
+                    //   h/w in [1.8, 3.0]; dogs ~[0.5, 1.0], wide objects
+                    //   (vehicles, trash cans, signs) typically < 1.5.
+                    //   YOLO11m at any threshold confuses any vertical
+                    //   "blob" as person at conf 0.45-0.60 → operator sees
+                    //   dogs / posts / shadows fire intrusion events.
+                    //   Aspect filter is the highest-leverage cheap fix
+                    //   because it's orthogonal to the model's class score
+                    //   — pure geometric prior.
+                    //
+                    //   Trade-off: people sitting on floor or crouching
+                    //   (h/w ~0.8-1.5) get filtered. Acceptable for this
+                    //   deployment (doorway / patrol cams, sitting not
+                    //   primary use case). Operator dials lower via env
+                    //   VMS_MIN_PERSON_ASPECT_RATIO=1.0 if seated-person
+                    //   detection matters.
+                    static const float min_person_aspect_ratio = []() {
+                        const char* e = std::getenv("VMS_MIN_PERSON_ASPECT_RATIO");
+                        return (e && *e) ? std::strtof(e, nullptr) : 1.5f;
+                    }();
+
                     std::vector<inference::BBox> det_bboxes;
                     size_t dropped_small_persons = 0;
+                    size_t dropped_low_aspect_persons = 0;
                     for (const auto& obj : result.objects) {
                         if (!class_filter.empty()) {
                             bool allowed = false;
@@ -854,6 +877,17 @@ int main(int argc, char** argv) {
                             ++dropped_small_persons;
                             continue;
                         }
+                        // Person-class aspect-ratio check (h/w must exceed
+                        // threshold, default 1.5). Geometric prior; gates
+                        // wide-blob FPs that no class-score tuning fixes.
+                        if (obj.class_id == 0 && min_person_aspect_ratio > 0.0f) {
+                            const float w = obj.x2 - obj.x1;
+                            const float h = obj.y2 - obj.y1;
+                            if (w > 1.0f && (h / w) < min_person_aspect_ratio) {
+                                ++dropped_low_aspect_persons;
+                                continue;
+                            }
+                        }
                         det_bboxes.push_back(obj);
                     }
                     if (dropped_small_persons > 0) {
@@ -862,6 +896,15 @@ int main(int argc, char** argv) {
                             std::cerr << "[AI-Worker-" << camera_id
                                       << "] dropped " << dropped_small_persons
                                       << " sub-" << min_person_height_px << "px person detections" << std::endl;
+                        }
+                    }
+                    if (dropped_low_aspect_persons > 0) {
+                        static thread_local int diag_aspect = 0;
+                        if ((diag_aspect++ % 30) == 0) {
+                            std::cerr << "[AI-Worker-" << camera_id
+                                      << "] dropped " << dropped_low_aspect_persons
+                                      << " low-aspect persons (h/w < "
+                                      << min_person_aspect_ratio << ")" << std::endl;
                         }
                     }
 
@@ -933,9 +976,20 @@ int main(int argc, char** argv) {
                 //   embeddings produced from < 30×30 px crops are not
                 //   meaningful even when the patch happens to be a real face.
                 //   Per-camera override via VMS_MIN_FACE_SIZE_PX.
+                // 2026-05-21 Path-1 fix: default bumped 30 → 50. Operator
+                //   running 1080p cameras was still hitting "mặt đường →
+                //   khuôn mặt" false-positive identity matches at 30 px
+                //   because road texture / wall tiles produce 30-45 px
+                //   crops that ArcFace then embeddings as gibberish that
+                //   happens to be close to a real gallery vector. 50 px is
+                //   ArcFace's "rule of thumb" minimum where embedding
+                //   distances start being separable; below that ID match
+                //   is essentially random. Lower to 30 only if camera
+                //   genuinely needs distant face capture and operator is
+                //   OK with the noise.
                 static const float min_face_side_px = []() {
                     const char* e = std::getenv("VMS_MIN_FACE_SIZE_PX");
-                    return (e && *e) ? std::strtof(e, nullptr) : 30.0f;
+                    return (e && *e) ? std::strtof(e, nullptr) : 50.0f;
                 }();
 
                 if (!result.faces.empty()) {

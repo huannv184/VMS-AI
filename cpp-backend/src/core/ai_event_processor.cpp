@@ -351,6 +351,14 @@ void AiEventProcessor::processIntrusion(int camera_id, const nlohmann::json& obj
     int track_id = obj.value("track_id", -1);
     auto j_bbox = obj.value("bbox", nlohmann::json::array());
 
+    // 2026-05-21 Path-1 — multi-frame confirmation gate. Drop transient
+    // single-frame detections (dogs / shadows / texture blobs) before they
+    // get a snapshot + Event row. See helper docstring for behaviour;
+    // track_id == -1 bypass preserves the legacy non-tracked path.
+    // Confidence + ROI checks still run downstream; this is a strict ADD
+    // on top, not a replacement.
+    if (!observeTrackAndCheckConfirmed(camera_id, track_id)) return;
+
     // Position-based cooldown when tracker is bypassed (track_id=-1) so that
     // multiple persons in the same frame don't all share key `cam:-1:person`
     // — the first person would otherwise lock out everyone for COOLDOWN_SECONDS.
@@ -837,6 +845,53 @@ void AiEventProcessor::setCooldown(const std::string& key) {
         cooldown_cache_.erase(oldest);
     }
     cooldown_cache_[key] = std::chrono::system_clock::now();
+}
+
+// 2026-05-21 Path-1 — multi-frame track confirmation gate. See header
+// comment for rationale. Returns true (= "fire event allowed") when:
+//   - track_id == -1 (bypass; legacy non-tracked path)
+//   - OR the per-(camera, track) observation count has reached the
+//     confirmation threshold (default 3, env VMS_INTRUSION_CONFIRM_FRAMES).
+// Always increments the counter. Lazy GC drops stale entries when the
+// map grows past kTrackObsSoftCap.
+bool AiEventProcessor::observeTrackAndCheckConfirmed(int camera_id, int track_id) {
+    if (track_id < 0) return true;  // bypass mode — let position cooldown gate
+
+    static const int confirm_count = []() {
+        const char* e = std::getenv("VMS_INTRUSION_CONFIRM_FRAMES");
+        if (e && *e) {
+            int v = std::atoi(e);
+            if (v >= 1 && v <= 30) return v;
+        }
+        return kTrackConfirmCount;
+    }();
+
+    const std::string key = std::to_string(camera_id) + ":" + std::to_string(track_id);
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(track_obs_mutex_);
+
+    // Lazy GC: when map gets too large, drop entries idle past TTL. O(N)
+    // sweep but only runs occasionally (~hourly on a busy site).
+    if (track_observations_.size() > kTrackObsSoftCap) {
+        const auto cutoff = now - std::chrono::seconds(kTrackObsTTLSec);
+        for (auto it = track_observations_.begin(); it != track_observations_.end(); ) {
+            if (it->second.last_seen < cutoff) it = track_observations_.erase(it);
+            else                                ++it;
+        }
+    }
+
+    auto& obs = track_observations_[key];
+    // Reset count if the track has been idle past TTL — the tracker
+    // likely re-used the same track_id for a different person after a
+    // gap, so don't carry over old confirmation credit.
+    if (obs.count > 0) {
+        const auto idle = std::chrono::duration_cast<std::chrono::seconds>(
+            now - obs.last_seen).count();
+        if (idle > kTrackObsTTLSec) obs.count = 0;
+    }
+    obs.count++;
+    obs.last_seen = now;
+    return obs.count >= confirm_count;
 }
 
 cv::Mat AiEventProcessor::cropSnapshot(const cv::Mat& frame, const nlohmann::json& bbox) {
