@@ -283,6 +283,25 @@ std::vector<BBox> AdvancedInfer::parseYOLOv8Output(
         return std::atoi(env) != 0;
     }();
 
+    // 2026-05-21 Top-2 class diagnostic for BUG-DETECT-FP-DOG-AS-PERSON.
+    // Operator reports dogs/vehicles being dispatched as Person events.
+    // Pipeline confirmed correct: parser argmax → class_filter {0,1,2,3,5,7}
+    // → ai_event_processor dispatches Person ONLY when class_id==0. So the
+    // misclassification is in the engine output itself. This log reveals the
+    // runner-up class + confidence margin for every kept-Person detection so
+    // we can distinguish:
+    //   - ambiguity (margin < ~0.10) → fixable with aspect-ratio filter or
+    //     conf raise downstream.
+    //   - confident wrong (margin > ~0.30) → engine bias, needs bigger model
+    //     (11l/11x) or re-train.
+    // Gated OFF by default — diag log volume scales with person-count × FPS.
+    // Restricted to COCO 80-class engines (num_classes==80) so PPE / Fire /
+    // Plate workers stay silent.
+    static const bool log_top2 = []() {
+        const char* env = std::getenv("VMS_LOG_TOP2");
+        return env && *env && std::atoi(env) != 0;
+    }();
+
     auto sigmoid = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
 
     // Auto-detect layout once: probe first prediction in both layouts and pick
@@ -352,12 +371,21 @@ std::vector<BBox> AdvancedInfer::parseYOLOv8Output(
 
         float best_conf_raw = 0.0f;
         int best_class = -1;
+        // Track runner-up for VMS_LOG_TOP2 diagnostic. Cost: 2 reg + 1
+        // branch per class iteration; negligible vs the 8400×80 inner loop.
+        float second_conf_raw = 0.0f;
+        int second_class = -1;
 
         for (int c = 0; c < num_classes; ++c) {
             float conf = at(i, 4 + c);
             if (conf > best_conf_raw) {
+                second_conf_raw = best_conf_raw;
+                second_class = best_class;
                 best_conf_raw = conf;
                 best_class = c;
+            } else if (conf > second_conf_raw) {
+                second_conf_raw = conf;
+                second_class = c;
             }
         }
 
@@ -395,6 +423,20 @@ std::vector<BBox> AdvancedInfer::parseYOLOv8Output(
             box.label = COCO_CLASSES[best_class];
         } else {
             box.label = "";
+        }
+
+        // VMS_LOG_TOP2 diagnostic — see static `log_top2` declaration above.
+        // Fires only for COCO + kept-Person; one line per such detection.
+        if (log_top2 && num_classes == 80 && best_class == 0 && second_class >= 0 && second_class < 80) {
+            const float runner_conf = apply_sigmoid ? sigmoid(second_conf_raw) : second_conf_raw;
+            std::cerr << "[YOLO-TOP2] person=" << best_conf
+                      << " runner=cls=" << second_class
+                      << "(" << COCO_CLASSES[second_class] << ")"
+                      << " score=" << runner_conf
+                      << " margin=" << (best_conf - runner_conf)
+                      << " bbox=(" << static_cast<int>(box.x1) << "," << static_cast<int>(box.y1)
+                      << "," << static_cast<int>(box.x2) << "," << static_cast<int>(box.y2) << ")"
+                      << std::endl;
         }
 
         boxes.push_back(box);
