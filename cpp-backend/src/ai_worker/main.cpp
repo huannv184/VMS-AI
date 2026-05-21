@@ -1097,43 +1097,120 @@ int main(int argc, char** argv) {
                 //   406 = NoHelmet violation (person bbox without overlap)
                 //   407 = NoVest violation   (person bbox without overlap)
                 // And forward the raw detections too with 300-offset
-                // namespace (for AnprView / debug visibility).
+                // namespace (for visibility / debug overlays).
                 //
                 // Class id remap (raw items, 300-offset to avoid COCO):
-                //   0 helmet  → 300, 1 vest   → 301, 2 person → 302,
-                //   3 gloves  → 303, 4 mask   → 304, 5 boots  → 305
+                //   raw class N → 300 + N
                 // Synthetic violation ids (derived, 400-offset):
                 //   406 NoHelmet, 407 NoVest
-                static const char* kPPELabels[] = {
-                    "Helmet", "Vest", "PPE_Person",
-                    "Gloves", "Mask", "Boots"
+                //
+                // 2026-05-20 labels + class indices come from
+                // VMS_AI_PPE_CONFIG_JSON (set by parent vms_backend from
+                // backend.yaml `ai.ppe.*` block). Cached once per worker
+                // — env reads at first use; subsequent calls hit the
+                // static struct. Operator retraining the engine with a
+                // different class order edits yaml + restarts backend;
+                // no source change / rebuild needed.
+                struct PpeRuntimeConfig {
+                    std::vector<std::string> labels;
+                    int person_class;
+                    int helmet_class;
+                    int vest_class;
+                    int gloves_class;   // 2026-05-21 added (operator request B)
+                    int mask_class;
+                    int boots_class;
+                };
+                static const PpeRuntimeConfig kPpeRuntime = []() {
+                    PpeRuntimeConfig cfg;
+                    // Defaults match the 2026-05-19 PPE-YOLOv8m engine — kept
+                    // identical to the pre-2026-05-20 hardcoded values so a
+                    // deployment without yaml's `ai.ppe.*` block sees zero
+                    // behaviour change for the helmet/vest channels. The
+                    // gloves/mask/boots channels are new in 2026-05-21 and
+                    // are enabled by default per operator's "B" choice.
+                    cfg.labels       = { "Helmet", "Vest", "PPE_Person",
+                                         "Gloves", "Mask", "Boots" };
+                    cfg.person_class = 2;
+                    cfg.helmet_class = 0;
+                    cfg.vest_class   = 1;
+                    cfg.gloves_class = 3;
+                    cfg.mask_class   = 4;
+                    cfg.boots_class  = 5;
+                    const char* env = std::getenv("VMS_AI_PPE_CONFIG_JSON");
+                    if (!env || !*env) return cfg;
+                    try {
+                        auto j = json::parse(env);
+                        if (j.contains("labels") && j["labels"].is_array()) {
+                            std::vector<std::string> parsed;
+                            parsed.reserve(j["labels"].size());
+                            for (const auto& s : j["labels"]) parsed.push_back(s.get<std::string>());
+                            if (!parsed.empty()) cfg.labels = std::move(parsed);
+                        }
+                        if (j.contains("person_class")) cfg.person_class = j["person_class"].get<int>();
+                        if (j.contains("helmet_class")) cfg.helmet_class = j["helmet_class"].get<int>();
+                        if (j.contains("vest_class"))   cfg.vest_class   = j["vest_class"].get<int>();
+                        if (j.contains("gloves_class")) cfg.gloves_class = j["gloves_class"].get<int>();
+                        if (j.contains("mask_class"))   cfg.mask_class   = j["mask_class"].get<int>();
+                        if (j.contains("boots_class"))  cfg.boots_class  = j["boots_class"].get<int>();
+                        std::cerr << "[AI-Worker] PPE config: labels=" << cfg.labels.size()
+                                  << " person=" << cfg.person_class
+                                  << " helmet=" << cfg.helmet_class
+                                  << " vest="   << cfg.vest_class
+                                  << " gloves=" << cfg.gloves_class
+                                  << " mask="   << cfg.mask_class
+                                  << " boots="  << cfg.boots_class
+                                  << " (from VMS_AI_PPE_CONFIG_JSON)" << std::endl;
+                    } catch (const std::exception& e) {
+                        std::cerr << "[AI-Worker] WARN: VMS_AI_PPE_CONFIG_JSON parse failed: "
+                                  << e.what() << " — using hardcoded defaults" << std::endl;
+                    }
+                    return cfg;
+                }();
+                auto label_for = [&](int src_cls) -> const char* {
+                    if (src_cls >= 0 && src_cls < (int)kPpeRuntime.labels.size())
+                        return kPpeRuntime.labels[src_cls].c_str();
+                    return "PPE_Unknown";
                 };
 
-                // Collect person, helmet, vest detections for pairing.
-                // (Other items still flow through as raw detections; their
-                // presence/absence isn't used for violations today.)
+                // Collect person + all 5 wearable types for pairing.
+                // *_class == -1 → channel disabled (skip pairing).
+                // 2026-05-21 expanded from {helmet, vest} → {helmet, vest,
+                // gloves, mask, boots}. Raw detections still flow through
+                // for visibility regardless of pairing channel state.
                 std::vector<const inference::BBox*> ppe_persons;
                 std::vector<const inference::BBox*> ppe_helmets;
                 std::vector<const inference::BBox*> ppe_vests;
+                std::vector<const inference::BBox*> ppe_gloves;
+                std::vector<const inference::BBox*> ppe_masks;
+                std::vector<const inference::BBox*> ppe_boots;
                 for (const auto& ppe : result.ppe_objects) {
                     const int src_cls = ppe.class_id;
-                    if (src_cls < 0 || src_cls > 5) continue;
-                    if (src_cls == 2) ppe_persons.push_back(&ppe);
-                    else if (src_cls == 0) ppe_helmets.push_back(&ppe);
-                    else if (src_cls == 1) ppe_vests.push_back(&ppe);
+                    if (src_cls < 0) continue;
+                    if (kPpeRuntime.person_class >= 0 &&
+                        src_cls == kPpeRuntime.person_class)      ppe_persons.push_back(&ppe);
+                    else if (kPpeRuntime.helmet_class >= 0 &&
+                             src_cls == kPpeRuntime.helmet_class) ppe_helmets.push_back(&ppe);
+                    else if (kPpeRuntime.vest_class >= 0 &&
+                             src_cls == kPpeRuntime.vest_class)   ppe_vests.push_back(&ppe);
+                    else if (kPpeRuntime.gloves_class >= 0 &&
+                             src_cls == kPpeRuntime.gloves_class) ppe_gloves.push_back(&ppe);
+                    else if (kPpeRuntime.mask_class >= 0 &&
+                             src_cls == kPpeRuntime.mask_class)   ppe_masks.push_back(&ppe);
+                    else if (kPpeRuntime.boots_class >= 0 &&
+                             src_cls == kPpeRuntime.boots_class)  ppe_boots.push_back(&ppe);
                 }
 
                 // Push raw detections into metadata channel.
                 for (const auto& ppe : result.ppe_objects) {
                     const int src_cls = ppe.class_id;
-                    if (src_cls < 0 || src_cls > 5) continue;
+                    if (src_cls < 0) continue;
                     inference::TrackedObject to;
                     to.bbox.x1 = ppe.x1; to.bbox.y1 = ppe.y1;
                     to.bbox.x2 = ppe.x2; to.bbox.y2 = ppe.y2;
                     to.confidence = ppe.score;
                     to.bbox.score = ppe.score;
                     to.bbox.class_id = 300 + src_cls;
-                    to.label = kPPELabels[src_cls];
+                    to.label = label_for(src_cls);
                     to.track_id = -1;
                     tracked_objects.push_back(to);
 
@@ -1160,8 +1237,14 @@ int main(int argc, char** argv) {
                 //   when the person IS wearing a helmet IoU ≈ 0.05-0.15.
                 //   The right check is "PPE item bbox CONTAINED in person
                 //   bbox" — use intersection / smaller_area as the metric.
+                // 2026-05-21 made threshold parametric. helmet/vest/boots
+                // are well-contained items (50% works). gloves often partly
+                // outside the person bbox because hands extend; mask is
+                // small but central — lower thresholds 0.30 / 0.40 reduce
+                // false NoGloves / NoMask in real footage.
                 auto contained_in = [](const inference::BBox& small,
-                                       const inference::BBox& big) -> bool {
+                                       const inference::BBox& big,
+                                       float min_overlap) -> bool {
                     const float ix1 = std::max(small.x1, big.x1);
                     const float iy1 = std::max(small.y1, big.y1);
                     const float ix2 = std::min(small.x2, big.x2);
@@ -1170,7 +1253,7 @@ int main(int argc, char** argv) {
                     const float inter = (ix2 - ix1) * (iy2 - iy1);
                     const float small_area =
                         std::max(1.0f, (small.x2 - small.x1) * (small.y2 - small.y1));
-                    return (inter / small_area) >= 0.50f; // ≥50% of helmet
+                    return (inter / small_area) >= min_overlap;
                 };
                 // 2026-05-20 compliance telemetry: count fully-compliant
                 // (has_helmet AND has_vest) vs violating PPE-persons in this
@@ -1184,10 +1267,23 @@ int main(int argc, char** argv) {
                 int violating_count = 0;
                 for (const auto* person : ppe_persons) {
                     bool has_helmet = false, has_vest = false;
-                    for (const auto* h : ppe_helmets) if (contained_in(*h, *person)) { has_helmet = true; break; }
-                    for (const auto* v : ppe_vests)   if (contained_in(*v, *person)) { has_vest   = true; break; }
-                    if (has_helmet && has_vest) ++compliant_count;
-                    else                        ++violating_count;
+                    bool has_gloves = false, has_mask = false, has_boots = false;
+                    for (const auto* h : ppe_helmets) if (contained_in(*h, *person, 0.50f)) { has_helmet = true; break; }
+                    for (const auto* v : ppe_vests)   if (contained_in(*v, *person, 0.50f)) { has_vest   = true; break; }
+                    for (const auto* g : ppe_gloves)  if (contained_in(*g, *person, 0.30f)) { has_gloves = true; break; }
+                    for (const auto* m : ppe_masks)   if (contained_in(*m, *person, 0.40f)) { has_mask   = true; break; }
+                    for (const auto* b : ppe_boots)   if (contained_in(*b, *person, 0.50f)) { has_boots  = true; break; }
+                    // Compliance ignores any check the operator disabled
+                    // (*_class == -1). A deployment that only enforces
+                    // hard hats sees vest/gloves/mask/boots absence treated
+                    // as "not measured", not as "violating".
+                    const bool helmet_ok = (kPpeRuntime.helmet_class < 0) || has_helmet;
+                    const bool vest_ok   = (kPpeRuntime.vest_class   < 0) || has_vest;
+                    const bool gloves_ok = (kPpeRuntime.gloves_class < 0) || has_gloves;
+                    const bool mask_ok   = (kPpeRuntime.mask_class   < 0) || has_mask;
+                    const bool boots_ok  = (kPpeRuntime.boots_class  < 0) || has_boots;
+                    if (helmet_ok && vest_ok && gloves_ok && mask_ok && boots_ok) ++compliant_count;
+                    else                                                          ++violating_count;
 
                     // 2026-05-20 PPE-person ↔ COCO-tracked-person IoU pairing.
                     // PPE engine runs as a parallel AdvancedInfer, NOT through
@@ -1248,8 +1344,17 @@ int main(int argc, char** argv) {
                             {"box", {to.bbox.x1, to.bbox.y1, to.bbox.x2, to.bbox.y2}}
                         });
                     };
-                    if (!has_helmet) emit_violation(406, "NoHelmet");
-                    if (!has_vest)   emit_violation(407, "NoVest");
+                    // *_class == -1 → operator opted out of that compliance
+                    // check; do NOT emit a violation just because we
+                    // collected zero detections (we were never looking
+                    // for them). 2026-05-21 added gloves/mask/boots
+                    // (synthetic class_ids 408/409/410, see ai_event_
+                    // processor::processPPEViolation dispatch).
+                    if (kPpeRuntime.helmet_class >= 0 && !has_helmet) emit_violation(406, "NoHelmet");
+                    if (kPpeRuntime.vest_class   >= 0 && !has_vest)   emit_violation(407, "NoVest");
+                    if (kPpeRuntime.gloves_class >= 0 && !has_gloves) emit_violation(408, "NoGloves");
+                    if (kPpeRuntime.mask_class   >= 0 && !has_mask)   emit_violation(409, "NoMask");
+                    if (kPpeRuntime.boots_class  >= 0 && !has_boots)  emit_violation(410, "NoBoots");
                 }
                 if (compliant_count + violating_count > 0) {
                     j_out["ppe_summary"] = {

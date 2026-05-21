@@ -275,6 +275,35 @@ bool Config::loadFromFile(const std::string& filepath) {
             auto ai = config_["ai"];
             ai_detection_.min_person_height_px =
                 ai["min_person_height_px"].as<float>(ai_detection_.min_person_height_px);
+
+            // 2026-05-20 PPE engine class-label config. Each field is
+            // optional — absent fields keep the struct defaults
+            // (PPE-YOLOv8m 6-class engine shipped 2026-05-19). Sanity:
+            // `labels` empty → fall back to defaults rather than disable
+            // labelling entirely.
+            if (ai["ppe"]) {
+                auto ppe = ai["ppe"];
+                if (ppe["labels"] && ppe["labels"].IsSequence()) {
+                    std::vector<std::string> parsed;
+                    parsed.reserve(ppe["labels"].size());
+                    for (const auto& node : ppe["labels"]) {
+                        parsed.push_back(node.as<std::string>(""));
+                    }
+                    if (!parsed.empty()) ai_detection_.ppe.labels = std::move(parsed);
+                }
+                ai_detection_.ppe.person_class =
+                    ppe["person_class"].as<int>(ai_detection_.ppe.person_class);
+                ai_detection_.ppe.helmet_class =
+                    ppe["helmet_class"].as<int>(ai_detection_.ppe.helmet_class);
+                ai_detection_.ppe.vest_class =
+                    ppe["vest_class"].as<int>(ai_detection_.ppe.vest_class);
+                ai_detection_.ppe.gloves_class =
+                    ppe["gloves_class"].as<int>(ai_detection_.ppe.gloves_class);
+                ai_detection_.ppe.mask_class =
+                    ppe["mask_class"].as<int>(ai_detection_.ppe.mask_class);
+                ai_detection_.ppe.boots_class =
+                    ppe["boots_class"].as<int>(ai_detection_.ppe.boots_class);
+            }
         }
         
         // Parse batch inference configuration

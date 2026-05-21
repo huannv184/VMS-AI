@@ -142,8 +142,47 @@ public:
     // If your camera mount sees people at <20 px height your scene is
     // either very wide-angle or the camera is too far for face
     // recognition to be useful anyway.
+    // 2026-05-20 PPE engine class-label configuration. Pre-fix the
+    // ai_worker hard-coded `kPPELabels[]` + the class indices for
+    // person/helmet/vest in C++. An operator retraining the PPE engine
+    // with a different class order had to edit source + rebuild — see
+    // `tools/test_ppe_engine.py` for how to discover an engine's actual
+    // class names (model.names sidecar metadata).
+    //
+    // Default values below match the engine shipped 2026-05-19
+    // (PPE-YOLOv8m.engine 6 classes): helmet/vest/person/gloves/mask/boots.
+    // labels[i] is the human label for class_id i (mostly UI / log).
+    // *_class indices select which slot is which semantically — only
+    // person + helmet + vest are used for violation derivation today;
+    // others (gloves/mask/boots) are detection-only.
+    //
+    // Set *_class to -1 to disable that compliance check entirely (e.g.
+    // a deployment that only cares about hard hats, not vests, sets
+    // vest_class=-1 and no NoVest violations are emitted).
+    //
+    // Propagated to ai_worker via VMS_AI_PPE_CONFIG_JSON env var (set in
+    // main.cpp at boot, inherited by QProcess children).
+    struct PpeClassConfig {
+        std::vector<std::string> labels = {
+            "Helmet", "Vest", "PPE_Person",
+            "Gloves", "Mask", "Boots"
+        };
+        int person_class = 2;
+        int helmet_class = 0;
+        int vest_class   = 1;
+        // 2026-05-21 expanded the enforcement set from 2 → all 5 wearables
+        // the engine recognizes (operator request "bật hết"). Set any
+        // *_class to -1 in backend.yaml to disable that compliance check
+        // without re-training the engine (e.g. an office-walkthrough camera
+        // shouldn't care about gloves/boots).
+        int gloves_class = 3;
+        int mask_class   = 4;
+        int boots_class  = 5;
+    };
+
     struct AIDetectionConfig {
         float min_person_height_px = 20.0f;
+        PpeClassConfig ppe;
     };
 
     // Batch inference configuration (M-1)

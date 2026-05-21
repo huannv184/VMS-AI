@@ -163,14 +163,18 @@ void AiEventProcessor::eventWorkerLoop() {
                     processIntrusion(job.camera_id, obj, job.frame);
                 } else if (class_id == 200 || label == "LicensePlate") {
                     processLicensePlate(job.camera_id, obj, job.frame);
-                } else if (class_id == 406 || class_id == 407 ||
-                           label == "NoHelmet" || label == "NoVest") {
-                    // 2026-05-19 PPE violation classes — DERIVED in ai_worker
-                    // via person↔helmet/vest containment pairing. Engine
-                    // itself is detection-only (helmet/vest/person/gloves/
-                    // mask/boots); ai_worker emits synthetic 406=NoHelmet
-                    // and 407=NoVest events when a person bbox has no
-                    // containing helmet/vest bbox (≥50% containment).
+                } else if ((class_id >= 406 && class_id <= 410) ||
+                           label == "NoHelmet" || label == "NoVest" ||
+                           label == "NoGloves" || label == "NoMask" ||
+                           label == "NoBoots") {
+                    // 2026-05-19 + 2026-05-21 PPE violation classes —
+                    // DERIVED in ai_worker via person↔wearable containment
+                    // pairing. Engine itself is detection-only (helmet/vest/
+                    // person/gloves/mask/boots); ai_worker emits synthetic
+                    //   406 NoHelmet, 407 NoVest, 408 NoGloves,
+                    //   409 NoMask,  410 NoBoots
+                    // when a person bbox has no containing wearable bbox
+                    // (thresholds 50% helmet/vest/boots, 30% gloves, 40% mask).
                     processPPEViolation(job.camera_id, obj, job.frame);
                 }
             }
@@ -489,6 +493,15 @@ void AiEventProcessor::processPPEViolation(int camera_id,
     } else if (class_id == 407 || label == "NoVest") {
         kind = "no_vest";
         desc = "Phát hiện nhân viên không mặc áo phản quang";
+    } else if (class_id == 408 || label == "NoGloves") {
+        kind = "no_gloves";
+        desc = "Phát hiện nhân viên không đeo găng tay bảo hộ";
+    } else if (class_id == 409 || label == "NoMask") {
+        kind = "no_mask";
+        desc = "Phát hiện nhân viên không đeo khẩu trang";
+    } else if (class_id == 410 || label == "NoBoots") {
+        kind = "no_boots";
+        desc = "Phát hiện nhân viên không mang giày bảo hộ";
     } else {
         return; // not a violation class
     }

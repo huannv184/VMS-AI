@@ -130,6 +130,57 @@ ai:
   # Maps to env var VMS_MIN_PERSON_HEIGHT_PX consumed by ai_worker_v2.
   min_person_height_px: 20
 
+  # ---------------------------------------------------------------------
+  # PPE (Personal Protective Equipment) class-label config.
+  #
+  # The PPE engine deployed under cpp-backend/.../models/PPE-YOLOv8m.engine
+  # is detection-only — it emits helmet/vest/person/gloves/mask/boots
+  # bounding boxes by class_id. Violation classes (NoHelmet/NoVest) are
+  # DERIVED in ai_worker by checking whether each detected PERSON bbox
+  # contains a HELMET and a VEST bbox (≥50% containment of the smaller
+  # bbox area). Compliance rate is rolled up by `PpeComplianceAggregator`
+  # (see /api/analytics/ppe_compliance).
+  #
+  # Edit this block when retraining the engine with a different class
+  # order. Use `tools/test_ppe_engine.py` to discover the engine's actual
+  # class names (model.names sidecar metadata) before editing.
+  #
+  # Defaults below match the engine shipped 2026-05-19. Leave the whole
+  # `ppe:` block commented out (or remove it) to keep these defaults.
+  # Maps to env var VMS_AI_PPE_CONFIG_JSON consumed by ai_worker_v2.
+  #
+  # ppe:
+  #   # Human-readable label per class_id 0..N. Used for UI overlays
+  #   # and ai_worker logs. Must match the engine's class count + order
+  #   # (mismatch → wrong labels but no crash).
+  #   labels:
+  #     - Helmet
+  #     - Vest
+  #     - PPE_Person
+  #     - Gloves
+  #     - Mask
+  #     - Boots
+  #   # Which engine class_id is "person" for violation pairing (the
+  #   # denominator). Set to -1 to disable the PPE feature entirely.
+  #   person_class: 2
+  #   # Which class_id is "helmet" for the NoHelmet compliance check.
+  #   # Set to -1 if your deployment doesn't enforce hard hats — then
+  #   # NoHelmet violations are not emitted and compliance ignores
+  #   # helmet absence.
+  #   helmet_class: 0
+  #   # Same shape for "vest". Set to -1 to skip the NoVest check.
+  #   vest_class: 1
+  #   # 2026-05-21 expanded enforcement: gloves / mask / boots are now
+  #   # paired against persons too and emit NoGloves / NoMask / NoBoots
+  #   # violations (synthetic class_ids 408 / 409 / 410). Defaults match
+  #   # the shipped 6-class engine. Set any one to -1 to skip that check
+  #   # — e.g. an indoor office camera should likely disable gloves +
+  #   # boots since employees walking through aren't required to wear
+  #   # them.
+  #   gloves_class: 3
+  #   mask_class:   4
+  #   boots_class:  5
+
 # ============================================================================
 # MEDIA SIGNING (presigned URLs for snapshots, recordings, etc.)
 # ============================================================================

@@ -23,6 +23,7 @@
 #include <QMetaObject>
 #include <QTimer>
 
+#include <nlohmann/json.hpp>
 #include "utils/logger.h"
 #include "utils/config.h"
 #include "utils/qt_logger.h"
@@ -291,6 +292,37 @@ int main(int argc, char* argv[]) {
                          v);
             } else if (const char* e = std::getenv("VMS_MIN_PERSON_HEIGHT_PX")) {
                 LOG_INFO("AI detection: VMS_MIN_PERSON_HEIGHT_PX={} (from operator env override)", e);
+            }
+
+            // 2026-05-20 PPE class-label config → JSON env var for ai_worker.
+            // Same env-precedence-rule as min_person_height_px: only set if
+            // operator hasn't already exported VMS_AI_PPE_CONFIG_JSON.
+            if (std::getenv("VMS_AI_PPE_CONFIG_JSON") == nullptr) {
+                nlohmann::json p;
+                p["labels"]       = ai_det.ppe.labels;
+                p["person_class"] = ai_det.ppe.person_class;
+                p["helmet_class"] = ai_det.ppe.helmet_class;
+                p["vest_class"]   = ai_det.ppe.vest_class;
+                // 2026-05-21 expanded enforcement set (operator request "B").
+                p["gloves_class"] = ai_det.ppe.gloves_class;
+                p["mask_class"]   = ai_det.ppe.mask_class;
+                p["boots_class"]  = ai_det.ppe.boots_class;
+                const std::string v = p.dump();
+#ifdef _WIN32
+                _putenv_s("VMS_AI_PPE_CONFIG_JSON", v.c_str());
+#else
+                setenv("VMS_AI_PPE_CONFIG_JSON", v.c_str(), /*overwrite=*/0);
+#endif
+                LOG_INFO("AI detection: VMS_AI_PPE_CONFIG_JSON set (labels={}, person={}, helmet={}, vest={}, gloves={}, mask={}, boots={})",
+                         ai_det.ppe.labels.size(),
+                         ai_det.ppe.person_class,
+                         ai_det.ppe.helmet_class,
+                         ai_det.ppe.vest_class,
+                         ai_det.ppe.gloves_class,
+                         ai_det.ppe.mask_class,
+                         ai_det.ppe.boots_class);
+            } else {
+                LOG_INFO("AI detection: VMS_AI_PPE_CONFIG_JSON taken from operator env override");
             }
         }
 
