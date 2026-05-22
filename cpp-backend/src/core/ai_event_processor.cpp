@@ -847,17 +847,38 @@ void AiEventProcessor::setCooldown(const std::string& key) {
     cooldown_cache_[key] = std::chrono::system_clock::now();
 }
 
+// 2026-05-22 Path-1 per-camera confirm-count override. Called from
+// CameraPipelineManager::startPipeline after parsing camera.ai_config.
+// count <=0 or out of [1,30] removes the per-camera entry (falls back
+// to env / default). Synchronised under the same mutex as the lookup
+// in observeTrackAndCheckConfirmed.
+void AiEventProcessor::setCameraConfirmCount(int camera_id, int count) {
+    std::lock_guard<std::mutex> lock(track_obs_mutex_);
+    if (count >= 1 && count <= 30) {
+        per_camera_confirm_count_[camera_id] = count;
+    } else {
+        per_camera_confirm_count_.erase(camera_id);
+    }
+}
+
+void AiEventProcessor::clearCameraConfirmCount(int camera_id) {
+    std::lock_guard<std::mutex> lock(track_obs_mutex_);
+    per_camera_confirm_count_.erase(camera_id);
+}
+
 // 2026-05-21 Path-1 — multi-frame track confirmation gate. See header
 // comment for rationale. Returns true (= "fire event allowed") when:
 //   - track_id == -1 (bypass; legacy non-tracked path)
 //   - OR the per-(camera, track) observation count has reached the
-//     confirmation threshold (default 3, env VMS_INTRUSION_CONFIRM_FRAMES).
+//     confirmation threshold (per-camera override > env > default 3).
 // Always increments the counter. Lazy GC drops stale entries when the
 // map grows past kTrackObsSoftCap.
 bool AiEventProcessor::observeTrackAndCheckConfirmed(int camera_id, int track_id) {
     if (track_id < 0) return true;  // bypass mode — let position cooldown gate
 
-    static const int confirm_count = []() {
+    // Env-derived global default. Static because env doesn't change at
+    // runtime; the per-camera override below wins over this.
+    static const int env_confirm_count = []() {
         const char* e = std::getenv("VMS_INTRUSION_CONFIRM_FRAMES");
         if (e && *e) {
             int v = std::atoi(e);
@@ -869,6 +890,11 @@ bool AiEventProcessor::observeTrackAndCheckConfirmed(int camera_id, int track_id
     const std::string key = std::to_string(camera_id) + ":" + std::to_string(track_id);
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(track_obs_mutex_);
+
+    // Per-camera override beats env / default. Lookup is O(1).
+    int confirm_count = env_confirm_count;
+    auto cam_it = per_camera_confirm_count_.find(camera_id);
+    if (cam_it != per_camera_confirm_count_.end()) confirm_count = cam_it->second;
 
     // Lazy GC: when map gets too large, drop entries idle past TTL. O(N)
     // sweep but only runs occasionally (~hourly on a busy site).

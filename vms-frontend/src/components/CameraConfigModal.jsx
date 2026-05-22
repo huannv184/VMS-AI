@@ -41,6 +41,37 @@ const CameraConfigModal = ({ onClose, initialData }) => {
     site_id: initialData?.site_id || -1
   });
 
+  // 2026-05-22 Path-1 per-camera detection filter overrides. Empty
+  // string for any field = "use default" (env var or hardcoded). The
+  // backend reads these from cameras.ai_config and ai_worker applies
+  // them at process startup; intrusion_confirm_frames is wired to
+  // AiEventProcessor's per-camera map at pipeline (re)start. Existing
+  // ai_config JSON keys (yolo/face/lpr/fire/ppe/face_match_threshold)
+  // are preserved on save — we only merge these four fields in.
+  const parseExistingAiConfig = () => {
+    try {
+      if (!initialData?.ai_config) return {};
+      if (typeof initialData.ai_config === 'string') return JSON.parse(initialData.ai_config);
+      if (typeof initialData.ai_config === 'object') return initialData.ai_config;
+    } catch (_) { /* ignore parse error — start with empty */ }
+    return {};
+  };
+  const existingAiCfg = parseExistingAiConfig();
+  const fieldFromCfg = (key) =>
+    (existingAiCfg && existingAiCfg[key] != null && existingAiCfg[key] !== '')
+      ? String(existingAiCfg[key])
+      : '';
+  const [aiFilters, setAiFilters] = useState({
+    min_person_aspect_ratio: fieldFromCfg('min_person_aspect_ratio'),
+    min_person_height_px:    fieldFromCfg('min_person_height_px'),
+    min_face_size_px:        fieldFromCfg('min_face_size_px'),
+    intrusion_confirm_frames:fieldFromCfg('intrusion_confirm_frames'),
+  });
+  const handleFilterChange = (e) => {
+    const { name, value } = e.target;
+    setAiFilters((prev) => ({ ...prev, [name]: value }));
+  };
+
   // Hardware event-subscription health snapshot (ONVIF PullPoint / Axis
   // eventfeed / Dahua attach / Hanwha poll / Hikvision adapter). Only
   // meaningful when editing an existing camera; new cameras have no
@@ -353,12 +384,39 @@ const CameraConfigModal = ({ onClose, initialData }) => {
           }
       }
       
+      // Merge Path-1 filter overrides into the existing ai_config JSON
+      // (preserve yolo/face/lpr/fire/ppe/face_match_threshold etc).
+      // Empty input string for a field = remove the key (back to default).
+      const aiCfg = { ...existingAiCfg };
+      const applyNumField = (key, raw, opts = {}) => {
+        const s = String(raw ?? '').trim();
+        if (s === '') { delete aiCfg[key]; return null; }
+        const n = Number(s);
+        if (!Number.isFinite(n)) return `${opts.label || key} không phải số hợp lệ`;
+        if (opts.min != null && n < opts.min) return `${opts.label || key} phải ≥ ${opts.min}`;
+        if (opts.max != null && n > opts.max) return `${opts.label || key} phải ≤ ${opts.max}`;
+        if (opts.integer && !Number.isInteger(n)) return `${opts.label || key} phải là số nguyên`;
+        aiCfg[key] = n;
+        return null;
+      };
+      const filterErrors = [
+        applyNumField('min_person_aspect_ratio', aiFilters.min_person_aspect_ratio, { min: 0, max: 10, label: 'Tỉ lệ cao/rộng tối thiểu' }),
+        applyNumField('min_person_height_px',    aiFilters.min_person_height_px,    { min: 0, max: 1000, label: 'Chiều cao người tối thiểu (px)' }),
+        applyNumField('min_face_size_px',        aiFilters.min_face_size_px,        { min: 0, max: 500, label: 'Cạnh khuôn mặt tối thiểu (px)' }),
+        applyNumField('intrusion_confirm_frames',aiFilters.intrusion_confirm_frames,{ min: 1, max: 30, integer: true, label: 'Số khung xác nhận' }),
+      ].filter(Boolean);
+      if (filterErrors.length > 0) {
+        alert(filterErrors.join('\n'));
+        return;
+      }
+
       const payload = {
         name,
         rtsp_url: finalRtspUrl,
         description: trim(formData.description),
         is_active: true,
-        site_id: parseInt(formData.site_id) || -1
+        site_id: parseInt(formData.site_id) || -1,
+        ai_config: aiCfg,
       };
 
       if (initialData?.id) {
@@ -570,6 +628,47 @@ const CameraConfigModal = ({ onClose, initialData }) => {
                 </div>
               );
             })()}
+
+            {/* Path-1 per-camera detection filters. Empty = dùng default
+                (1.5 / 20 / 50 / 3). Operator chỉnh per-camera khi
+                global default không phù hợp góc đặt camera (vd: cam
+                overhead cho phép aspect=0, cam doorway giữ 1.5). Có
+                hiệu lực sau khi camera restart pipeline (lưu xong
+                vms_backend respawn ai_worker với JSON mới). */}
+            <div style={{background:'var(--bg-card)', padding:'12px', borderRadius:'4px', border:'1px solid var(--border)', marginTop:'12px'}}>
+              <div style={{fontSize:'11px', color:'var(--text-dim)', marginBottom:'10px', fontFamily:"'Rajdhani',sans-serif", fontWeight:700, letterSpacing:'1px'}}>
+                BỘ LỌC PHÁT HIỆN AI (PATH-1) — ĐỂ TRỐNG = DÙNG MẶC ĐỊNH
+              </div>
+              <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:'8px'}}>
+                <div>
+                  <label style={{display:'block', fontSize:'10px', color:'var(--text-dim)', marginBottom:'4px'}}>TỈ LỆ H/W TỐI THIỂU (mặc định 1.5)</label>
+                  <input name="min_person_aspect_ratio" type="text" inputMode="decimal" className="search-input" style={{width:'100%'}}
+                         placeholder="vd: 1.2 — 0 = tắt"
+                         value={aiFilters.min_person_aspect_ratio} onChange={handleFilterChange} />
+                </div>
+                <div>
+                  <label style={{display:'block', fontSize:'10px', color:'var(--text-dim)', marginBottom:'4px'}}>CHIỀU CAO NGƯỜI MIN (px, mặc định 20)</label>
+                  <input name="min_person_height_px" type="text" inputMode="decimal" className="search-input" style={{width:'100%'}}
+                         placeholder="vd: 30"
+                         value={aiFilters.min_person_height_px} onChange={handleFilterChange} />
+                </div>
+                <div>
+                  <label style={{display:'block', fontSize:'10px', color:'var(--text-dim)', marginBottom:'4px'}}>CẠNH MẶT MIN (px, mặc định 50)</label>
+                  <input name="min_face_size_px" type="text" inputMode="decimal" className="search-input" style={{width:'100%'}}
+                         placeholder="vd: 40"
+                         value={aiFilters.min_face_size_px} onChange={handleFilterChange} />
+                </div>
+                <div>
+                  <label style={{display:'block', fontSize:'10px', color:'var(--text-dim)', marginBottom:'4px'}}>KHUNG XÁC NHẬN (1-30, mặc định 3)</label>
+                  <input name="intrusion_confirm_frames" type="text" inputMode="numeric" className="search-input" style={{width:'100%'}}
+                         placeholder="vd: 2"
+                         value={aiFilters.intrusion_confirm_frames} onChange={handleFilterChange} />
+                </div>
+              </div>
+              <div style={{fontSize:'10px', color:'var(--text-dim)', marginTop:'8px', fontStyle:'italic'}}>
+                Cam có FP cao (thùng rác, dog, vật cao): tăng tỉ lệ + khung xác nhận. Cam góc nghiêng / overhead: giảm tỉ lệ về 0.
+              </div>
+            </div>
 
             <div style={{marginTop:'auto', paddingTop:'20px', display:'flex', gap:'10px'}}>
                 <button onClick={onClose} disabled={loading || deepScanning} style={{flex:1, padding:'10px', background:'transparent', border:'1px solid var(--border)', color:'var(--text-secondary)', cursor:'pointer', fontWeight:'bold', borderRadius:'4px'}}>HỦY BỎ</button>

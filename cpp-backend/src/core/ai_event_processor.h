@@ -67,6 +67,15 @@ public:
 
     void processMetadata(int camera_id, const nlohmann::json& metadata, const cv::Mat& frame);
 
+    // 2026-05-22 Path-1 per-camera override for the multi-frame track
+    // confirmation gate. Called by CameraPipelineManager when starting
+    // (or restarting) a pipeline; reads the value from the camera's
+    // ai_config JSON column. Clamped to [1, 30]; <=0 removes the
+    // per-camera entry (falls back to env / kTrackConfirmCount). Lookup
+    // in observeTrackAndCheckConfirmed is O(1) hash + mutex-guarded.
+    void setCameraConfirmCount(int camera_id, int count);
+    void clearCameraConfirmCount(int camera_id);
+
 private:
     // ── Event processing: bounded worker pool with joinable workers ───────────
     // Previously processMetadata() spawned std::thread(...).detach() with `this`
@@ -131,8 +140,15 @@ private:
         std::chrono::steady_clock::time_point last_seen;
     };
     std::unordered_map<std::string, TrackObservation> track_observations_;
+    // Per-camera override map, populated by setCameraConfirmCount. Read
+    // path in observeTrackAndCheckConfirmed; both sides hold
+    // track_obs_mutex_. Keeping this under the same mutex (vs. a
+    // separate one) sidesteps lock-ordering concerns and the map is
+    // touched once per Event candidate frame — contention is bounded
+    // by the existing 2 event_worker threads.
+    std::unordered_map<int, int> per_camera_confirm_count_;
     std::mutex track_obs_mutex_;
-    static constexpr int kTrackConfirmCount = 3;       // override via VMS_INTRUSION_CONFIRM_FRAMES
+    static constexpr int kTrackConfirmCount = 3;       // override via VMS_INTRUSION_CONFIRM_FRAMES or ai_config.intrusion_confirm_frames
     static constexpr int kTrackObsTTLSec = 30;
     static constexpr size_t kTrackObsSoftCap = 5000;   // GC trigger
     // Returns true when this observation should produce an Event (count

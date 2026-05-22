@@ -562,12 +562,15 @@ int main(int argc, char** argv) {
     ai_config.lpr_model_path = resolveModelPath("lprnet.onnx", exe_path);
     
     // Parse Config from Arguments (Index 4)
+    // j_config is lifted out of the try{} so per-camera Path-1 filter
+    // overrides (resolved further below) can read it.
+    nlohmann::json j_config = nlohmann::json::object();
     if (argc > 4) {
         std::string config_str = argv[4];
         try {
             std::cerr << "[AI-Worker-" << camera_id << "] Parsing config: " << config_str << std::endl;
-            auto j_config = json::parse(config_str);
-            
+            j_config = json::parse(config_str);
+
             if (j_config.contains("yolo")) ai_config.enable_yolo = j_config["yolo"];
             if (j_config.contains("face")) {
                 ai_config.enable_face_detection = j_config["face"];
@@ -578,13 +581,39 @@ int main(int argc, char** argv) {
             if (j_config.contains("ppe")) ai_config.enable_ppe = j_config["ppe"];
             if (j_config.contains("face_match_threshold")) {
                 ai_config.face_match_threshold = j_config["face_match_threshold"].get<float>();
-                std::cerr << "[AI-Worker-" << camera_id << "] Custom face_match_threshold: " 
+                std::cerr << "[AI-Worker-" << camera_id << "] Custom face_match_threshold: "
                           << ai_config.face_match_threshold << std::endl;
             }
         } catch (const std::exception& e) {
              std::cerr << "[AI-Worker-" << camera_id << "] Error parsing config: " << e.what() << std::endl;
+             j_config = nlohmann::json::object();
         }
     }
+
+    // 2026-05-22 Path-1 per-camera filter overrides.
+    // Precedence: per-camera ai_config JSON > env var > hardcoded default.
+    // Operator complaint loop: global env defaults (aspect 1.5, height 20,
+    // face 50) were appropriate for doorway/frontal cams but dropped every
+    // detection on angled/overhead cams where persons appear with h/w<1.5.
+    // Per-camera override lets operator dial each camera's filters via UI
+    // without touching env or rebuild. Filter values live in the same
+    // ai_config JSON column that already carries yolo/face/lpr/fire/ppe
+    // toggles, set by CameraConfigModal.
+    auto resolveFloatFilter = [&](const char* json_key, const char* env_name, float def) -> float {
+        if (j_config.contains(json_key) && j_config[json_key].is_number()) {
+            return j_config[json_key].get<float>();
+        }
+        const char* e = std::getenv(env_name);
+        if (e && *e) return std::strtof(e, nullptr);
+        return def;
+    };
+    const float min_person_height_px    = resolveFloatFilter("min_person_height_px",    "VMS_MIN_PERSON_HEIGHT_PX",   20.0f);
+    const float min_person_aspect_ratio = resolveFloatFilter("min_person_aspect_ratio", "VMS_MIN_PERSON_ASPECT_RATIO", 1.5f);
+    const float min_face_side_px        = resolveFloatFilter("min_face_size_px",        "VMS_MIN_FACE_SIZE_PX",        50.0f);
+    std::cerr << "[AI-Worker-" << camera_id << "] Path-1 filters: "
+              << "min_person_height_px=" << min_person_height_px
+              << " min_person_aspect_ratio=" << min_person_aspect_ratio
+              << " min_face_size_px=" << min_face_side_px << std::endl;
 
     // Env-var bisect levers — applied AFTER JSON config so they always win.
     // Use case: cmdline JSON escape is broken (the {"yolo":...} arg arrives as
@@ -818,51 +847,10 @@ int main(int argc, char** argv) {
                         return std::atoi(e) != 0;
                     }();
 
-                    // 2026-05-08 (Fix-B): minimum person bbox height filter.
-                    //   YOLO at any conf threshold below ~0.6 produces a long tail
-                    //   of small false-positive person detections on background
-                    //   texture (vegetation, fence noise, distant shadow). Cameras
-                    //   in this deployment are mounted at human-scale; a real
-                    //   person fewer than ~40 px tall is either too far for face
-                    //   recognition to be useful or noise. Per-camera override via
-                    //   VMS_MIN_PERSON_HEIGHT_PX.
-                    // 2026-05-19 default lowered 40→20 px after operator hit
-                    // "AI không có" out-of-box: a typical deployment sees real
-                    // people at <40 px in the source frame (wide-angle PTZ,
-                    // upper-corner mounts, or 720p streams) so 40 dropped
-                    // legitimate detections. 20 still filters obvious noise
-                    // (vegetation, fence texture, 1-pixel motion blobs). The
-                    // env var is the operator's emergency override; parent
-                    // vms_backend exports it from config.ai.min_person_height_px
-                    // when present, so this hardcoded value is a last-resort
-                    // fallback when both env and yaml are absent.
-                    static const float min_person_height_px = []() {
-                        const char* e = std::getenv("VMS_MIN_PERSON_HEIGHT_PX");
-                        return (e && *e) ? std::strtof(e, nullptr) : 20.0f;
-                    }();
-
-                    // 2026-05-21 Path-1 fix: aspect-ratio filter for COCO
-                    //   person (class 0). Real standing humans have bbox
-                    //   h/w in [1.8, 3.0]; dogs ~[0.5, 1.0], wide objects
-                    //   (vehicles, trash cans, signs) typically < 1.5.
-                    //   YOLO11m at any threshold confuses any vertical
-                    //   "blob" as person at conf 0.45-0.60 → operator sees
-                    //   dogs / posts / shadows fire intrusion events.
-                    //   Aspect filter is the highest-leverage cheap fix
-                    //   because it's orthogonal to the model's class score
-                    //   — pure geometric prior.
-                    //
-                    //   Trade-off: people sitting on floor or crouching
-                    //   (h/w ~0.8-1.5) get filtered. Acceptable for this
-                    //   deployment (doorway / patrol cams, sitting not
-                    //   primary use case). Operator dials lower via env
-                    //   VMS_MIN_PERSON_ASPECT_RATIO=1.0 if seated-person
-                    //   detection matters.
-                    static const float min_person_aspect_ratio = []() {
-                        const char* e = std::getenv("VMS_MIN_PERSON_ASPECT_RATIO");
-                        return (e && *e) ? std::strtof(e, nullptr) : 1.5f;
-                    }();
-
+                    // Person bbox geometric filters (min_person_height_px,
+                    // min_person_aspect_ratio) resolved once at startup —
+                    // see Path-1 per-camera filter block above for precedence
+                    // (per-camera JSON > env > default).
                     std::vector<inference::BBox> det_bboxes;
                     size_t dropped_small_persons = 0;
                     size_t dropped_low_aspect_persons = 0;
@@ -969,29 +957,9 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                // 2026-05-08 (Fix-B): minimum face side filter — drop SCRFD
-                //   detections whose shorter side is below min_face_side_px.
-                //   Tiny "faces" on road texture / wall pattern are the
-                //   primary source of identity-match false positives; ArcFace
-                //   embeddings produced from < 30×30 px crops are not
-                //   meaningful even when the patch happens to be a real face.
-                //   Per-camera override via VMS_MIN_FACE_SIZE_PX.
-                // 2026-05-21 Path-1 fix: default bumped 30 → 50. Operator
-                //   running 1080p cameras was still hitting "mặt đường →
-                //   khuôn mặt" false-positive identity matches at 30 px
-                //   because road texture / wall tiles produce 30-45 px
-                //   crops that ArcFace then embeddings as gibberish that
-                //   happens to be close to a real gallery vector. 50 px is
-                //   ArcFace's "rule of thumb" minimum where embedding
-                //   distances start being separable; below that ID match
-                //   is essentially random. Lower to 30 only if camera
-                //   genuinely needs distant face capture and operator is
-                //   OK with the noise.
-                static const float min_face_side_px = []() {
-                    const char* e = std::getenv("VMS_MIN_FACE_SIZE_PX");
-                    return (e && *e) ? std::strtof(e, nullptr) : 50.0f;
-                }();
-
+                // Face min-side filter (min_face_side_px) resolved once at
+                // startup — see Path-1 per-camera filter block above for
+                // precedence (per-camera JSON > env > default).
                 if (!result.faces.empty()) {
                     size_t before_min = result.faces.size();
                     result.faces.erase(

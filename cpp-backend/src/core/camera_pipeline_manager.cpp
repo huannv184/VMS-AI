@@ -376,6 +376,27 @@ bool CameraPipelineManager::startPipeline(int camera_id, const std::string& rtsp
         std::string db_path = vms::Config::getInstance().getDatabaseConfig().path;
         std::string ai_config_json = camera_opt->ai_config.empty() ? "{}" : camera_opt->ai_config;
 
+        // 2026-05-22 Path-1 per-camera override wiring. The geometric
+        // filters (min_person_height_px / min_person_aspect_ratio /
+        // min_face_size_px) live inside ai_worker so they're already
+        // delivered through the cmdline JSON below. The confirm-frame
+        // gate, however, runs in the parent process (AiEventProcessor
+        // is a singleton serving all cameras), so we extract the value
+        // here and push it into the per-camera map. -1/0/missing key
+        // clears any prior override (falls back to env / default 3).
+        try {
+            auto j = nlohmann::json::parse(ai_config_json);
+            if (j.contains("intrusion_confirm_frames") && j["intrusion_confirm_frames"].is_number()) {
+                AiEventProcessor::getInstance().setCameraConfirmCount(
+                    camera_id, j["intrusion_confirm_frames"].get<int>());
+            } else {
+                AiEventProcessor::getInstance().clearCameraConfirmCount(camera_id);
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("[Manager] Camera {}: ai_config parse failed for confirm-frame override: {}", camera_id, e.what());
+            AiEventProcessor::getInstance().clearCameraConfirmCount(camera_id);
+        }
+
         // Windows CommandLineToArgvW: inside a "..."-quoted argument, an embedded
         // double-quote must be written as \". A backslash followed by a quote is
         // an escaped quote; a backslash NOT followed by a quote is a literal \.
@@ -635,6 +656,7 @@ void CameraPipelineManager::stopPipeline(int camera_id) {
     FrameBus::getInstance().unsubscribeAll(camera_id);
     PipelineStateStore::getInstance().removeCamera(camera_id);
     HealthMonitor::getInstance().unregisterCamera(camera_id);
+    AiEventProcessor::getInstance().clearCameraConfirmCount(camera_id);
 }
 
 
@@ -661,6 +683,7 @@ void CameraPipelineManager::stopAllPipelines() {
         FrameBus::getInstance().unsubscribeAll(camera_id);
         PipelineStateStore::getInstance().removeCamera(camera_id);
         HealthMonitor::getInstance().unregisterCamera(camera_id);
+        AiEventProcessor::getInstance().clearCameraConfirmCount(camera_id);
     }
 }
 
