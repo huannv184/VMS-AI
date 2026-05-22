@@ -136,11 +136,21 @@ void CounterController::registerRoutes(vms::server::VmsApp& app) {
             if (req.method == crow::HTTPMethod::Get) {
                 QSqlQuery q(db);
                 if (req.url_params.get("camera_id")) {
+                    // Validate camera_id before binding. Pre-fix used std::atoi
+                    // which returns 0 on garbage input — a typo like
+                    // ?camera_id=abc would silently return cameras with id=0
+                    // instead of HTTP 400. Pattern from anpr_controller:50-54.
+                    int cam_id = 0;
+                    try {
+                        cam_id = std::stoi(req.url_params.get("camera_id"));
+                    } catch (const std::exception&) {
+                        return ApiUtils::createErrorResponse("Invalid query parameter: camera_id must be an integer", 400, origin);
+                    }
                     q.prepare("SELECT id, camera_id, name, ax, ay, bx, by, "
                               "       direction_a_label, direction_b_label, "
                               "       object_classes_json, enabled "
                               "FROM counting_lines WHERE camera_id = ? ORDER BY id ASC");
-                    q.bindValue(0, std::atoi(req.url_params.get("camera_id")));
+                    q.bindValue(0, cam_id);
                 } else {
                     q.prepare("SELECT id, camera_id, name, ax, ay, bx, by, "
                               "       direction_a_label, direction_b_label, "

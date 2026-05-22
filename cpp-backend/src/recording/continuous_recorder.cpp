@@ -248,18 +248,55 @@ void ContinuousRecorder::scanAndRegisterSegments() {
                 }
             }
 
+            const std::string pending_path = full_path + ".pending";
             if (!already_exists) {
                 if (repo.insertSegment(camera_id_, full_path, start_time, end_time, file_size, "completed")) {
                     LOG_INFO("[ContinuousRecorder-{}] Registered segment: {} ({}s)", camera_id_, filename, segment_sec_);
+                    // Clear any stale .pending marker from a prior failed
+                    // attempt — registration now succeeded.
+                    if (fs::exists(pending_path)) {
+                        std::error_code ec;
+                        fs::remove(pending_path, ec);
+                    }
                 } else {
-                    // Segment is on disk but DB row was not written. The next
-                    // retention sweep can mistake this for an orphan and
-                    // delete a valid recent recording — surface the failure
-                    // loudly instead of leaving the disk/DB drift silent.
-                    LOG_ERROR("[ContinuousRecorder-{}] insertSegment returned false for {} "
-                              "(file exists on disk but is NOT registered; "
-                              "may be pruned as orphan)",
-                              camera_id_, full_path);
+                    // Segment on disk but DB row not written. Self-heal: scan
+                    // runs every 30s and retries until insert succeeds. To
+                    // distinguish transient (DB lock, brief lock contention)
+                    // from permanent (FK error, schema drift, full disk DB),
+                    // write a .pending sidecar capturing first-failure
+                    // timestamp + retry count. Marker persists across backend
+                    // restart so the operator can grep for genuinely stuck
+                    // segments and pruneOldSegments knows not to touch them.
+                    int prior_retries = 0;
+                    int64_t first_fail_ts = (int64_t)std::time(nullptr);
+                    try {
+                        if (fs::exists(pending_path)) {
+                            std::ifstream in(pending_path);
+                            std::string ts_str, rc_str;
+                            if (std::getline(in, ts_str, ',') && std::getline(in, rc_str)) {
+                                first_fail_ts = std::stoll(ts_str);
+                                prior_retries = std::stoi(rc_str);
+                            }
+                        }
+                    } catch (const std::exception&) { /* malformed marker — treat as first failure */ }
+                    const int retry_count = prior_retries + 1;
+                    try {
+                        std::ofstream out(pending_path, std::ios::trunc);
+                        out << first_fail_ts << "," << retry_count << "\n";
+                    } catch (const std::exception& e) {
+                        LOG_WARN("[ContinuousRecorder-{}] failed to write pending marker {}: {}",
+                                 camera_id_, pending_path, e.what());
+                    }
+                    const int64_t age_sec = (int64_t)std::time(nullptr) - first_fail_ts;
+                    if (age_sec > 3600 || retry_count >= 10) {
+                        LOG_ERROR("[ContinuousRecorder-{}] insertSegment STUCK for {} "
+                                  "(retries={}, age={}s) — manual DB inspection required",
+                                  camera_id_, full_path, retry_count, age_sec);
+                    } else {
+                        LOG_WARN("[ContinuousRecorder-{}] insertSegment failed for {} "
+                                 "(retry={}, will retry next scan)",
+                                 camera_id_, full_path, retry_count);
+                    }
                 }
             }
         }
@@ -288,6 +325,14 @@ void ContinuousRecorder::pruneOldSegments() {
                 if (fs::exists(seg.filename)) {
                     fs::remove(seg.filename);
                     LOG_DEBUG("[ContinuousRecorder-{}] Deleted old segment: {}", camera_id_, seg.filename);
+                }
+                // Sweep any leftover .pending sidecar — segment is now
+                // registered (it's in old_segments → has a DB row), so
+                // any prior failed-insert marker is stale.
+                const std::string pending_path = seg.filename + ".pending";
+                if (fs::exists(pending_path)) {
+                    std::error_code ec;
+                    fs::remove(pending_path, ec);
                 }
             } catch (const std::exception& e) {
                 LOG_WARN("[ContinuousRecorder-{}] Failed to delete file {}: {}", camera_id_, seg.filename, e.what());

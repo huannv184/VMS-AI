@@ -254,9 +254,16 @@ private:
     RuleEngine(const RuleEngine&) = delete;
     RuleEngine& operator=(const RuleEngine&) = delete;
     
-    // Evaluation internals
-    bool evaluateCondition(const RuleCondition& cond, const RawEvent& event);
-    bool evaluateConditions(const std::vector<RuleCondition>& conds, RuleLogic logic, const RawEvent& event);
+    // Evaluation internals. trigger_log_snapshot is passed by const ref so
+    // RULE_TRIGGERED conditions can read recent firings without acquiring
+    // log_mutex_ (which evaluateEvent already snapshotted into a local
+    // before dispatching). Pre-fix evaluateCondition used a try_lock on
+    // log_mutex_ and silently returned false on contention, dropping
+    // chained-rule evaluations under load.
+    bool evaluateCondition(const RuleCondition& cond, const RawEvent& event,
+                           const std::vector<RuleTriggerLog>& trigger_log_snapshot);
+    bool evaluateConditions(const std::vector<RuleCondition>& conds, RuleLogic logic, const RawEvent& event,
+                            const std::vector<RuleTriggerLog>& trigger_log_snapshot);
     void executeActions(const CompositeRule& rule, const RawEvent& event);
     
     // Anti-noise checks

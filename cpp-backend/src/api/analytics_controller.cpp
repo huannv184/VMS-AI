@@ -24,9 +24,14 @@ void AnalyticsController::registerRoutes(vms::server::VmsApp& app) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
         
-        // Auth check (Enterprise)
+        // Auth + RBAC. Pre-fix the route only checked authentication, so a
+        // user whose ANALYTICS_READ permission had been revoked (viewer
+        // demoted, role disabled) still received traffic summaries. Matches
+        // the requirePermission shape already used at line 107 for the
+        // sibling PPE compliance endpoint and across counter/attendance.
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
 
         try {
             vms::database::TrafficRepository repo;
@@ -55,6 +60,7 @@ void AnalyticsController::registerRoutes(vms::server::VmsApp& app) {
         
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (!ctx.user.has_value()) return ApiUtils::createErrorResponse("Unauthorized", 401, origin);
+        if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
 
         try {
             vms::database::TrafficRepository repo;

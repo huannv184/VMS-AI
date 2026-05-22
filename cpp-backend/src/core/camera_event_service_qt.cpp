@@ -219,18 +219,39 @@ bool CameraEventService::sendPTZCommand(const std::string& cam_id, const std::st
 }
 
 void CameraEventService::workerLoop(std::shared_ptr<EventSession> session) {
+    // Exponential reconnect backoff. Pre-fix every reconnect path slept a
+    // flat 5-10s, so a misconfigured camera (wrong password, blocked port,
+    // wrong brand) spun 720 attempts/hour at the device — operators
+    // reported "VMS DoS'ing my NVR". Sequence escalates on each consecutive
+    // failure and resets the moment we receive a real event (proves the
+    // brand path actually worked at least once this cycle).
+    //
+    // Schedule: 5s, 10s, 30s, 60s, 300s (capped). Counter local to the
+    // worker — survives across iterations within this session, no need to
+    // expose on the session shape.
+    constexpr int kBackoffSchedule[] = {5, 10, 30, 60, 300};
+    constexpr int kBackoffCount = static_cast<int>(sizeof(kBackoffSchedule) / sizeof(kBackoffSchedule[0]));
+    int consecutive_failures = 0;
+    auto sleepBackoff = [&]() {
+        const int idx = std::min(consecutive_failures, kBackoffCount - 1);
+        const int secs = kBackoffSchedule[idx];
+        std::this_thread::sleep_for(std::chrono::seconds(secs));
+    };
+
     while (!session->stop_flag) {
         CameraDiscovery::DiscoveryConfig cfg = getCameraConfig(session->cam_id);
         if (cfg.host.empty()) {
             session->state = static_cast<int>(SubscriptionState::Failed);
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            ++consecutive_failures;
+            sleepBackoff();
             continue;
         }
 
         auto core = brands::CoreFactory::getCore(cfg.brand);
         if (!core) {
             session->state = static_cast<int>(SubscriptionState::Failed);
-            std::this_thread::sleep_for(std::chrono::seconds(10));
+            ++consecutive_failures;
+            sleepBackoff();
             continue;
         }
 
@@ -241,6 +262,12 @@ void CameraEventService::workerLoop(std::shared_ptr<EventSession> session) {
         }
         session->last_attempt_at = (long long)std::time(nullptr);
         session->state = static_cast<int>(SubscriptionState::Active);
+
+        // Snapshot event counter before pullEvents so we can tell whether
+        // the cycle actually produced events (counted as success → reset
+        // backoff) vs. pullEvents returned without any (counted as failure
+        // → escalate).
+        const uint64_t events_before = session->total_events.load(std::memory_order_relaxed);
 
         LOG_INFO("CameraEventService polling events for {} (brand={})",
                  session->cam_id, session->brand);
@@ -370,11 +397,19 @@ void CameraEventService::workerLoop(std::shared_ptr<EventSession> session) {
 
         // pullEvents returned. If the caller didn't stop us, the brand stub
         // exited (ONVIF subscription expired, Hanwha poll hit an error,
-        // Dahua disconnect, etc.). Mark Failed and reconnect after 5s.
+        // Dahua disconnect, etc.). Sleep with exponential backoff before
+        // reconnect — reset to 0 only if at least one event flowed this
+        // cycle (proves credentials + network + parse are all working).
         if (!session->stop_flag) {
             session->state = static_cast<int>(SubscriptionState::Failed);
             session->reconnect_count.fetch_add(1, std::memory_order_relaxed);
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            const uint64_t events_after = session->total_events.load(std::memory_order_relaxed);
+            if (events_after > events_before) {
+                consecutive_failures = 0;
+            } else {
+                ++consecutive_failures;
+            }
+            sleepBackoff();
         }
     }
     session->state = static_cast<int>(SubscriptionState::Stopped);

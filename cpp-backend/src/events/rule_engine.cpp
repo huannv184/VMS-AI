@@ -359,14 +359,30 @@ bool RuleEngine::evaluateEvent(const RawEvent& event) {
     std::vector<PendingAction> pending_actions;
     std::vector<RuleFiredCallback> local_callbacks;
     
+    // BUG-3 followup (2026-05-22): snapshot trigger_log_ once at top of
+    // evaluation so RULE_TRIGGERED conditions read from this local copy
+    // without acquiring log_mutex_ during evaluateCondition. Pre-fix used
+    // try_lock and silently dropped RULE_TRIGGERED checks on contention
+    // (chained-rule cascade evaluation lost under load). Brief copy here
+    // is bounded by trigger_log_.size() ≤ 10000 (FIFO cap) and runs
+    // outside any other mutex, so contention window is small. The
+    // snapshot is slightly stale (won't see firings recorded in this
+    // very evaluation), which is acceptable — chained rules already
+    // operate on prior firings by definition.
+    std::vector<RuleTriggerLog> trigger_log_snapshot;
+    {
+        std::lock_guard<std::mutex> llock(log_mutex_);
+        trigger_log_snapshot = trigger_log_;
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         total_evaluated_++;
         local_callbacks = callbacks_;
-        
+
         for (auto& rule : rules_) {
             if (!rule.enabled) continue;
-            
+
             // Check camera scope
             if (!rule.camera_ids.empty()) {
                 if (std::find(rule.camera_ids.begin(), rule.camera_ids.end(),
@@ -374,9 +390,9 @@ bool RuleEngine::evaluateEvent(const RawEvent& event) {
                     continue;
                 }
             }
-            
+
             // Evaluate conditions
-            if (!evaluateConditions(rule.conditions, rule.logic, event)) {
+            if (!evaluateConditions(rule.conditions, rule.logic, event, trigger_log_snapshot)) {
                 continue;
             }
             
@@ -458,25 +474,27 @@ bool RuleEngine::evaluateEvent(const RawEvent& event) {
 // CONDITION EVALUATION
 // ============================================================================
 
-bool RuleEngine::evaluateConditions(const std::vector<RuleCondition>& conds, 
-                                     RuleLogic logic, const RawEvent& event) {
+bool RuleEngine::evaluateConditions(const std::vector<RuleCondition>& conds,
+                                     RuleLogic logic, const RawEvent& event,
+                                     const std::vector<RuleTriggerLog>& trigger_log_snapshot) {
     if (conds.empty()) return true;
-    
+
     if (logic == RuleLogic::AND) {
         for (auto& c : conds) {
-            if (!evaluateCondition(c, event)) return false;
+            if (!evaluateCondition(c, event, trigger_log_snapshot)) return false;
         }
         return true;
     } else {
         // OR
         for (auto& c : conds) {
-            if (evaluateCondition(c, event)) return true;
+            if (evaluateCondition(c, event, trigger_log_snapshot)) return true;
         }
         return false;
     }
 }
 
-bool RuleEngine::evaluateCondition(const RuleCondition& cond, const RawEvent& event) {
+bool RuleEngine::evaluateCondition(const RuleCondition& cond, const RawEvent& event,
+                                   const std::vector<RuleTriggerLog>& trigger_log_snapshot) {
     switch (cond.type) {
         case ConditionType::OBJECT:
             return cond.object_class.empty() || event.object_class == cond.object_class;
@@ -537,21 +555,13 @@ bool RuleEngine::evaluateCondition(const RuleCondition& cond, const RawEvent& ev
         case ConditionType::RULE_TRIGGERED: {
             if (cond.referenced_rule_id < 0) return true;
 
-            // BUG-3 FIX: Không lock log_mutex_ ở đây vì evaluateEvent() đang giữ mutex_
-            // → lock ordering không nhất quán → deadlock tiềm ẩn.
-            // Giải pháp: snapshot trigger_log ra local trước khi evaluate conditions.
-            // Caller (evaluateEvent) phải truyền snapshot log_snapshot thay vì dùng
-            // log_mutex_ trực tiếp. Workaround hiện tại: dùng try_lock để tránh block.
-            std::unique_lock<std::mutex> llock(log_mutex_, std::try_to_lock);
-            if (!llock.owns_lock()) {
-                // Không thể lock log_mutex_ ngay — bỏ qua RULE_TRIGGERED check lần này
-                // thay vì deadlock
-                return false;
-            }
+            // BUG-3 followup (2026-05-22): read from the snapshot
+            // evaluateEvent already collected under log_mutex_. No
+            // lock acquired here → no deadlock risk and no
+            // try_lock-induced silent drops of chained-rule
+            // evaluations under contention.
             auto now = std::chrono::system_clock::now();
-
-            // Look back in trigger log for the referenced rule
-            for (auto it = trigger_log_.rbegin(); it != trigger_log_.rend(); ++it) {
+            for (auto it = trigger_log_snapshot.rbegin(); it != trigger_log_snapshot.rend(); ++it) {
                 if (it->rule_id == cond.referenced_rule_id) {
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         now - it->triggered_at).count();
