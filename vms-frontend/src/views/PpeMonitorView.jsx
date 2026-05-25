@@ -8,11 +8,18 @@ const normalizeTimestamp = (value) => (value > 9999999999 ? value : value * 1000
 
 const PpeMonitorView = () => {
   const counts = useVmsStore((state) => state.counts);
+  // Cameras for per-camera compliance display — needed to map the
+  // /ppe_compliance.per_camera camera_id keys back to operator-readable names.
+  const cameras = useVmsStore((state) => state.cameras);
   const [selectedViolation, setSelectedViolation] = useState(null);
   const [violations, setViolations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [actionMsg, setActionMsg] = useState(null);
   const [compliance, setCompliance] = useState(null); // {compliant_ticks, violating_ticks, compliance_rate} | null
+  // Per-camera breakdown from /ppe_compliance.per_camera — was discarded
+  // pre-2026-05-25 (FE only kept .global), but backend has been returning
+  // per-camera detail since PR-2. Object keyed by camera_id string.
+  const [perCameraCompliance, setPerCameraCompliance] = useState({});
   // PR-2: backend readiness probe — null until first reply. Initial render
   // shows "Đang tải trạng thái..." instead of the old static "AI Active" lie.
   const [ppeStatus, setPpeStatus] = useState(null);
@@ -50,6 +57,10 @@ const PpeMonitorView = () => {
       const res = await apiClient.getPpeCompliance(60);
       if (res?.success && res?.data?.global) {
         setCompliance(res.data.global);
+        // per_camera is a {"<camera_id>": { compliant_ticks, violating_ticks,
+        // compliance_rate, samples }} object. Default to {} when the field
+        // is absent (e.g. zero cameras ticked yet).
+        setPerCameraCompliance(res.data.per_camera || {});
       }
     } catch (err) {
       console.error('PpeMonitorView: compliance fetch error', err);
@@ -286,6 +297,110 @@ const PpeMonitorView = () => {
               </div>
             </div>
           </div>
+        </div>
+
+        {/* Per-camera compliance breakdown — surfaces /ppe_compliance.per_camera
+            data that was previously fetched but discarded. Operator can spot a
+            single camera dragging the global average down without having to
+            mentally aggregate the violation list. Ordered by lowest rate
+            first so problem cameras float to the top. */}
+        <div className="analytics-card span3 glass" style={{ marginTop: 10 }}>
+          <div className="analytics-card-title">
+            Tuân thủ theo camera (60 phút qua)
+          </div>
+          {(() => {
+            // Snapshot + sort: lowest compliance first (= worst). Rows with
+            // 0 samples drop to the bottom because rate defaults to 1.0
+            // ("no data observed" is not the same as "100% compliant" — we
+            // separate visually via the sample count column).
+            const rows = Object.entries(perCameraCompliance)
+              .map(([camIdStr, data]) => {
+                const camId = parseInt(camIdStr, 10);
+                const cam = cameras.find((c) => c.id === camId);
+                const samples = Number(data?.samples || 0);
+                const rate = Number(data?.compliance_rate || 0);
+                return {
+                  camId,
+                  camName: cam?.name || `CAM-${camId}`,
+                  samples,
+                  compliantTicks: Number(data?.compliant_ticks || 0),
+                  violatingTicks: Number(data?.violating_ticks || 0),
+                  rate,
+                };
+              })
+              .sort((a, b) => {
+                // 0-sample rows last; otherwise lowest rate first.
+                if (a.samples === 0 && b.samples > 0) return 1;
+                if (a.samples > 0 && b.samples === 0) return -1;
+                return a.rate - b.rate;
+              });
+
+            if (rows.length === 0) {
+              return (
+                <div style={{ padding: 20, textAlign: 'center', color: 'var(--text-dim)' }}>
+                  Chưa có camera nào tick PPE trong 60 phút qua. Khi ai_worker bắt đầu sinh
+                  ppe_summary, từng camera sẽ xuất hiện ở đây với tỷ lệ tuân thủ riêng.
+                </div>
+              );
+            }
+            return (
+              <table className="lpr-table">
+                <thead>
+                  <tr>
+                    <th>Camera</th>
+                    <th>Tỷ lệ tuân thủ</th>
+                    <th>Quan sát</th>
+                    <th>Vi phạm</th>
+                    <th>Bar</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => {
+                    const ratePct = (r.rate * 100).toFixed(1);
+                    // Color thresholds match the "ngưỡng tuân thủ" intuition
+                    // operators use elsewhere in the dashboard:
+                    //   >= 90% green, >= 70% warn, else danger.
+                    // 0-sample rows render neutral (text-dim) regardless.
+                    let color = 'var(--text-dim)';
+                    if (r.samples > 0) {
+                      if (r.rate >= 0.9) color = 'var(--accent3)';
+                      else if (r.rate >= 0.7) color = 'var(--warn)';
+                      else color = 'var(--danger)';
+                    }
+                    return (
+                      <tr key={r.camId}>
+                        <td style={{ fontWeight: 700 }}>{r.camName}</td>
+                        <td style={{ color }}>
+                          {r.samples > 0 ? `${ratePct}%` : '—'}
+                        </td>
+                        <td>{r.samples.toLocaleString('vi-VN')}</td>
+                        <td style={{ color: r.violatingTicks > 0 ? 'var(--danger)' : 'var(--text-dim)' }}>
+                          {r.violatingTicks.toLocaleString('vi-VN')}
+                        </td>
+                        <td style={{ width: 200 }}>
+                          {r.samples > 0 ? (
+                            <div style={{
+                              background: 'rgba(255,255,255,0.05)',
+                              borderRadius: 3, height: 8, width: '100%', overflow: 'hidden',
+                            }}>
+                              <div style={{
+                                background: color,
+                                height: '100%',
+                                width: `${ratePct}%`,
+                                transition: 'width 300ms ease',
+                              }} />
+                            </div>
+                          ) : (
+                            <span style={{ fontSize: 9, color: 'var(--text-dim)' }}>không có data</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            );
+          })()}
         </div>
 
         {/* Chart */}
