@@ -83,6 +83,28 @@ std::optional<crow::response> requireAttendanceRead(
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+// Generic 500 builder for the catch-all "DB op failed" path. Never echo
+// QSqlError::text() back to the client — it leaks SQL schema / column
+// names (same anti-pattern as the ~108 sites swept in
+// p0_production_pass_2026_05_10). Server-side log keeps the raw text for
+// debugging; client gets a safe message.
+crow::response createAttendanceDbError(const QSqlQuery& query,
+                                       const std::string& origin) {
+    LOG_ERROR("[DB] query failed in attendance_controller: {}",
+              query.lastError().text().toStdString());
+    return ApiUtils::createErrorResponse("Internal database error", 500, origin);
+}
+
+// Sniff for UNIQUE-constraint failure across SQLite + PG drivers so the
+// UI can show a friendly 409 instead of a raw driver string. SQLite emits
+// "UNIQUE constraint failed: …", PG emits "duplicate key value violates
+// unique constraint …".
+bool isUniqueConstraintError(const std::string& message) {
+    return message.find("UNIQUE") != std::string::npos ||
+           message.find("unique") != std::string::npos ||
+           message.find("duplicate key") != std::string::npos;
+}
+
 std::string todayLocalDate() {
     auto t = std::time(nullptr);
     auto tm = *std::localtime(&t);
@@ -756,22 +778,16 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             q.bindValue(5, body.value("active", true) ? 1 : 0);
 
             if (!q.exec()) {
-                const std::string err_msg = q.lastError().text().toStdString();
-                LOG_ERROR("[DB] POST /api/attendance/employees failed: {}", err_msg);
+                const std::string msg = q.lastError().text().toStdString();
                 // person_id and code both carry UNIQUE constraints
                 // (db_manager.cpp:885-886). Map to 409 so the UI can render
                 // a field-level "already exists" error instead of a generic
-                // 500. Sniff matches SQLite "UNIQUE constraint failed" and
-                // Postgres "duplicate key value violates unique constraint".
-                if (err_msg.find("UNIQUE") != std::string::npos ||
-                    err_msg.find("unique") != std::string::npos ||
-                    err_msg.find("duplicate key") != std::string::npos) {
+                // 500. Same pattern as shifts/holidays POST below.
+                if (isUniqueConstraintError(msg)) {
                     return ApiUtils::createErrorResponse(
                         "person_id or code already exists", 409, origin);
                 }
-                // Generic 500 — never echo lastError().text() (leaks SQL
-                // schema / column names; same lesson as p0_production_pass).
-                return ApiUtils::createErrorResponse("Internal database error", 500, origin);
+                return createAttendanceDbError(q, origin);
             }
 
             // Refresh in-memory cache so the next face event resolves the new mapping.
@@ -844,18 +860,14 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             q.bindValue(5, id);
 
             if (!q.exec()) {
-                const std::string err_msg = q.lastError().text().toStdString();
-                LOG_ERROR("[DB] PUT /api/attendance/employees failed: {}", err_msg);
+                const std::string msg = q.lastError().text().toStdString();
                 // Only `code` is editable here; person_id is anchored to the
-                // face DB pairing and not in the SET clause. Mirrors the
-                // POST handler. Same UNIQUE sniff for SQLite + Postgres.
-                if (err_msg.find("UNIQUE") != std::string::npos ||
-                    err_msg.find("unique") != std::string::npos ||
-                    err_msg.find("duplicate key") != std::string::npos) {
+                // face DB pairing and not in the SET clause. Mirrors POST.
+                if (isUniqueConstraintError(msg)) {
                     return ApiUtils::createErrorResponse(
                         "code already exists", 409, origin);
                 }
-                return ApiUtils::createErrorResponse("Internal database error", 500, origin);
+                return createAttendanceDbError(q, origin);
             }
             vms::core::AttendanceTracker::getInstance().reloadEmployees();
             return ApiUtils::createResponse({{"updated", true}, {"id", id}}, 200, origin);
