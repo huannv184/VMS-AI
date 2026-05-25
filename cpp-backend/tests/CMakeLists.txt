@@ -156,6 +156,28 @@ target_link_libraries(test_ppe_integration PRIVATE
     nlohmann_json::nlohmann_json)
 add_test(NAME PpeIntegrationTests COMMAND test_ppe_integration)
 
+# ── attendance integration tests (PR-7C — DB-backed, exercises full
+# AttendanceTracker → BulkWriter → attendance_events write path against
+# real SQLite, then validates the /health 24h-scan SUM(CASE WHEN) read
+# query). Closes the trilogy (counter/PPE/attendance) of synthetic
+# integration tests per the readiness verification roadmap.
+add_executable(test_attendance_integration
+    integration/test_attendance_integration.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/attendance_tracker.cpp
+    ${CMAKE_SOURCE_DIR}/src/database/db_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/config.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/logger.cpp)
+target_include_directories(test_attendance_integration PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(test_attendance_integration PRIVATE
+    GTest::gtest GTest::gtest_main
+    Qt6::Core Qt6::Sql
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
+    yaml-cpp::yaml-cpp)
+add_test(NAME AttendanceIntegrationTests COMMAND test_attendance_integration)
+
 # ── frame bus tests (Phase A refactor) ────────────────────────────────────────
 # Links the REAL FrameBus implementation (not an inline reproduction) to catch
 # regressions in subscribe/publish/unsubscribe semantics, the zero-copy raw_frame
@@ -234,6 +256,7 @@ if(WIN32)
         AttendanceHealthTests
         CounterIntegrationTests
         PpeIntegrationTests
+        AttendanceIntegrationTests
         FrameBusTests
         JwtPurposeTests
         HttpStartupFailFastTests
