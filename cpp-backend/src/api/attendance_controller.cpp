@@ -756,7 +756,22 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             q.bindValue(5, body.value("active", true) ? 1 : 0);
 
             if (!q.exec()) {
-                return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                const std::string err_msg = q.lastError().text().toStdString();
+                LOG_ERROR("[DB] POST /api/attendance/employees failed: {}", err_msg);
+                // person_id and code both carry UNIQUE constraints
+                // (db_manager.cpp:885-886). Map to 409 so the UI can render
+                // a field-level "already exists" error instead of a generic
+                // 500. Sniff matches SQLite "UNIQUE constraint failed" and
+                // Postgres "duplicate key value violates unique constraint".
+                if (err_msg.find("UNIQUE") != std::string::npos ||
+                    err_msg.find("unique") != std::string::npos ||
+                    err_msg.find("duplicate key") != std::string::npos) {
+                    return ApiUtils::createErrorResponse(
+                        "person_id or code already exists", 409, origin);
+                }
+                // Generic 500 — never echo lastError().text() (leaks SQL
+                // schema / column names; same lesson as p0_production_pass).
+                return ApiUtils::createErrorResponse("Internal database error", 500, origin);
             }
 
             // Refresh in-memory cache so the next face event resolves the new mapping.
@@ -829,7 +844,18 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             q.bindValue(5, id);
 
             if (!q.exec()) {
-                return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                const std::string err_msg = q.lastError().text().toStdString();
+                LOG_ERROR("[DB] PUT /api/attendance/employees failed: {}", err_msg);
+                // Only `code` is editable here; person_id is anchored to the
+                // face DB pairing and not in the SET clause. Mirrors the
+                // POST handler. Same UNIQUE sniff for SQLite + Postgres.
+                if (err_msg.find("UNIQUE") != std::string::npos ||
+                    err_msg.find("unique") != std::string::npos ||
+                    err_msg.find("duplicate key") != std::string::npos) {
+                    return ApiUtils::createErrorResponse(
+                        "code already exists", 409, origin);
+                }
+                return ApiUtils::createErrorResponse("Internal database error", 500, origin);
             }
             vms::core::AttendanceTracker::getInstance().reloadEmployees();
             return ApiUtils::createResponse({{"updated", true}, {"id", id}}, 200, origin);
