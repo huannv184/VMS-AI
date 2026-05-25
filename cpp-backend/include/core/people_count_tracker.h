@@ -79,6 +79,12 @@ public:
     // For tests / debugging.
     std::size_t lineCount(int camera_id);
 
+    // Total cached enabled-or-disabled line count across all cameras.
+    // Used by GET /api/counter/status so operators can confirm the
+    // tracker actually loaded counting_lines (vs DB never returned rows).
+    std::size_t totalLineCount();
+    bool        cacheLoaded() const { return loaded_.load(std::memory_order_acquire); }
+
 private:
     PeopleCountTracker();
     ~PeopleCountTracker() = default;

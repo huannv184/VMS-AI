@@ -1,12 +1,8 @@
 import { API_BASE_URL } from '../utils/runtimeUrls';
 
 const BASE_URL = API_BASE_URL;
-// Auth model: Bearer token.
-// Token is stored in memory (_inMemoryToken) for the current session and mirrored
-// to localStorage for survival across page reloads and WebSocket ticket requests.
-// Backend also sets an HttpOnly cookie on login as a defence-in-depth measure,
-// but all API requests use the Authorization: Bearer header as the primary auth path.
-const TOKEN_KEY = 'vms_token';
+// Auth state lives in memory for the current tab. We keep only a lightweight
+// "logged in" flag in localStorage; the backend session cookie remains HttpOnly.
 const AUTH_CHANGE_EVENT = 'vms_auth_changed';
 
 let isLoggingOut = false;
@@ -36,9 +32,7 @@ const setToken = (token, localStorageOnly = false) => {
   }
 
   if (token) {
-    // SECURITY FIX: Never store JWT in localStorage to prevent session theft via XSS.
-    // The backend provides an HttpOnly cookie for all API requests.
-    // We only store a flag to let the UI know we are 'logged in'.
+    // Never persist the bearer token; only persist a UI auth flag.
     localStorage.setItem('vms_auth_status', 'true');
   } else {
     if (!localStorageOnly) {
@@ -174,9 +168,6 @@ const apiClient = {
   buildQuery,
 
   request: async (endpoint, options = {}, responseType = 'json') => {
-    // SECURITY: We prefer cookies (HttpOnly) for security against XSS.
-    // The browser automatically attaches the 'vms_session' cookie.
-    // We only attach Authorization header if a token is in memory (e.g., just after login).
     const token = _inMemoryToken;
     const url = `${BASE_URL}${endpoint}`;
     const headers = toHeadersObject(options.headers);
@@ -193,7 +184,7 @@ const apiClient = {
     const requestOptions = {
       ...options,
       headers,
-      // H5: include HttpOnly cookie on every request (same-origin + CORS with credentials)
+      // Always send the session cookie; some flows also attach an in-memory bearer token.
       credentials: 'include',
     };
 
@@ -523,6 +514,19 @@ const apiClient = {
     { method: 'DELETE' }),
   reloadCountingLines: () => apiClient.request('/api/counter/lines/reload',
     { method: 'POST' }),
+
+  // ── Counter analytics (reads counter_buckets_1m, written by the live AI
+  //    pipeline via CounterBucketAggregator). Replaces the legacy
+  //    getTrafficSummary/getTrafficHistory calls that pointed at the
+  //    orthogonal `traffic_counts` table — those queries returned 0 for
+  //    line-crossing pipelines because the data was being written to a
+  //    different table than CounterView was reading. ────────────────────
+  // params: { from, to } unix epoch seconds (optional; defaults to today).
+  getCounterSummary: (cameraId, params = {}) => apiClient.request(
+    `/api/counter/summary${buildQuery({ camera_id: cameraId, ...params })}`),
+  getCounterHistory: (cameraId, params = {}) => apiClient.request(
+    `/api/counter/history${buildQuery({ camera_id: cameraId, ...params })}`),
+  getCounterStatus: () => apiClient.request('/api/counter/status'),
 
   getDevices: () => apiClient.request('/api/devices'),
   getDevice: (id) => apiClient.request(`/api/devices/${id}`),

@@ -53,6 +53,9 @@ public:
     std::uint64_t totalSweeps() const   { return sweeps_.load(std::memory_order_relaxed); }
     std::uint64_t totalUpserted() const { return upserted_.load(std::memory_order_relaxed); }
     std::uint64_t lastSweepMs() const   { return last_sweep_ms_.load(std::memory_order_relaxed); }
+    bool          running() const       { return started_.load(std::memory_order_acquire); }
+    int           intervalSeconds() const { return interval_seconds_; }
+    int           lookbackMinutes() const { return lookback_minutes_; }
 
     // Force an immediate sweep — for tests and the ops escape hatch.
     // Safe to call from any thread; runs synchronously on the caller.

@@ -84,6 +84,16 @@ target_link_libraries(test_counter_bucket PRIVATE
     nlohmann_json::nlohmann_json)
 add_test(NAME CounterBucketTests COMMAND test_counter_bucket)
 
+# ── counter summary/history tests ─────────────────────────────────────────────
+# Inline reproduction of the bucket → summary/history aggregation inside
+# the GET /api/counter/summary and GET /api/counter/history handlers in
+# src/api/counter_controller.cpp. Guards the data contract CounterView
+# depends on after the swap away from /api/analytics/traffic.
+add_executable(test_counter_summary test_counter_summary.cpp)
+target_include_directories(test_counter_summary PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_counter_summary PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME CounterSummaryTests COMMAND test_counter_summary)
+
 # ── frame bus tests (Phase A refactor) ────────────────────────────────────────
 # Links the REAL FrameBus implementation (not an inline reproduction) to catch
 # regressions in subscribe/publish/unsubscribe semantics, the zero-copy raw_frame
@@ -142,6 +152,7 @@ if(WIN32)
         AttendanceShiftTests
         LineCrossingTests
         CounterBucketTests
+        CounterSummaryTests
         FrameBusTests
         JwtPurposeTests
         HttpStartupFailFastTests

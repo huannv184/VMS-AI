@@ -18,6 +18,12 @@ const CounterView = () => {
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [heatmapData, setHeatmapData] = useState([]);
   const [exporting, setExporting] = useState(false);
+  // Backend pipeline health (CounterBucketAggregator + PeopleCountTracker).
+  // Polled separately from fetchData so the badge updates even when the
+  // operator hasn't hit "Làm mới". Null until the first reply lands —
+  // initial render shows a neutral state instead of falsely claiming
+  // "active" (operator-visible BUG-FE-COUNTER-STATIC-BADGE-01 class issue).
+  const [counterStatus, setCounterStatus] = useState(null);
 
   // Counting lines management
   const [lines, setLines]               = useState([]);
@@ -32,13 +38,18 @@ const CounterView = () => {
     setLoading(true);
     try {
       if (cameras.length > 0) {
-        const summaries = await Promise.all(cameras.map((cam) => apiClient.getTrafficSummary(cam.id)));
+        // PR-1 (2026-05-24): switched from getTrafficSummary/History (which
+        // queried `traffic_counts`, a vehicle/ANPR-only table) to the new
+        // /api/counter/* endpoints that read counter_buckets_1m. The
+        // aggregator writes that table from LINE_CROSSING_* events, so this
+        // is the data source the live AI pipeline actually populates.
+        const summaries = await Promise.all(cameras.map((cam) => apiClient.getCounterSummary(cam.id)));
         const validSummaries = summaries.filter((s) => s.success).map((s) => s.data);
         setTrafficSummaries(validSummaries);
 
-        const history = await apiClient.getTrafficHistory(cameras[0].id);
+        const history = await apiClient.getCounterHistory(cameras[0].id);
         if (history.success) {
-          setTrafficHistory(history.data?.history || history.data?.points || []);
+          setTrafficHistory(history.data?.points || []);
         }
       }
 
@@ -79,6 +90,26 @@ const CounterView = () => {
   }, []);
 
   useEffect(() => { refreshLines(); }, [refreshLines]);
+
+  // Poll backend pipeline health on mount + every 15s. 15s is intentionally
+  // shorter than the aggregator's default 60s sweep interval so a "stopped"
+  // state surfaces fast without spamming the API. The endpoint itself is
+  // cheap (atomic loads + shared_lock).
+  useEffect(() => {
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const res = await apiClient.getCounterStatus();
+        if (!cancelled && res.success) setCounterStatus(res.data || null);
+      } catch (err) {
+        // Network blip — leave the prior state so the badge doesn't flicker.
+        console.warn('[CounterView] status poll failed', err);
+      }
+    };
+    pull();
+    const id = setInterval(pull, 15000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   const handleDeleteLine = async (id) => {
     if (!window.confirm('Xóa vạch đếm này? Không thể hoàn tác.')) return;
@@ -204,10 +235,40 @@ const CounterView = () => {
               <Download size={12} style={{ marginRight: 6 }} /> 
               {exporting ? 'ĐANG TẢI...' : 'XUẤT BÁO CÁO (CSV)'}
             </button>
-            <div className="ai-badge">
-              <div className="ai-dot-spin"></div>
-              Multi-Object Tracker Active
-            </div>
+            {(() => {
+              // Reflect real backend state instead of a static "Active" badge.
+              // States:
+              //   loading   — first reply hasn't landed yet
+              //   ok        — aggregator running AND at least one line loaded
+              //   no-lines  — running but no counting_lines configured anywhere
+              //   stopped   — aggregator not running (backend down or crashed)
+              const agg = counterStatus?.aggregator;
+              const trk = counterStatus?.tracker;
+              let label = 'Đang tải trạng thái...';
+              let color = 'var(--text-dim)';
+              let title = '';
+              if (counterStatus) {
+                if (!agg?.running) {
+                  label = 'Aggregator dừng';
+                  color = 'var(--danger)';
+                  title = 'CounterBucketAggregator chưa start — dashboard sẽ trống.';
+                } else if ((trk?.total_lines || 0) === 0) {
+                  label = 'Chưa cấu hình vạch đếm';
+                  color = 'var(--warn)';
+                  title = 'Aggregator đang chạy nhưng counting_lines rỗng.';
+                } else {
+                  label = `Aggregator hoạt động · ${trk.total_lines} vạch`;
+                  color = 'var(--accent3)';
+                  title = `Sweeps: ${agg.total_sweeps} · Upserts: ${agg.total_upserted} · Last sweep: ${agg.last_sweep_ms} ms`;
+                }
+              }
+              return (
+                <div className="ai-badge" title={title} style={{ color }}>
+                  <div className="ai-dot-spin" style={{ background: color }}></div>
+                  {label}
+                </div>
+              );
+            })()}
           </div>
         </div>
 
@@ -258,7 +319,7 @@ const CounterView = () => {
                       <td style={{ color: 'var(--accent)' }}>{s.total_today || 0}</td>
                       <td style={{ color: 'var(--accent3)' }}>{s.total_in || 0}</td>
                       <td style={{ color: 'var(--danger)' }}>{s.total_out || 0}</td>
-                      <td>{s.peak_hour || '-'}h ({s.peak_count || 0})</td>
+                      <td>{(typeof s.peak_hour === 'number' && s.peak_hour >= 0) ? `${s.peak_hour}h` : '-'} ({s.peak_count || 0})</td>
                       <td style={{ textAlign: 'center' }}>
                          <button 
                            className="config-btn" 

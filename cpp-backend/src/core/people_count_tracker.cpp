@@ -245,4 +245,11 @@ std::size_t PeopleCountTracker::lineCount(int camera_id) {
     return it == by_camera_.end() ? 0 : it->second.size();
 }
 
+std::size_t PeopleCountTracker::totalLineCount() {
+    std::shared_lock<std::shared_mutex> rd(cache_mu_);
+    std::size_t n = 0;
+    for (const auto& [cam, lines] : by_camera_) n += lines.size();
+    return n;
+}
+
 } // namespace vms::core
