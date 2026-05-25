@@ -219,18 +219,35 @@ void PpeComplianceAggregator::recordTick(int camera_id,
     const int64_t minute = ts_ms / 60000;
     const size_t idx = static_cast<size_t>(((minute % kSlotCount) + kSlotCount) % kSlotCount);
 
-    std::lock_guard<std::mutex> lk(mtx_);
-    auto& ring = rings_[camera_id];
-    auto& slot = ring[idx];
-    if (slot.epoch_minute != minute) {
-        // Slot is stale (60 minutes have wrapped past it OR first write).
-        // Reset the bucket before accumulating into the new minute.
-        slot.epoch_minute    = minute;
-        slot.compliant_ticks = 0;
-        slot.violating_ticks = 0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto& ring = rings_[camera_id];
+        auto& slot = ring[idx];
+        if (slot.epoch_minute != minute) {
+            // Slot is stale (60 minutes have wrapped past it OR first write).
+            // Reset the bucket before accumulating into the new minute.
+            slot.epoch_minute    = minute;
+            slot.compliant_ticks = 0;
+            slot.violating_ticks = 0;
+        }
+        if (compliant_count > 0) slot.compliant_ticks += static_cast<uint64_t>(compliant_count);
+        if (violating_count > 0) slot.violating_ticks += static_cast<uint64_t>(violating_count);
     }
-    if (compliant_count > 0) slot.compliant_ticks += static_cast<uint64_t>(compliant_count);
-    if (violating_count > 0) slot.violating_ticks += static_cast<uint64_t>(violating_count);
+
+    // 2026-05-25 PR-2: readiness signals updated after the slot write so a
+    // reader that sees a non-zero last_tick_ms_ is guaranteed to find the
+    // corresponding tick in the ring on a subsequent snapshot() — relaxed
+    // ordering is fine because /status doesn't pair these atomics with
+    // ring-state assertions, it just reports the wall-clock recency.
+    last_tick_ms_.store(ts_ms, std::memory_order_relaxed);
+    if (violating_count > 0) {
+        last_violation_ms_.store(ts_ms, std::memory_order_relaxed);
+    }
+}
+
+std::size_t PpeComplianceAggregator::cameraCount() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return rings_.size();
 }
 
 nlohmann::json PpeComplianceAggregator::snapshot(int window_minutes) const {

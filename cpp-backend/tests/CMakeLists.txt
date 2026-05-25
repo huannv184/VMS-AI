@@ -94,6 +94,16 @@ target_include_directories(test_counter_summary PRIVATE ${CMAKE_SOURCE_DIR}/incl
 target_link_libraries(test_counter_summary PRIVATE GTest::gtest GTest::gtest_main)
 add_test(NAME CounterSummaryTests COMMAND test_counter_summary)
 
+# ── PPE status / readiness tests ──────────────────────────────────────────────
+# Inline reproduction of the health-classification matrix in the
+# GET /api/analytics/ppe/status handler (analytics_controller.cpp) plus
+# the PpeComplianceAggregator atomic-bump semantics for last_tick_ms /
+# last_violation_ms. Update test_ppe_status.cpp whenever either changes.
+add_executable(test_ppe_status test_ppe_status.cpp)
+target_include_directories(test_ppe_status PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_ppe_status PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME PpeStatusTests COMMAND test_ppe_status)
+
 # ── frame bus tests (Phase A refactor) ────────────────────────────────────────
 # Links the REAL FrameBus implementation (not an inline reproduction) to catch
 # regressions in subscribe/publish/unsubscribe semantics, the zero-copy raw_frame
@@ -153,6 +163,7 @@ if(WIN32)
         LineCrossingTests
         CounterBucketTests
         CounterSummaryTests
+        PpeStatusTests
         FrameBusTests
         JwtPurposeTests
         HttpStartupFailFastTests

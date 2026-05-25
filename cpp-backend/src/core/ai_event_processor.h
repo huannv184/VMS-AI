@@ -45,6 +45,17 @@ public:
     //     per_camera:{ "<id>": { compliant_ticks, violating_ticks, compliance_rate, samples }, ... } }
     nlohmann::json snapshot(int window_minutes) const;
 
+    // 2026-05-25 PR-2 readiness probes. Atomic loads — safe to call from
+    // HTTP handlers without contending with recordTick on the data path.
+    // last_tick_ms() = 0 means the aggregator has NEVER recorded a tick
+    // since process start (vs "ticked an hour ago, ring slot has wrapped").
+    int64_t lastTickMs()      const { return last_tick_ms_.load(std::memory_order_relaxed); }
+    int64_t lastViolationMs() const { return last_violation_ms_.load(std::memory_order_relaxed); }
+
+    // Number of cameras that have ticked at least once since process
+    // start. Briefly takes the mutex; cheap at /status poll rates.
+    std::size_t cameraCount() const;
+
 private:
     PpeComplianceAggregator() = default;
     struct MinuteSlot {
@@ -56,6 +67,14 @@ private:
     using CameraRing = std::array<MinuteSlot, kSlotCount>;
     std::unordered_map<int, CameraRing> rings_;
     mutable std::mutex mtx_;
+
+    // 2026-05-25 PR-2: behavioral readiness signals. Atomic so /status
+    // can read them without acquiring mtx_ (which the data path holds
+    // on every PPE-bearing frame). last_violation_ms_ stays at the value
+    // of the most recent recordTick where violating_count > 0; it never
+    // decreases — operator UI shows "X seconds since last violation".
+    std::atomic<int64_t> last_tick_ms_{0};
+    std::atomic<int64_t> last_violation_ms_{0};
 };
 
 class AiEventProcessor {

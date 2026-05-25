@@ -452,6 +452,12 @@ const apiClient = {
   exportAnalyticsCsv: (params = {}) => apiClient.download(`/api/analytics/export${buildQuery(params)}`),
   getPpeCompliance: (windowMinutes = 60) =>
     apiClient.request(`/api/analytics/ppe_compliance${buildQuery({ window_minutes: windowMinutes })}`),
+  // PR-2 (2026-05-25): readiness probe — combines per-camera ai_config probe,
+  // env force-flags, and aggregator runtime (last_tick_ms / last_violation_ms /
+  // active_cameras). PpeMonitorView uses this instead of the static
+  // "YOLOv11 PPE Active" badge that always claimed active.
+  // Health enum: ok | stale | inactive | no_cameras.
+  getPpeStatus: () => apiClient.request('/api/analytics/ppe/status'),
 
   getSystemStats: () => apiClient.request('/api/system/stats'),
   getHealth: () => apiClient.request('/api/health'),

@@ -13,6 +13,9 @@ const PpeMonitorView = () => {
   const [loading, setLoading] = useState(true);
   const [actionMsg, setActionMsg] = useState(null);
   const [compliance, setCompliance] = useState(null); // {compliant_ticks, violating_ticks, compliance_rate} | null
+  // PR-2: backend readiness probe — null until first reply. Initial render
+  // shows "Đang tải trạng thái..." instead of the old static "AI Active" lie.
+  const [ppeStatus, setPpeStatus] = useState(null);
 
   const fetchPpeEvents = async () => {
     setLoading(true);
@@ -62,6 +65,25 @@ const PpeMonitorView = () => {
     return () => clearInterval(id);
   }, []);
 
+  // Backend readiness probe — short poll so a freshly-started ai_worker
+  // flips the badge to "ok" quickly, and a crash flips to "stale" within
+  // the staleness cutoff. 10s is intentionally well under the 5-min stale
+  // cutoff so operators see degradation before it becomes red.
+  useEffect(() => {
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const res = await apiClient.getPpeStatus();
+        if (!cancelled && res?.success) setPpeStatus(res.data || null);
+      } catch (err) {
+        console.warn('PpeMonitorView: status poll failed', err);
+      }
+    };
+    pull();
+    const id = setInterval(pull, 10000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
   // Aggregate by hour for the bar chart (16 buckets, 7h..22h)
   const hourlyBuckets = (() => {
     const buckets = new Array(16).fill(0);
@@ -105,10 +127,52 @@ const PpeMonitorView = () => {
           <div style={{ fontFamily: 'Rajdhani', fontWeight: 700, fontSize: 18, letterSpacing: 2, textTransform: 'uppercase', color: 'var(--accent)' }}>
             Giám sát Bảo hộ Lao động (PPE)
           </div>
-          <div className="ai-badge">
-            <div className="ai-dot-spin"></div>
-            YOLOv11 PPE Active
-          </div>
+          {(() => {
+            // PR-2: state-driven badge. Closes BUG-FE-PPE-STATIC-BADGE-01
+            // (operator complaint: badge always said "Active" even when
+            // ai_worker had no PPE engine loaded). Mirrors the Counter PR-1
+            // pattern but with PPE-specific health enum from backend.
+            if (!ppeStatus) {
+              return (
+                <div className="ai-badge" style={{ color: 'var(--text-dim)' }}>
+                  <div className="ai-dot-spin" style={{ background: 'var(--text-dim)' }}></div>
+                  Đang tải trạng thái...
+                </div>
+              );
+            }
+            const health = ppeStatus.health;
+            const cfg = ppeStatus.config || {};
+            const rt  = ppeStatus.runtime || {};
+            let label;
+            let color;
+            let title;
+            if (health === 'no_cameras') {
+              label = 'Chưa bật PPE cho camera nào';
+              color = 'var(--text-dim)';
+              title = 'Không có camera nào có ai_config.ppe=true và VMS_AI_ENABLE_PPE chưa được bật.';
+            } else if (health === 'inactive') {
+              label = `Chưa nhận PPE telemetry (${cfg.enabled_count || 0} cam cấu hình)`;
+              color = 'var(--warn)';
+              title = 'Backend chưa nhận tick nào từ ai_worker. Có thể engine load fail — kiểm tra log ai_worker. Backend không phân biệt được "load fail" vs "scene rỗng từ boot".';
+            } else if (health === 'stale') {
+              const sec = rt.seconds_since_last_tick;
+              label = `PPE im lặng ${sec >= 0 ? `${sec}s` : ''}`;
+              color = 'var(--danger)';
+              title = `Tick gần nhất ${sec}s trước, vượt ngưỡng ${rt.stale_after_s}s. ai_worker có thể crash hoặc mọi PPE camera đã offline.`;
+            } else {
+              const ac = rt.active_cameras || 0;
+              label = `PPE hoạt động · ${ac}/${cfg.enabled_count || ac} cam`;
+              color = 'var(--accent3)';
+              const lastViol = rt.seconds_since_last_violation;
+              title = `Tick gần nhất: ${rt.seconds_since_last_tick}s trước. Vi phạm gần nhất: ${lastViol >= 0 ? `${lastViol}s trước` : 'chưa có'}. Cutoff stale: ${rt.stale_after_s}s.`;
+            }
+            return (
+              <div className="ai-badge" title={title} style={{ color }}>
+                <div className="ai-dot-spin" style={{ background: color }}></div>
+                {label}
+              </div>
+            );
+          })()}
         </div>
 
         {/* Stats Row */}
