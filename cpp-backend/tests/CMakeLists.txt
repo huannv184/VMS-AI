@@ -115,6 +115,30 @@ target_include_directories(test_attendance_health PRIVATE ${CMAKE_SOURCE_DIR}/in
 target_link_libraries(test_attendance_health PRIVATE GTest::gtest GTest::gtest_main)
 add_test(NAME AttendanceHealthTests COMMAND test_attendance_health)
 
+# ── counter integration tests (PR-7 pilot — first DB-backed integration) ──────
+# Links REAL DbManager + CounterBucketAggregator + Config + Logger against a
+# per-test temp SQLite file. Verifies the slice the inline test_counter_bucket
+# can't: real-SQLite UPSERT semantics, schema portability between init and
+# aggregator/summary SQL, time-window boundary, idempotency. Bypasses
+# AiEventProcessor handler — handler coverage stays on the hardware runbook
+# (docs/runbooks/counter_e2e_readiness.md) per the 2026-05-25 roadmap.
+add_executable(test_counter_integration
+    integration/test_counter_integration.cpp
+    ${CMAKE_SOURCE_DIR}/src/database/db_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/counter_bucket_aggregator.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/config.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/logger.cpp)
+target_include_directories(test_counter_integration PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(test_counter_integration PRIVATE
+    GTest::gtest GTest::gtest_main
+    Qt6::Core Qt6::Sql
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
+    yaml-cpp::yaml-cpp)
+add_test(NAME CounterIntegrationTests COMMAND test_counter_integration)
+
 # ── frame bus tests (Phase A refactor) ────────────────────────────────────────
 # Links the REAL FrameBus implementation (not an inline reproduction) to catch
 # regressions in subscribe/publish/unsubscribe semantics, the zero-copy raw_frame
@@ -161,11 +185,26 @@ add_test(NAME HttpStartupFailFastTests COMMAND test_http_startup_failfast)
 # vcpkg manifest install dir and are NOT copied next to test exes. Prepend BOTH
 # the main-binary directory AND vcpkg_installed/<triplet>/bin so the loader can
 # find every transitive DLL when ctest launches a test from a non-deploy dir.
+#
+# PR-7 (2026-05-25): added QT_PLUGIN_PATH so DB-backed integration tests can
+# load the QSQLITE driver — without it, QSqlDatabase::open() SEH-crashes
+# during init (no qsqlite.dll on the search path, addDatabase returns an
+# invalid handle, open() deref crashes). The plugin path is the Qt6/plugins
+# root from vcpkg — Qt scans subdirs (sqldrivers/, etc.) automatically.
+#
 # Use \; to escape the CMake list separator inside a string value.
 if(WIN32)
-    set(_VMS_VCPKG_BIN "${CMAKE_SOURCE_DIR}/vcpkg_installed/x64-windows/bin")
+    set(_VMS_VCPKG_BIN     "${CMAKE_SOURCE_DIR}/vcpkg_installed/x64-windows/bin")
+    # Qt plugins must match build config (debug DLLs are 'd'-suffixed and
+    # depend on Qt6Xxxd.dll; mixing release plugins into a debug exe SEH-
+    # crashes inside the driver loader). vcpkg ships separate dirs:
+    #   release → vcpkg_installed/x64-windows/Qt6/plugins
+    #   debug   → vcpkg_installed/x64-windows/debug/Qt6/plugins
+    set(_VMS_QT_PLUGIN_DIR
+        "${CMAKE_SOURCE_DIR}/vcpkg_installed/x64-windows/$<IF:$<CONFIG:Debug>,debug/Qt6/plugins,Qt6/plugins>")
     set(_VMS_TEST_PATH_ENV
-        "PATH=${CMAKE_BINARY_DIR}/$<CONFIG>\;${_VMS_VCPKG_BIN}\;$ENV{PATH}")
+        "PATH=${CMAKE_BINARY_DIR}/$<CONFIG>\;${_VMS_VCPKG_BIN}\;$ENV{PATH}"
+        "QT_PLUGIN_PATH=${_VMS_QT_PLUGIN_DIR}")
     set_tests_properties(
         AuthTests
         DbPortabilityTests
@@ -176,6 +215,7 @@ if(WIN32)
         CounterSummaryTests
         PpeStatusTests
         AttendanceHealthTests
+        CounterIntegrationTests
         FrameBusTests
         JwtPurposeTests
         HttpStartupFailFastTests
