@@ -139,6 +139,23 @@ target_link_libraries(test_counter_integration PRIVATE
     yaml-cpp::yaml-cpp)
 add_test(NAME CounterIntegrationTests COMMAND test_counter_integration)
 
+# ── PPE integration tests (PR-7B — Qt-free, no DB) ────────────────────────────
+# Links the REAL PpeComplianceAggregator after PR-7B's refactor extracted it
+# from ai_event_processor.cpp into its own TU. No Qt / no DbManager / no
+# QCoreApplication needed — the aggregator is pure atomics + std::mutex + a
+# 60-slot ring per camera. Catches reproduction-vs-prod drift that the inline
+# test_ppe_status.cpp would miss when prod code evolves.
+add_executable(test_ppe_integration
+    integration/test_ppe_integration.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/ppe_compliance_aggregator.cpp)
+target_include_directories(test_ppe_integration PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(test_ppe_integration PRIVATE
+    GTest::gtest GTest::gtest_main
+    nlohmann_json::nlohmann_json)
+add_test(NAME PpeIntegrationTests COMMAND test_ppe_integration)
+
 # ── frame bus tests (Phase A refactor) ────────────────────────────────────────
 # Links the REAL FrameBus implementation (not an inline reproduction) to catch
 # regressions in subscribe/publish/unsubscribe semantics, the zero-copy raw_frame
@@ -216,6 +233,7 @@ if(WIN32)
         PpeStatusTests
         AttendanceHealthTests
         CounterIntegrationTests
+        PpeIntegrationTests
         FrameBusTests
         JwtPurposeTests
         HttpStartupFailFastTests
