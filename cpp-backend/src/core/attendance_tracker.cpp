@@ -187,6 +187,11 @@ void AttendanceTracker::onFaceRecognized(int camera_id,
         }
     }
 
+    // PR-5 audit signal — bumped only on accepted (non-deduped) recognitions
+    // so /health "seconds since last event" is a real activity indicator,
+    // not a noise floor.
+    last_event_ts_.store(ts_seconds, std::memory_order_relaxed);
+
     writer_->enqueue(std::move(row));
 }
 
@@ -222,6 +227,10 @@ bool AttendanceTracker::recordManual(int employee_id,
     row.timestamp_s   = ts_seconds;
     row.confidence    = 1.0f;
     row.source_rule   = "manual";
+
+    // PR-5 audit signal — manual punches also count as activity so /health
+    // doesn't go "stale" if all attendance is recorded via the manual UI.
+    last_event_ts_.store(ts_seconds, std::memory_order_relaxed);
 
     writer_->enqueue(std::move(row));
     return true;
@@ -275,6 +284,16 @@ std::size_t AttendanceTracker::pendingRows() {
 
 std::uint64_t AttendanceTracker::droppedRows() {
     return writer_ ? writer_->droppedCount() : 0;
+}
+
+std::size_t AttendanceTracker::employeesCached() {
+    std::lock_guard<std::mutex> lk(cache_mu_);
+    return emp_by_person_.size();
+}
+
+std::size_t AttendanceTracker::cameraRolesCached() {
+    std::lock_guard<std::mutex> lk(cache_mu_);
+    return camera_role_.size();
 }
 
 }  // namespace vms::core

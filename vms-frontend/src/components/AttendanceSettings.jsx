@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { UserPlus, Trash2, Save, RefreshCw, Heart, Edit2, Clock, Plus, Calendar } from 'lucide-react';
+import { UserPlus, Trash2, Save, RefreshCw, Heart, Edit2, Clock, Plus, Calendar, AlertTriangle } from 'lucide-react';
 import apiClient from '../api/apiClient';
 
 const ROLE_OPTIONS = [
@@ -24,7 +24,7 @@ const AttendanceSettings = ({ cameras = [], onToast = () => {} }) => {
   const [employees,   setEmployees]   = useState([]);
   const [shifts,      setShifts]      = useState([]);
   const [cameraRoles, setCameraRoles] = useState([]);
-  const [health,      setHealth]      = useState({ pending_rows: 0, dropped_rows: 0 });
+  const [health,      setHealth]      = useState({ pending_rows: 0, dropped_rows: 0, health: null });
   const [loading,     setLoading]     = useState(false);
 
   const [editingEmp, setEditingEmp] = useState(null);
@@ -54,7 +54,7 @@ const AttendanceSettings = ({ cameras = [], onToast = () => {} }) => {
       if (emp.success)   setEmployees(emp.data?.employees || []);
       if (sh.success)    setShifts(sh.data?.shifts || []);
       if (roles.success) setCameraRoles(roles.data?.camera_roles || []);
-      if (hp.success)    setHealth(hp.data || { pending_rows: 0, dropped_rows: 0 });
+      if (hp.success)    setHealth(hp.data || { pending_rows: 0, dropped_rows: 0, health: null });
       if (hd.success)    setHolidays(hd.data?.holidays || []);
     } catch (e) {
       console.error('AttendanceSettings refresh failed', e);
@@ -71,7 +71,7 @@ const AttendanceSettings = ({ cameras = [], onToast = () => {} }) => {
     const id = setInterval(async () => {
       try {
         const hp = await apiClient.getAttendanceHealth();
-        if (hp.success) setHealth(hp.data || { pending_rows: 0, dropped_rows: 0 });
+        if (hp.success) setHealth(hp.data || { pending_rows: 0, dropped_rows: 0, health: null });
       } catch (_) { /* ignore */ }
     }, 10000);
     return () => clearInterval(id);
@@ -272,14 +272,50 @@ const AttendanceSettings = ({ cameras = [], onToast = () => {} }) => {
   };
   const cellStyle = { padding: '6px 10px', fontSize: 11 };
 
+  // PR-5: derive badge state from backend health enum. null = first reply
+  // hasn't landed; show neutral "loading" state instead of falsely claiming OK.
+  const badge = (() => {
+    if (!health.health) {
+      return { label: 'Đang tải trạng thái...', color: 'var(--text-dim)', title: '' };
+    }
+    const secs = health.seconds_since_last_event;
+    const since = secs >= 0 ? `${secs}s trước` : 'chưa có';
+    const cached = `${health.employees_cached || 0} NV / ${health.camera_roles_cached || 0} camera`;
+    const titleBase = `Tracker started: ${health.started ? 'yes' : 'no'} · Cache: ${cached} · Last event: ${since} · Stale cutoff: ${health.stale_after_s}s`;
+    if (health.health === 'inactive') {
+      return { label: 'Tracker chưa start', color: 'var(--danger)',
+               title: `AttendanceTracker chưa start hoặc đã stop. Kiểm tra backend log cho boot fail. ${titleBase}` };
+    }
+    if (health.health === 'degraded') {
+      return { label: 'Đang chạy — cấu hình thiếu', color: 'var(--warn)',
+               title: `Hệ thống có recognition không map được employee hoặc camera chưa có role. Xem banner cảnh báo bên dưới. ${titleBase}` };
+    }
+    if (health.health === 'stale') {
+      return { label: `Không có event ${secs}s`, color: 'var(--warn)',
+               title: `Tracker đang chạy nhưng không nhận event nào trong ${secs}s (cutoff ${health.stale_after_s}s). Bình thường ngoài giờ làm việc; bất thường trong giờ. ${titleBase}` };
+    }
+    return { label: `Hoạt động · ${cached}`, color: 'var(--accent3)', title: titleBase };
+  })();
+  const showDegradedBanner = health.health === 'degraded' &&
+    ((health.unlinked_events_24h || 0) > 0 || (health.fallback_events_24h || 0) > 0);
+
   return (
     <div>
       {/* ── Health ──────────────────────────────────────────────────────── */}
       <div style={{
-        display: 'flex', gap: 12, marginBottom: 16,
+        display: 'flex', gap: 12, marginBottom: 16, alignItems: 'center',
         padding: 10, background: 'var(--bg-card)',
         border: '1px solid var(--border)', borderRadius: 6,
       }}>
+        <div title={badge.title} style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          padding: '4px 10px', borderRadius: 4,
+          border: `1px solid ${badge.color}`, color: badge.color,
+          fontFamily: 'Rajdhani', fontSize: 12, fontWeight: 700, letterSpacing: 1,
+          textTransform: 'uppercase', cursor: 'default',
+        }}>
+          <Heart size={12} /> {badge.label}
+        </div>
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 9, letterSpacing: 1, color: 'var(--text-secondary)' }}>HÀNG ĐỢI GHI DB</div>
           <div style={{ fontSize: 18, fontFamily: "'Share Tech Mono'", color: health.pending_rows > 1000 ? 'var(--warn)' : 'var(--accent3)' }}>
@@ -296,6 +332,35 @@ const AttendanceSettings = ({ cameras = [], onToast = () => {} }) => {
           <RefreshCw size={12} /> {loading ? '...' : 'Làm mới'}
         </button>
       </div>
+
+      {/* ── Degraded-config warning banner ──────────────────────────────── */}
+      {/* Visible signal that operator config has a real gap. Does NOT auto-
+          hide — operator must fix the underlying issue (link person→employee
+          or set camera role) for the banner to clear on the next 10s poll. */}
+      {showDegradedBanner && (
+        <div style={{
+          display: 'flex', gap: 12, alignItems: 'flex-start', marginBottom: 16,
+          padding: 12, background: 'rgba(255, 165, 0, 0.08)',
+          border: '1px solid var(--warn)', borderRadius: 6,
+        }}>
+          <AlertTriangle size={18} color="var(--warn)" style={{ marginTop: 2, flexShrink: 0 }} />
+          <div style={{ flex: 1, fontSize: 12, color: 'var(--text)' }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>Cấu hình chấm công có lỗ hổng (24h qua)</div>
+            {(health.unlinked_events_24h || 0) > 0 && (
+              <div>
+                • <b>{health.unlinked_events_24h}</b> recognition có person_id nhưng chưa map sang nhân viên —
+                ghi vào DB với <code>employee_id = NULL</code>, không vào báo cáo. Vào mục <i>Danh sách nhân viên</i> bên dưới để bind.
+              </div>
+            )}
+            {(health.fallback_events_24h || 0) > 0 && (
+              <div>
+                • <b>{health.fallback_events_24h}</b> recognition trên camera chưa có role (entry/exit/both/observe) —
+                kind được gán bằng heuristic <code>min_max_fallback</code>, không phải door semantics thật. Set role tại <i>Vai trò camera</i> ngay dưới đây.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ── Camera roles ────────────────────────────────────────────────── */}
       <div className="config-section-title">Vai trò camera (entry / exit / both / observe)</div>

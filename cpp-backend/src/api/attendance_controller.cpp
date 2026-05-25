@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <limits>
 #include <map>
@@ -1486,8 +1487,27 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
     });
 
     // ─────────────────────────────────────────────────────────────────────
-    // GET /api/attendance/health — BulkWriter pending + dropped counters.
-    // Used by ops to detect attendance write backlog.
+    // GET /api/attendance/health — operator-facing readiness + audit probe.
+    //
+    // PR-5 (2026-05-25) extends the original pending/dropped counters with
+    // tracker introspection + a 24h scan of `attendance_events` to surface
+    // operationally-degraded configuration:
+    //   - unlinked_events_24h    → recognitions with no employee mapping
+    //                              (face DB person_id not bound to an
+    //                              employee row in /api/attendance/employees)
+    //   - fallback_events_24h    → recognitions on cameras with no door
+    //                              role configured (source_rule fell back
+    //                              to "min_max_fallback")
+    //
+    // Health enum derived as:
+    //   inactive  → tracker.start() never called or stopped (boot failure)
+    //   degraded  → started + unlinked_24h > 0 OR fallback_24h > 0
+    //   stale     → started + had events before + (now - last) > cutoff
+    //   ok        → started + (no events yet OR recent) + zero degraded
+    //
+    // Stale cutoff defaults 1 h (env VMS_ATTENDANCE_STALE_S, clamped
+    // [60s, 24h]). Intentionally long: face recognition is sparse compared
+    // to PPE — empty office at night is the norm, not a failure mode.
     // ─────────────────────────────────────────────────────────────────────
     CROW_ROUTE(app, "/api/attendance/health")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
@@ -1497,10 +1517,86 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createResponse(json::object(), 204, origin);
         }
         if (auto err = requireAttendanceRead(app, req, origin)) return std::move(*err);
+
         auto& tr = vms::core::AttendanceTracker::getInstance();
+        const bool    started        = tr.started();
+        const int64_t last_event_ts  = tr.lastEventTs();
+        const auto    pending_rows   = static_cast<uint64_t>(tr.pendingRows());
+        const auto    dropped_rows   = static_cast<uint64_t>(tr.droppedRows());
+        const auto    emp_cached     = static_cast<uint64_t>(tr.employeesCached());
+        const auto    role_cached    = static_cast<uint64_t>(tr.cameraRolesCached());
+
+        // 24h audit query (single SQL, portable across SQLite + Postgres
+        // via SUM(CASE WHEN …)). Indexed on attendance_events.timestamp
+        // so the scan is bounded even with months of history.
+        const int64_t now_s          = static_cast<int64_t>(std::time(nullptr));
+        const int64_t window_start_s = now_s - 24 * 3600;
+        uint64_t unlinked_24h = 0;
+        uint64_t fallback_24h = 0;
+        try {
+            auto db = vms::database::DbManager::getInstance().getThreadConnection();
+            if (db.isValid() && db.isOpen()) {
+                QSqlQuery q(db);
+                q.prepare(
+                    "SELECT "
+                    "  SUM(CASE WHEN employee_id IS NULL THEN 1 ELSE 0 END) AS unlinked, "
+                    "  SUM(CASE WHEN source_rule = 'min_max_fallback' THEN 1 ELSE 0 END) AS fallback "
+                    "FROM attendance_events "
+                    "WHERE timestamp >= ?");
+                q.bindValue(0, static_cast<qlonglong>(window_start_s));
+                if (q.exec() && q.next()) {
+                    unlinked_24h = q.value(0).isNull() ? 0 : q.value(0).toULongLong();
+                    fallback_24h = q.value(1).isNull() ? 0 : q.value(1).toULongLong();
+                } else if (!q.lastError().text().isEmpty()) {
+                    LOG_WARN("[attendance/health] 24h audit query failed: {}",
+                             q.lastError().text().toStdString());
+                }
+            }
+        } catch (const std::exception& e) {
+            // Audit query failure is non-fatal — tracker stats still ship.
+            LOG_WARN("[attendance/health] 24h audit exception: {}", e.what());
+        }
+
+        // Staleness cutoff (env-tunable). Long default because face
+        // recognition fires only when people are present — quiet hours
+        // are expected. Operator can tighten during business hours.
+        int stale_after_s = 3600;
+        if (const char* e = std::getenv("VMS_ATTENDANCE_STALE_S")) {
+            if (*e) {
+                int v = std::atoi(e);
+                stale_after_s = std::clamp(v, 60, 24 * 3600);
+            }
+        }
+
+        // Health derivation. Matrix mirrored byte-for-byte in
+        // tests/test_attendance_health.cpp — keep them in sync.
+        std::string health;
+        if (!started) {
+            health = "inactive";
+        } else if (unlinked_24h > 0 || fallback_24h > 0) {
+            health = "degraded";
+        } else if (last_event_ts > 0 && (now_s - last_event_ts) > stale_after_s) {
+            health = "stale";
+        } else {
+            health = "ok";
+        }
+
+        const int64_t seconds_since_last_event = last_event_ts > 0
+            ? (now_s - last_event_ts) : -1;
+
         return ApiUtils::createResponse({
-            {"pending_rows", static_cast<uint64_t>(tr.pendingRows())},
-            {"dropped_rows", static_cast<uint64_t>(tr.droppedRows())}
+            {"health",                    health},
+            {"started",                   started},
+            {"pending_rows",              pending_rows},
+            {"dropped_rows",              dropped_rows},
+            {"employees_cached",          emp_cached},
+            {"camera_roles_cached",       role_cached},
+            {"last_event_ts",             last_event_ts},
+            {"seconds_since_last_event",  seconds_since_last_event},
+            {"stale_after_s",             stale_after_s},
+            {"unlinked_events_24h",       unlinked_24h},
+            {"fallback_events_24h",       fallback_24h},
+            {"generated_at_ms",           static_cast<int64_t>(now_s) * 1000}
         }, 200, origin);
     });
 }

@@ -96,6 +96,19 @@ public:
     std::size_t pendingRows();
     std::uint64_t droppedRows();
 
+    // 2026-05-25 PR-5 audit endpoint probes. Atomic loads — safe from
+    // HTTP handlers without contending with the data path.
+    // lastEventTs() = 0 means the tracker has NEVER accepted a recognized
+    // face since process start (vs "ticked, then went quiet").
+    bool          started() const     { return started_.load(std::memory_order_acquire); }
+    int64_t       lastEventTs() const { return last_event_ts_.load(std::memory_order_relaxed); }
+
+    // Cache sizes — briefly lock cache_mu_. Cheap at /health poll rates.
+    // employeesCached == 0 means /api/attendance/employees was never
+    // populated OR the cache hasn't been reloaded after a CRUD op.
+    std::size_t   employeesCached();
+    std::size_t   cameraRolesCached();
+
     // Pure key-pack — exposed for unit test (test_attendance_dedup.cpp
     // exercises the real packing rule so prod + test cannot drift).
     // person_id (int32) ⊕ camera_id (int32) packed into uint64 for dedup map.
@@ -115,6 +128,11 @@ private:
 
     int                                cooldown_seconds_;  // from env, default 60
     std::atomic<bool>                  started_{false};
+
+    // 2026-05-25 PR-5: behavioural readiness signal. Bumped in
+    // onFaceRecognized (after dedup pass) and recordManual; relaxed
+    // ordering — /health reads this for "seconds since last event" only.
+    std::atomic<int64_t>               last_event_ts_{0};
 
     // Dedup state — small (≤ persons * cameras), GC opportunistically.
     struct DedupEntry { int64_t last_ts_s; std::string last_kind; };

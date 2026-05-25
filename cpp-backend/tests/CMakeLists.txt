@@ -104,6 +104,17 @@ target_include_directories(test_ppe_status PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_ppe_status PRIVATE GTest::gtest GTest::gtest_main)
 add_test(NAME PpeStatusTests COMMAND test_ppe_status)
 
+# ── attendance health / audit tests ───────────────────────────────────────────
+# Inline reproduction of the health-classification matrix in the
+# GET /api/attendance/health handler (attendance_controller.cpp). Guards
+# the operator contract: inactive / degraded / stale / ok semantics +
+# precedence (inactive > degraded > stale > ok) + the last_event_ts == 0
+# guard that prevents fresh-boot from falsely showing as stale.
+add_executable(test_attendance_health test_attendance_health.cpp)
+target_include_directories(test_attendance_health PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_attendance_health PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME AttendanceHealthTests COMMAND test_attendance_health)
+
 # ── frame bus tests (Phase A refactor) ────────────────────────────────────────
 # Links the REAL FrameBus implementation (not an inline reproduction) to catch
 # regressions in subscribe/publish/unsubscribe semantics, the zero-copy raw_frame
@@ -164,6 +175,7 @@ if(WIN32)
         CounterBucketTests
         CounterSummaryTests
         PpeStatusTests
+        AttendanceHealthTests
         FrameBusTests
         JwtPurposeTests
         HttpStartupFailFastTests
