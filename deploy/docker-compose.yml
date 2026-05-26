@@ -1,0 +1,121 @@
+# VMS AI Camera — production infrastructure (compose deployment)
+#
+# What this orchestrates:
+#   * postgres — production DB (the backend's SQLite-default is for dev only;
+#                              memory pin: PostgreSQL is the prod target).
+#   * minio    — S3-compatible object store for recordings + snapshots.
+#   * caddy    — TLS-terminating reverse proxy, auto Let's Encrypt.
+#
+# What this does NOT orchestrate:
+#   * vms_backend itself. The backend builds on Windows with vcpkg x64-windows
+#     + Qt6 + TensorRT/CUDA — containerising it requires a Linux port that is
+#     out of scope for this compose file. Run the backend natively on the host
+#     (Windows: NSSM service via scripts/install_service.ps1; Linux: systemd
+#     unit). Caddy proxies into it via `host.docker.internal`.
+#   * Frontend. The backend serves vms-frontend/dist out of the same HTTP
+#     port; no separate FE container needed.
+#
+# Quick start:
+#   1. cp .env.example .env  &&  edit values (especially VMS_JWT_SECRET +
+#      VMS_PG_PASSWORD + VMS_MINIO_* + VMS_DOMAIN + ACME_EMAIL).
+#   2. docker compose up -d
+#   3. Edit cpp-backend/config/backend.yaml to match (see deploy/README.md
+#      for the snippet — server.host=127.0.0.1, database.driver=postgresql,
+#      storage.driver=minio, security.trusted_proxies=[loopback], etc.)
+#   4. Start vms_backend on the host (NSSM / systemd / manual).
+#   5. Browse to https://<VMS_DOMAIN> — Caddy provisions a cert on first hit.
+#
+# Stopping: `docker compose down` (data persists in named volumes).
+# Wiping:   `docker compose down -v` (DESTRUCTIVE — drops postgres + minio data).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vms-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vms}
+      POSTGRES_USER: ${POSTGRES_USER:-vms}
+      POSTGRES_PASSWORD: ${VMS_PG_PASSWORD:?VMS_PG_PASSWORD must be set in .env}
+      # Reduce log noise; backend's own logger captures interesting events.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    ports:
+      # Loopback-only — backend on the host connects via 127.0.0.1:5432.
+      # NEVER bind 0.0.0.0 here without a firewall rule; postgres on the
+      # public internet is a daily breach headline.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vms} -d ${POSTGRES_DB:-vms}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  minio:
+    image: minio/minio:latest
+    container_name: vms-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${VMS_MINIO_ACCESS_KEY:?VMS_MINIO_ACCESS_KEY must be set in .env}
+      MINIO_ROOT_PASSWORD: ${VMS_MINIO_SECRET_KEY:?VMS_MINIO_SECRET_KEY must be set in .env}
+      # Tell MinIO to advertise the public domain in pre-signed URLs.
+      # Backend doesn't currently use MinIO presigned URLs (vms uses its
+      # own signing in media_signer.cpp), but leaving this lets ops drop
+      # into the MinIO console at a sensible URL.
+      MINIO_BROWSER_REDIRECT_URL: https://${VMS_DOMAIN:?VMS_DOMAIN must be set in .env}/minio/
+    volumes:
+      - minio-data:/data
+    ports:
+      # API on 9000 — backend on host hits this via 127.0.0.1:9000.
+      # Console on 9001 — loopback-only; expose externally only behind
+      # an authenticated proxy. The MinIO root creds bypass everything.
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: vms-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      # HTTP/3 over QUIC — Caddy supports it out of the box; leave open
+      # for clients that negotiate h3. UDP, not TCP.
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile.compose:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data          # cert storage, persists across restarts
+      - caddy-config:/config      # Caddy's runtime config snapshot
+    environment:
+      VMS_DOMAIN: ${VMS_DOMAIN:?VMS_DOMAIN must be set in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL must be set in .env}
+    extra_hosts:
+      # Required on Linux hosts — Docker Desktop (Win/Mac) maps
+      # host.docker.internal automatically, vanilla Linux does not. The
+      # `host-gateway` alias resolves to the host's IP on the docker0
+      # bridge. Without this, Caddy can't reach vms_backend on the host.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      # Soft ordering — caddy doesn't strictly need postgres/minio up to
+      # start serving, but starting them first means the backend has its
+      # deps when an operator brings the stack up cold.
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  minio-data:
+  caddy-data:
+  caddy-config:

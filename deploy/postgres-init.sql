@@ -1,0 +1,38 @@
+-- VMS AI Camera — PostgreSQL bootstrap
+--
+-- Runs ONCE on first container start (Postgres official image executes
+-- everything in /docker-entrypoint-initdb.d/ on initial cluster bring-up).
+-- On subsequent restarts the cluster already exists, this script is
+-- skipped.
+--
+-- Backend's first-boot DB init (src/database/db_manager.cpp) creates
+-- the schema itself — tables, indexes, default admin row. This file
+-- just ensures the role and database the backend expects are present
+-- with the right encoding + permissions.
+--
+-- The default POSTGRES_USER + POSTGRES_DB compose envs (vms / vms)
+-- already create the role + database with sane defaults. Everything
+-- below is defense-in-depth + explicit grant guidance for operators
+-- who want a least-privilege setup with a separate runtime user.
+
+-- Lock the database to UTF8 + the standard locale. Postgres defaults
+-- to template1's encoding, which on some hosts has been "SQL_ASCII"
+-- by accident — that breaks Unicode plate text + camera names.
+-- This ALTER is a no-op on a fresh cluster (already UTF8) but is
+-- a safety net for migrating ops who restore into this stack.
+ALTER DATABASE vms SET client_encoding = 'UTF8';
+
+-- Optional: separate application role with the minimum privileges
+-- needed. Uncomment + change the password if you don't want to use
+-- the bootstrap superuser at runtime.
+--
+-- CREATE ROLE vms_app WITH LOGIN PASSWORD 'change-me-app-role-password';
+-- GRANT CONNECT ON DATABASE vms TO vms_app;
+-- \c vms
+-- GRANT USAGE ON SCHEMA public TO vms_app;
+-- GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO vms_app;
+-- GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vms_app;
+-- ALTER DEFAULT PRIVILEGES IN SCHEMA public
+--   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO vms_app;
+-- ALTER DEFAULT PRIVILEGES IN SCHEMA public
+--   GRANT USAGE, SELECT ON SEQUENCES TO vms_app;

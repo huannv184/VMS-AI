@@ -1,0 +1,67 @@
+# VMS AI Camera — Caddyfile for docker-compose deployment
+#
+# Differences from Caddyfile.sample (the standalone Caddy variant):
+#   * Proxies to `host.docker.internal` instead of `127.0.0.1` — Caddy
+#     runs in a container, the backend runs on the host. The compose
+#     file injects `extra_hosts: host-gateway` on Linux so this name
+#     resolves; Docker Desktop on Win/Mac handles it natively.
+#   * `{$VMS_DOMAIN}` and `{$ACME_EMAIL}` are interpolated from compose
+#     environment variables (which read from .env).
+#
+# Caddy auto-provisions Let's Encrypt certs on first request. Cert data
+# persists in the named `caddy-data` volume (declared in
+# docker-compose.yml) so a `docker compose down && up -d` doesn't
+# re-request certs and trigger rate limits.
+
+{
+    email {$ACME_EMAIL}
+}
+
+{$VMS_DOMAIN} {
+    # TLS — automatic via Let's Encrypt. For local prod-mirror testing
+    # against a domain you don't own, replace with `tls internal` to
+    # generate a self-signed cert (browsers will warn — that's the point).
+
+    # Defense-in-depth: backend HstsMiddleware emits HSTS too on the
+    # trusted-proxy + XFP=https path; duplicate headers don't hurt.
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+    # Optional hardening — uncomment after vetting your FE assets:
+    # header X-Frame-Options "SAMEORIGIN"
+    # header X-Content-Type-Options "nosniff"
+    # header Referrer-Policy "strict-origin-when-cross-origin"
+
+    # ── /ws  →  backend QWebSocketServer port on host ─────────────
+    @ws {
+        path /ws /ws/*
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @ws host.docker.internal:8083 {
+        # FMP4 binary frames must not be proxy-buffered — same trap the
+        # Vite dev proxy hit. flush_interval -1 disables buffering.
+        flush_interval -1
+        transport http {
+            read_timeout  168h
+            write_timeout 168h
+        }
+    }
+
+    # ── /minio/  →  MinIO console (optional ops UI) ───────────────
+    # Strip the prefix and forward to the console. REMOVE this block if
+    # you don't want the MinIO root credentials reachable from the
+    # public domain. Console runs on host.docker.internal:9001 (loopback
+    # bind, so only the caddy container can reach it).
+    handle_path /minio/* {
+        reverse_proxy host.docker.internal:9001
+    }
+
+    # ── /api/* + SPA  →  backend HTTP port on host ────────────────
+    reverse_proxy host.docker.internal:8000 {
+        flush_interval -1
+        transport http {
+            read_timeout  60s
+            write_timeout 60s
+        }
+    }
+}
