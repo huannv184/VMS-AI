@@ -20,7 +20,13 @@ bool startsWith(const std::string& value, const char* prefix) {
 }
 
 bool isDbIndependentApiPath(const std::string& path, bool auth_enabled) {
-    if (path == "/api/health") {
+    // /api/health is the soft-deprecated alias kept 200-always for legacy
+    // probes. /api/health/live is the new liveness probe (must NEVER 503).
+    // /api/health/ready is the new readiness probe — its handler emits 503
+    // by design when DB is down, so it must NOT be short-circuited here.
+    if (path == "/api/health" ||
+        path == "/api/health/live" ||
+        path == "/api/health/ready") {
         return true;
     }
 
@@ -108,6 +114,8 @@ void AuthMiddleware::before_handle(crow::request& req, crow::response& res, cont
     if (path == "/api/auth/login" ||
         path == "/api/auth/2fa/verify" ||
         path == "/api/health" ||
+        path == "/api/health/live" ||  // liveness probe: orchestrator must hit without creds
+        path == "/api/health/ready" || // readiness probe: LB must hit without creds
         path == "/api/system/streaming-config") {  // PUBLIC: frontend cần trước khi login
         return;
     }

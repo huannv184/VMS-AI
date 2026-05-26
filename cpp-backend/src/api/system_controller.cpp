@@ -1,7 +1,9 @@
 #include "api/system_controller.h"
 #include "utils/system_stats.h"
+#include "utils/storage_manager.h"
 #include "utils/api_utils.h"
 #include "core/onvif_discovery.h"
+#include "core/readiness_state.h"
 #include "database/db_manager.h"
 #include "database/db_state.h"
 #include "database/audit_repository.h"
@@ -14,6 +16,7 @@
 #include "core/network_scanner.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include "core/camera_pipeline_manager.h"
+#include <chrono>
 #include <unordered_set>
 
 using json = nlohmann::json;
@@ -94,27 +97,129 @@ json parseStoredSettingValue(const std::string& key, const std::string& value) {
 
 void SystemController::registerRoutes(vms::server::VmsApp& app) {
 
-    // GET /api/health
-    // ISOLATION GUARANTEE: Always returns 200. No DB access. No auth.
-    // No blocking calls. No mutex. Reads only atomic flags (O(1), lock-free).
-    CROW_ROUTE(app, "/api/health")
+    // Process start timestamp captured at route-registration time. Good
+    // enough for an uptime metric exposed via /api/health/live — boot time
+    // and route-registration are within a few hundred milliseconds.
+    static const auto process_start = std::chrono::steady_clock::now();
+
+    // Helper: read the live readiness snapshot from process globals.
+    // Storage policy is intentionally NOT required by default — see the
+    // block comment in include/core/readiness_state.h for the rationale.
+    // When the storage-resilience P0 follow-up lands it can flip the
+    // storage_required field from config without touching the route.
+    auto readReadinessSnapshot = []() -> vms::core::ReadinessSnapshot {
+        vms::core::ReadinessSnapshot s{};
+        s.db_ready = vms::database::db_ready.load(std::memory_order_acquire);
+        s.storage_ready = vms::utils::StorageManager::getInstance().isAvailable();
+        s.storage_required = false;
+        return s;
+    };
+
+    // GET /api/health/live  (liveness probe)
+    // ISOLATION GUARANTEE: Always returns 200 while the process is alive.
+    // Zero dependency checks — a flaky DB or storage outage must NOT cause
+    // orchestrators to restart this pod, only to drop it out of LB rotation
+    // (that signal is /api/health/ready).
+    // LINT-ALLOW-NO-AUTH: explicit-public — liveness probe must be reachable by orchestrators without credentials.
+    CROW_ROUTE(app, "/api/health/live")
     .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
-    ([&app](const crow::request& req) {
+    ([](const crow::request& req) {
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
 
-        // Dependency status is INFORMATIONAL — health always returns 200.
-        // This enables load balancers and monitoring to distinguish between
-        // "backend alive" vs "backend alive + fully operational".
-        bool db_ok = vms::database::db_ready.load(std::memory_order_relaxed);
+        const auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - process_start).count();
 
         crow::response res;
         res.code = 200;
         res.set_header("Content-Type", "application/json");
         ApiUtils::applyCors(res, origin);
-        res.body = db_ok
-            ? R"({"success":true,"data":{"status":"ok","database":"connected"},"error":null})"
-            : R"({"success":true,"data":{"status":"degraded","database":"unavailable"},"error":null})";
+        nlohmann::json body = {
+            {"success", true},
+            {"data", {
+                {"status", "alive"},
+                {"uptime_sec", uptime_sec}
+            }},
+            {"error", nullptr}
+        };
+        res.body = body.dump();
+        return res;
+    });
+
+    // GET /api/health/ready  (readiness probe)
+    // 200 only when every REQUIRED dependency is up. Otherwise 503, and
+    // the body lists which dependency is missing. This is the signal LBs
+    // should consult when deciding whether to send live traffic.
+    CROW_ROUTE(app, "/api/health/ready")
+    .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
+    ([readReadinessSnapshot](const crow::request& req) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
+
+        const auto snap = readReadinessSnapshot();
+        const bool ready = vms::core::computeReady(snap);
+
+        // storage status string: "ok" / "unavailable" / "degraded_optional"
+        // The third state lets operators see that storage is dead but the
+        // current policy chose not to fail readiness — the right signal
+        // for monitoring without paging on-call.
+        const char* storage_state = snap.storage_ready
+            ? "ok"
+            : (snap.storage_required ? "unavailable" : "degraded_optional");
+
+        crow::response res;
+        res.code = ready ? 200 : 503;
+        res.set_header("Content-Type", "application/json");
+        ApiUtils::applyCors(res, origin);
+        nlohmann::json body = {
+            {"success", ready},
+            {"data", {
+                {"status", ready ? "ready" : "not_ready"},
+                {"checks", {
+                    {"database", snap.db_ready ? "ok" : "unavailable"},
+                    {"storage", storage_state}
+                }}
+            }},
+            {"error", nullptr}
+        };
+        res.body = body.dump();
+        return res;
+    });
+
+    // GET /api/health  (legacy alias — soft-deprecated 2026-05-26)
+    // Kept 200-always so existing LB/orchestrator probe configurations don't
+    // suddenly start failing. Body carries a `successor` field and the
+    // response carries a Deprecation header per RFC 8594 so ops can migrate
+    // probes to /api/health/live (liveness) or /api/health/ready (readiness)
+    // at their own pace.
+    // LINT-ALLOW-NO-AUTH: explicit-public — legacy health endpoint, must stay unauth for backward compat with existing LB probes.
+    CROW_ROUTE(app, "/api/health")
+    .methods(crow::HTTPMethod::Get, crow::HTTPMethod::Options)
+    ([](const crow::request& req) {
+        std::string origin = ApiUtils::resolveCorsOrigin(req);
+        if (req.method == crow::HTTPMethod::Options) return ApiUtils::createResponse(json::object(), 204, origin);
+
+        bool db_ok = vms::database::db_ready.load(std::memory_order_relaxed);
+
+        crow::response res;
+        res.code = 200;
+        res.set_header("Content-Type", "application/json");
+        res.set_header("Deprecation", "true");
+        res.set_header("Link", "</api/health/live>; rel=\"successor-version\", </api/health/ready>; rel=\"alternate\"");
+        ApiUtils::applyCors(res, origin);
+        nlohmann::json body = {
+            {"success", true},
+            {"data", {
+                {"status", db_ok ? "ok" : "degraded"},
+                {"database", db_ok ? "connected" : "unavailable"},
+                {"successor", {
+                    {"liveness", "/api/health/live"},
+                    {"readiness", "/api/health/ready"}
+                }}
+            }},
+            {"error", nullptr}
+        };
+        res.body = body.dump();
         return res;
     });
 

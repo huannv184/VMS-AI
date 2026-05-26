@@ -30,6 +30,17 @@ target_link_libraries(test_password_hash PRIVATE
     unofficial::argon2::libargon2)
 add_test(NAME PasswordHashTests COMMAND test_password_hash)
 
+# ── readiness-state tests (liveness/readiness split policy guard) ────────────
+# Pins the boolean matrix in include/core/readiness_state.h so future
+# refactors can't silently change the rule "DB required, storage gated on
+# config". Pure-function tests — no Crow, no globals. The Crow handler in
+# system_controller.cpp builds a ReadinessSnapshot from atomics and passes
+# it to computeReady() (the function this target exercises).
+add_executable(test_readiness_state test_readiness_state.cpp)
+target_include_directories(test_readiness_state PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_readiness_state PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME ReadinessStateTests COMMAND test_readiness_state)
+
 # ── jwt purpose isolation tests (SEC-002 regression) ──────────────────────────
 # Links the REAL jwt_utils.cpp + config.cpp + logger.cpp so the test fails if
 # someone refactors away the token_use claim or accepts wrong-purpose tokens.
@@ -261,6 +272,7 @@ if(WIN32)
     set_tests_properties(
         AuthTests
         PasswordHashTests
+        ReadinessStateTests
         DbPortabilityTests
         AttendanceDedupTests
         AttendanceShiftTests
