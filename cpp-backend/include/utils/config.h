@@ -50,6 +50,18 @@ public:
     // Storage configuration (MinIO)
     struct StorageConfig {
         std::string driver = "local"; // "minio" or "local"
+        // H7: operator policy for storage availability.
+        //   false (default) — optional. Backend boots even if MinIO is
+        //     unreachable; a background retry loop attempts recovery with
+        //     bounded backoff. Readiness probe stays "ready" so the LB
+        //     keeps routing traffic — uploads silently no-op until storage
+        //     comes back.
+        //   true            — required. init() does a synchronous bucket
+        //     check; on failure main() throws and the process refuses to
+        //     start. While running, /api/health/ready returns 503 whenever
+        //     storage_ready flips false.
+        // Env override: VMS_STORAGE_REQUIRED=1 / =0.
+        bool required = false;
         struct MinioConfig {
             std::string endpoint = "http://localhost:9000";
             std::string access_key = "minioadmin";

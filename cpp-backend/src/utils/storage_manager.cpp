@@ -150,22 +150,58 @@ StorageManager& StorageManager::getInstance() {
 
 bool StorageManager::init(const Config::StorageConfig& config) {
     driver_ = config.driver;
+    required_ = config.required;
     config_ = config.minio;
     initialized_.store(true);
+    shutdown_requested_.store(false);
     storage_ready_.store(driver_ != "minio");
 
-    LOG_INFO("StorageManager initialized with driver: {} endpoint: {}", driver_, config_.endpoint);
-    if (driver_ == "minio") {
-        startBackgroundInitialization();
+    LOG_INFO("StorageManager initialized: driver={} endpoint={} required={}",
+             driver_, config_.endpoint, required_ ? "true" : "false");
+
+    if (driver_ != "minio") {
+        return true;  // local driver — nothing to verify, always ready
     }
+
+    if (required_) {
+        // H7: operator opted into fail-fast. Try once synchronously so
+        // main() can throw on the same call stack as boot. No background
+        // retry — if buckets aren't ready right now, the process refuses
+        // to start.
+        if (!tryEnsureBucketsOnce()) {
+            LOG_ERROR("StorageManager: required=true but MinIO unavailable. "
+                      "Refusing to start. Check endpoint + credentials, or "
+                      "flip storage.required=false to boot in degraded mode.");
+            return false;
+        }
+        storage_ready_.store(true);
+        LOG_INFO("StorageManager: all required buckets ready");
+        return true;
+    }
+
+    // Optional storage path: kick off long-lived background retry loop.
+    // Returns true immediately so boot continues; the loop will flip
+    // storage_ready_ true when MinIO comes online (or stay false forever
+    // if it never does — readiness probe reports degraded_optional).
+    startBackgroundRetryLoop();
     return true;
 }
 
 void StorageManager::shutdown() {
+    shutdown_requested_.store(true);
     std::lock_guard<std::mutex> lock(init_mutex_);
     if (init_thread_.joinable()) {
         init_thread_.join();
     }
+}
+
+// Pure helper — exposed in the header for unit tests so the sequence is
+// pinned without spinning real threads.
+int StorageManager::nextBackoffSeconds(int attempt) {
+    if (attempt <= 1) return 5;
+    if (attempt == 2) return 15;
+    if (attempt == 3) return 60;
+    return 300;  // cap from attempt 4 onward
 }
 
 // Helper: apply S3v4 auth to a CURL handle for a given method+path
@@ -183,7 +219,7 @@ void applySigV4(CURL* curl, struct curl_slist*& headers,
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 }
 
-void StorageManager::startBackgroundInitialization() {
+void StorageManager::startBackgroundRetryLoop() {
     std::lock_guard<std::mutex> lock(init_mutex_);
     if (background_init_in_progress_.load()) {
         return;
@@ -195,9 +231,55 @@ void StorageManager::startBackgroundInitialization() {
 
     background_init_in_progress_.store(true);
     init_thread_ = std::thread([this]() {
-        ensureBucketsExist();
+        runBackoffRetryLoop();
         background_init_in_progress_.store(false);
     });
+}
+
+// H7: long-lived background recovery loop. Replaces the pre-existing
+// "2 attempts → give up → disabled until restart" behaviour. Wakes up
+// on a bounded backoff schedule (5s/15s/60s/300s, see nextBackoffSeconds)
+// and retries MinIO bucket initialisation until one of three things
+// happens:
+//   1. storage_ready_ flips true (success — loop exits, no respawn).
+//   2. shutdown_requested_ flips true (graceful shutdown — loop exits).
+// Sleep is sliced into 250ms chunks so the shutdown signal is observed
+// within ~quarter-second regardless of which backoff window we're in.
+void StorageManager::runBackoffRetryLoop() {
+    // Step 0: try once immediately. Avoids a pointless 5s wait when the
+    // operator just started MinIO a moment before vms_backend.
+    if (tryEnsureBucketsOnce()) {
+        storage_ready_.store(true);
+        LOG_INFO("StorageManager: buckets ready on first attempt");
+        return;
+    }
+
+    for (int attempt = 1; ; ++attempt) {
+        const int sleep_sec = nextBackoffSeconds(attempt);
+        LOG_WARN("StorageManager: bucket init failed (attempt {}). Retrying in {}s.",
+                 attempt, sleep_sec);
+
+        // Sliced sleep so shutdown is responsive.
+        constexpr auto kSlice = std::chrono::milliseconds(250);
+        const int slices = (sleep_sec * 1000) / 250;
+        for (int i = 0; i < slices; ++i) {
+            if (shutdown_requested_.load(std::memory_order_acquire)) {
+                LOG_INFO("StorageManager: retry loop exiting on shutdown signal");
+                return;
+            }
+            std::this_thread::sleep_for(kSlice);
+        }
+
+        if (shutdown_requested_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        if (tryEnsureBucketsOnce()) {
+            storage_ready_.store(true);
+            LOG_INFO("StorageManager: buckets ready after {} retries (storage recovered)", attempt);
+            return;
+        }
+    }
 }
 
 bool StorageManager::createBucket(const std::string& name, long timeout_ms) {
@@ -252,40 +334,20 @@ bool StorageManager::createBucket(const std::string& name, long timeout_ms) {
     return false;
 }
 
-bool StorageManager::ensureBucketsExist() {
+// Single-attempt bucket check. No retry — the caller decides whether to
+// loop, fail-fast, or accept a degraded state. Returns true iff both
+// recordings and snapshots buckets are reachable / creatable.
+bool StorageManager::tryEnsureBucketsOnce() {
     if (!initialized_.load()) return false;
     if (driver_ != "minio") {
-        storage_ready_.store(true);
+        // Local driver — nothing to verify. Caller is expected to have
+        // already flipped storage_ready_ in init().
         return true;
     }
-
-    constexpr int kMaxAttempts = 2;
     constexpr long kAttemptTimeoutMs = 1000;
-    constexpr auto kRetryDelay = std::chrono::milliseconds(250);
-
-    storage_ready_.store(false);
-
-    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
-        const bool recordings_ok = createBucket(config_.bucket_recordings, kAttemptTimeoutMs);
-        const bool snapshots_ok = createBucket(config_.bucket_snapshots, kAttemptTimeoutMs);
-
-        if (recordings_ok && snapshots_ok) {
-            storage_ready_.store(true);
-            LOG_INFO("StorageManager: All buckets ready");
-            return true;
-        }
-
-        if (attempt < kMaxAttempts) {
-            LOG_WARN("StorageManager: Bucket initialization attempt {}/{} failed; retrying once in {} ms",
-                     attempt, kMaxAttempts, kRetryDelay.count());
-            std::this_thread::sleep_for(kRetryDelay);
-        }
-    }
-
-    storage_ready_.store(false);
-    LOG_WARN("StorageManager: MinIO unavailable after {} attempts; storage will remain disabled until restart",
-             kMaxAttempts);
-    return false;
+    const bool recordings_ok = createBucket(config_.bucket_recordings, kAttemptTimeoutMs);
+    const bool snapshots_ok = createBucket(config_.bucket_snapshots, kAttemptTimeoutMs);
+    return recordings_ok && snapshots_ok;
 }
 
 bool StorageManager::uploadFile(const std::string& local_path, const std::string& object_key) {

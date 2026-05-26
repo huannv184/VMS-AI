@@ -90,6 +90,7 @@ bool Config::loadFromFile(const std::string& filepath) {
         if (config_["storage"]) {
             auto storage = config_["storage"];
             storage_.driver = storage["driver"].as<std::string>(storage_.driver);
+            storage_.required = storage["required"].as<bool>(storage_.required);
             if (storage["minio"]) {
                 auto minio = storage["minio"];
                 storage_.minio.endpoint = minio["endpoint"].as<std::string>(storage_.minio.endpoint);
@@ -118,8 +119,19 @@ bool Config::loadFromFile(const std::string& filepath) {
                 storage_.minio.secret_key = minio_secret;
                 LOG_INFO("Loaded MinIO secret key from VMS_MINIO_SECRET_KEY environment variable");
             }
+            // H7: env override for storage.required (= "1" turns it on,
+            // "0" / "false" / "no" / unset leaves whatever the YAML says).
+            const auto storage_required_env = getEnvStr("VMS_STORAGE_REQUIRED");
+            if (!storage_required_env.empty()) {
+                const bool on = (storage_required_env == "1" ||
+                                 storage_required_env == "true" ||
+                                 storage_required_env == "TRUE" ||
+                                 storage_required_env == "yes");
+                storage_.required = on;
+                LOG_INFO("Storage 'required' flag set from VMS_STORAGE_REQUIRED env var: {}", on);
+            }
         }
-        
+
         // Parse authentication configuration
         if (config_["auth"]) {
             auto auth = config_["auth"];

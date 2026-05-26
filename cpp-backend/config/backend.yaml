@@ -289,7 +289,49 @@ snapshots:
   jpeg_quality: 85
   auto_cleanup: true
   retention_days: 7
-  
+
+# ============================================================================
+# STORAGE BACKEND (H7 — operator-driven availability policy)
+# ============================================================================
+# `driver` selects where recordings + snapshots live:
+#   local — files on the local filesystem (default; no outbound calls).
+#   minio — S3-compatible object store (recordings + snapshots buckets).
+#
+# `required` controls how the backend reacts when the MinIO driver can't
+# reach its endpoint:
+#   false (default) — OPTIONAL. Backend boots regardless of MinIO state.
+#                     A long-lived background retry loop attempts recovery
+#                     with bounded backoff (5s → 15s → 60s → 300s capped).
+#                     `/api/health/ready` stays 200 with `storage:
+#                     degraded_optional` so the LB keeps routing traffic
+#                     and uploads silently no-op until storage recovers.
+#                     Right policy for sites where storage is convenience,
+#                     not safety-critical (dev, small deploys, kiosk).
+#   true            — REQUIRED. init() runs a synchronous bucket check;
+#                     on failure main() throws and the process refuses
+#                     to start (orchestrator will see a non-zero exit
+#                     and back off / page on-call). While running,
+#                     `/api/health/ready` returns 503 whenever the
+#                     storage_ready flag flips false. Right policy for
+#                     prod deployments where lost footage is a compliance
+#                     incident.
+#
+# Env override: VMS_STORAGE_REQUIRED=1 / =true / =yes flips on. Anything
+# else (or unset) leaves whatever this YAML says.
+#
+# Secrets: access_key + secret_key can also come from VMS_MINIO_ACCESS_KEY
+# and VMS_MINIO_SECRET_KEY env vars (preferred for prod — keeps the YAML
+# safe to commit).
+storage:
+  driver: "local"
+  required: false
+  minio:
+    endpoint: "http://localhost:9000"
+    access_key: "minioadmin"
+    secret_key: "minioadmin"
+    bucket_recordings: "vms-recordings"
+    bucket_snapshots: "vms-snapshots"
+
 # ============================================================================
 # LOGGING
 # ============================================================================

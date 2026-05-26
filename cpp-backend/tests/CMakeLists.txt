@@ -41,6 +41,32 @@ target_include_directories(test_readiness_state PRIVATE ${CMAKE_SOURCE_DIR}/incl
 target_link_libraries(test_readiness_state PRIVATE GTest::gtest GTest::gtest_main)
 add_test(NAME ReadinessStateTests COMMAND test_readiness_state)
 
+# ── storage backoff tests (H7 retry-schedule guard) ──────────────────────────
+# Pins the long-lived recovery loop's sleep sequence (5s → 15s → 60s →
+# 300s capped) so future "tuning" can't silently turn it into a spin-loop
+# or a glacial 24-hour wait. Pure-function test — links the same
+# StorageManager translation unit as the backend to keep the symbol
+# resolution honest (if someone deletes nextBackoffSeconds the test
+# fails to link).
+add_executable(test_storage_backoff
+    test_storage_backoff.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/storage_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/config.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/logger.cpp)
+target_include_directories(test_storage_backoff PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# storage_manager.cpp uses std::min on Windows; match the main target's
+# NOMINMAX so windows.h's min/max macros don't shadow the stdlib calls.
+if(MSVC)
+    target_compile_definitions(test_storage_backoff PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+target_link_libraries(test_storage_backoff PRIVATE
+    GTest::gtest GTest::gtest_main
+    spdlog::spdlog
+    yaml-cpp::yaml-cpp
+    OpenSSL::SSL OpenSSL::Crypto
+    CURL::libcurl)
+add_test(NAME StorageBackoffTests COMMAND test_storage_backoff)
+
 # ── jwt purpose isolation tests (SEC-002 regression) ──────────────────────────
 # Links the REAL jwt_utils.cpp + config.cpp + logger.cpp so the test fails if
 # someone refactors away the token_use claim or accepts wrong-purpose tokens.
@@ -273,6 +299,7 @@ if(WIN32)
         AuthTests
         PasswordHashTests
         ReadinessStateTests
+        StorageBackoffTests
         DbPortabilityTests
         AttendanceDedupTests
         AttendanceShiftTests

@@ -397,9 +397,22 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Initializing storage manager...");
         try {
             if (!vms::utils::StorageManager::getInstance().init(config.getStorageConfig())) {
+                // H7: init() returns false only when storage.required=true AND
+                // the synchronous bucket check failed. Fail-fast so the
+                // process refuses to start instead of pretending to be ready.
+                // For required=false the call returns true even on MinIO
+                // outage (a background retry loop owns recovery).
+                if (config.getStorageConfig().required) {
+                    throw std::runtime_error(
+                        "StorageManager required but MinIO unavailable at boot. "
+                        "Check endpoint/credentials or set storage.required=false.");
+                }
                 LOG_WARN("Failed to initialize StorageManager (MinIO not available?). Backend will continue without storage.");
             }
         } catch (const std::exception& e) {
+            if (config.getStorageConfig().required) {
+                throw;  // propagate — required deployments must fail-fast
+            }
             LOG_WARN("StorageManager init exception: {}. Backend will continue without storage.", e.what());
         }
 

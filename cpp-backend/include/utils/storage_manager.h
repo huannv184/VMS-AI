@@ -77,23 +77,43 @@ public:
      * @brief Delete an object from MinIO.
      */
     bool remove(const std::string& object_key);
-    bool ensureBucketsExist();
 
     /**
      * @brief Check if storage is reachable and buckets are ready.
      */
     bool isAvailable() const { return storage_ready_.load(); }
 
+    /**
+     * @brief Whether the operator declared storage required (fail-fast on
+     * boot, /api/health/ready returns 503 while down).
+     */
+    bool isRequired() const { return required_; }
+
+    /**
+     * @brief Backoff schedule for the background retry loop. Pure function
+     * so the sequence is unit-testable without spawning real threads.
+     * Sequence: 5s → 15s → 60s → 300s, then capped at 300s indefinitely.
+     * `attempt` is 1-indexed (1 = first retry after init failure).
+     */
+    static int nextBackoffSeconds(int attempt);
+
 private:
     StorageManager() = default;
     bool createBucket(const std::string& name, long timeout_ms);
-    void startBackgroundInitialization();
+    bool tryEnsureBucketsOnce();
+    void startBackgroundRetryLoop();
+    void runBackoffRetryLoop();
 
     std::string driver_{"local"};
+    bool required_{false};
     Config::StorageConfig::MinioConfig config_;
     std::atomic<bool> initialized_{false};
     std::atomic<bool> storage_ready_{false};
     std::atomic<bool> background_init_in_progress_{false};
+    // H7: signals the long-lived retry loop to exit. Checked between sleep
+    // slices so a clean shutdown observes it within ~250ms regardless of
+    // how long the current backoff window is.
+    std::atomic<bool> shutdown_requested_{false};
     std::mutex init_mutex_;
     std::thread init_thread_;
 

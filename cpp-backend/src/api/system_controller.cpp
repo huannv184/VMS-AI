@@ -103,15 +103,16 @@ void SystemController::registerRoutes(vms::server::VmsApp& app) {
     static const auto process_start = std::chrono::steady_clock::now();
 
     // Helper: read the live readiness snapshot from process globals.
-    // Storage policy is intentionally NOT required by default — see the
-    // block comment in include/core/readiness_state.h for the rationale.
-    // When the storage-resilience P0 follow-up lands it can flip the
-    // storage_required field from config without touching the route.
+    // H7: storage_required now reflects operator policy
+    // (`storage.required` in backend.yaml or VMS_STORAGE_REQUIRED env).
+    // When true, a storage outage flips /api/health/ready to 503. When
+    // false (default), it stays 200 but reports `degraded_optional` so
+    // monitoring sees the outage without paging on-call.
     auto readReadinessSnapshot = []() -> vms::core::ReadinessSnapshot {
         vms::core::ReadinessSnapshot s{};
         s.db_ready = vms::database::db_ready.load(std::memory_order_acquire);
         s.storage_ready = vms::utils::StorageManager::getInstance().isAvailable();
-        s.storage_required = false;
+        s.storage_required = vms::utils::StorageManager::getInstance().isRequired();
         return s;
     };
 
