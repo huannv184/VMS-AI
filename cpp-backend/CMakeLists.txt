@@ -14,6 +14,11 @@ find_package(yaml-cpp CONFIG REQUIRED)
 find_package(cppzmq CONFIG REQUIRED)
 find_package(jwt-cpp REQUIRED)
 find_package(OpenSSL REQUIRED)
+# H6: argon2id password hashing. Header utils/password_hash.h gates its
+# real implementation on VMS_HAS_ARGON2 — if the define is dropped, login
+# silently falls back to legacy salted SHA256, so keep the define and the
+# link target in lockstep with the vcpkg.json entry.
+find_package(unofficial-argon2 CONFIG REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system filesystem geometry)
 find_package(OpenCV REQUIRED)
 find_package(GTest REQUIRED)
@@ -100,6 +105,7 @@ target_link_libraries(vms_backend PRIVATE
     cppzmq
     jwt-cpp::jwt-cpp
     OpenSSL::SSL OpenSSL::Crypto
+    unofficial::argon2::libargon2
     Boost::system Boost::filesystem Boost::geometry
     ${OpenCV_LIBS}
     unofficial::sqlite3::sqlite3
@@ -130,6 +136,11 @@ add_subdirectory(tests)
 if(MSVC)
     target_compile_definitions(vms_backend PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN BUILD_SHM_READER_C)
 endif()
+
+# H6: activate argon2id codepath in utils/password_hash.h. Removing this
+# define is silent — login falls back to legacy SHA256 with zero log line,
+# so leaving it dependent on the link target above is intentional.
+target_compile_definitions(vms_backend PRIVATE VMS_HAS_ARGON2)
 
 # Force re-configure to pick up moved headers
 

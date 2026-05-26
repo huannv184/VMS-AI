@@ -16,6 +16,20 @@ target_include_directories(test_auth PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_auth PRIVATE GTest::gtest GTest::gtest_main)
 add_test(NAME AuthTests COMMAND test_auth)
 
+# ── password-hash tests (Argon2id activation guard) ──────────────────────────
+# Locks the H6 wiring in place: if CMakeLists.txt ever loses
+# `unofficial::argon2::libargon2` or the VMS_HAS_ARGON2 define, this target
+# either fails to link or throws std::runtime_error at runtime — both surface
+# the regression before the silent SHA256 fallback ships.
+find_package(unofficial-argon2 CONFIG REQUIRED)
+add_executable(test_password_hash test_password_hash.cpp)
+target_include_directories(test_password_hash PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_password_hash PRIVATE VMS_HAS_ARGON2)
+target_link_libraries(test_password_hash PRIVATE
+    GTest::gtest GTest::gtest_main
+    unofficial::argon2::libargon2)
+add_test(NAME PasswordHashTests COMMAND test_password_hash)
+
 # ── jwt purpose isolation tests (SEC-002 regression) ──────────────────────────
 # Links the REAL jwt_utils.cpp + config.cpp + logger.cpp so the test fails if
 # someone refactors away the token_use claim or accepts wrong-purpose tokens.
@@ -246,6 +260,7 @@ if(WIN32)
         "QT_PLUGIN_PATH=${_VMS_QT_PLUGIN_DIR}")
     set_tests_properties(
         AuthTests
+        PasswordHashTests
         DbPortabilityTests
         AttendanceDedupTests
         AttendanceShiftTests
