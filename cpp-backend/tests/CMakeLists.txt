@@ -67,6 +67,17 @@ target_link_libraries(test_storage_backoff PRIVATE
     CURL::libcurl)
 add_test(NAME StorageBackoffTests COMMAND test_storage_backoff)
 
+# ── HSTS gate tests (H8 production-mode header policy) ──────────────────────
+# Pins the shouldEmitHsts() decision matrix so HSTS is emitted ONLY when
+# operators have declared a reverse proxy AND the proxy forwarded
+# X-Forwarded-Proto: https. Pure-function test — guards the "you cannot
+# un-emit HSTS for a year" foot-gun the same way the Argon2 tests guard
+# the silent SHA256 fallback. See include/utils/security_headers.h.
+add_executable(test_hsts_header test_hsts_header.cpp)
+target_include_directories(test_hsts_header PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_hsts_header PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME HstsHeaderTests COMMAND test_hsts_header)
+
 # ── jwt purpose isolation tests (SEC-002 regression) ──────────────────────────
 # Links the REAL jwt_utils.cpp + config.cpp + logger.cpp so the test fails if
 # someone refactors away the token_use claim or accepts wrong-purpose tokens.
@@ -300,6 +311,7 @@ if(WIN32)
         PasswordHashTests
         ReadinessStateTests
         StorageBackoffTests
+        HstsHeaderTests
         DbPortabilityTests
         AttendanceDedupTests
         AttendanceShiftTests

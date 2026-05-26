@@ -1,0 +1,122 @@
+# VMS AI Camera — production nginx config sample
+#
+# Production architecture: nginx terminates TLS on :443, forwards plain
+# HTTP/WS to the backend on loopback (127.0.0.1:8000 for /api + SPA,
+# 127.0.0.1:8083 for /ws). The backend itself binds 127.0.0.1 only —
+# LAN clients cannot bypass TLS by hitting it directly.
+#
+# Prerequisites:
+#   * TLS cert + key (Let's Encrypt, internal CA, or commercial cert)
+#   * cpp-backend/config/backend.yaml has:
+#       server:
+#         host: "127.0.0.1"          # loopback only
+#       security:
+#         trusted_proxies: ["loopback"]   # honours XFF/XFP from nginx
+#       cors:
+#         origins: ["https://vms.example.com"]   # your real FE origin
+#         credentials: true
+#
+# Replace `vms.example.com` and cert paths with your values.
+
+# Optional: HSTS preload list submission requires the `preload` flag at
+# top level + max-age >= 31536000 + includeSubDomains. We DON'T set
+# preload by default — opt in after vetting every subdomain.
+
+# HTTP → HTTPS redirect. Survives Let's Encrypt http-01 challenge if you
+# use a separate location { } for /.well-known/acme-challenge.
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name vms.example.com;
+
+    # Let's Encrypt http-01 challenge passthrough (if using certbot).
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen      443 ssl http2;
+    listen      [::]:443 ssl http2;
+    server_name vms.example.com;
+
+    # ── TLS termination ─────────────────────────────────────────────
+    ssl_certificate     /etc/letsencrypt/live/vms.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/vms.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # HSTS — nginx emits this too (defense in depth: backend HstsMiddleware
+    # also emits on trusted-proxy + XFP=https path). 1 year, no preload.
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Other defensible defaults — uncomment to lock down further.
+    # add_header X-Frame-Options "SAMEORIGIN" always;
+    # add_header X-Content-Type-Options "nosniff" always;
+    # add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # ── Body size — FMP4 recording uploads + face avatar PUTs ──────
+    client_max_body_size 200m;
+
+    # ── /api/* + SPA  →  backend HTTP port ─────────────────────────
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+
+        # Forward the client TLS state. backend HstsMiddleware reads
+        # X-Forwarded-Proto; backend rate-limiter + cookie code read
+        # X-Forwarded-For. Both honoured only when the request peer is
+        # in `security.trusted_proxies` — set `loopback` there.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        # Streaming endpoints (HLS, snapshot file, recording download)
+        # need streaming-mode forwarding — DO NOT buffer.
+        proxy_buffering         off;
+        proxy_request_buffering off;
+
+        # Long-poll / SSE friendliness if any handler grows that pattern.
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+
+    # ── /ws  →  backend QWebSocketServer port ─────────────────────
+    # Separate location because WS proxies need explicit Upgrade header
+    # forwarding. Same backend host, different port (8083 default).
+    location /ws {
+        proxy_pass         http://127.0.0.1:8083/ws;
+        proxy_http_version 1.1;
+
+        # The two magic headers that turn this into a WS proxy.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Origin forward is required for the backend's WS-handshake
+        # origin check (see camera_stream_manager.cpp).
+        proxy_set_header Host              $host;
+        proxy_set_header Origin            $http_origin;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Buffering MUST be off for FMP4 video frame fan-out. The Vite
+        # dev proxy comment in vms-frontend/src/utils/runtimeUrls.js
+        # learned this the hard way — buffering truncates binary frames.
+        proxy_buffering         off;
+        proxy_request_buffering off;
+
+        # WebSockets stay open as long as the client wants. Bump the
+        # idle timeout well above any heartbeat interval.
+        proxy_read_timeout 7d;
+        proxy_send_timeout 7d;
+    }
+}

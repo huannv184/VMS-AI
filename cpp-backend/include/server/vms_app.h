@@ -5,6 +5,8 @@
 #include <algorithm>
 #include "middleware/auth_middleware.h"
 #include "utils/api_utils.h"
+#include "utils/config.h"
+#include "utils/security_headers.h"
 
 namespace vms {
 namespace server {
@@ -60,8 +62,47 @@ struct CORSMiddleware {
     }
 };
 
-// Define the App type with CORS and Auth Middleware
-using VmsApp = crow::App<CORSMiddleware, middleware::AuthMiddleware>;
+// HSTS Middleware — emits Strict-Transport-Security only in production
+// mode (reverse-proxy in front + X-Forwarded-Proto: https). See
+// include/utils/security_headers.h for the gate rationale + dev safety
+// argument (we MUST NOT emit HSTS on a no-proxy box; it would poison
+// browsers into refusing plain-HTTP localhost dev for a year).
+//
+// Skips WS upgrade responses for the same reason as CORSMiddleware —
+// extra headers on a 101 Switching Protocols can confuse some clients.
+struct HstsMiddleware {
+    struct context {};
+
+    void before_handle(crow::request& /*req*/, crow::response& /*res*/, context& /*ctx*/) {
+        // No-op
+    }
+
+    void after_handle(crow::request& req, crow::response& res, context& /*ctx*/) {
+        std::string upgrade = req.get_header_value("Upgrade");
+        if (upgrade.empty()) upgrade = req.get_header_value("upgrade");
+        std::string upgrade_lower = upgrade;
+        std::transform(upgrade_lower.begin(), upgrade_lower.end(), upgrade_lower.begin(), ::tolower);
+        if (upgrade_lower == "websocket") {
+            return;
+        }
+
+        const auto& sec = vms::Config::getInstance().getSecurityConfig();
+        const bool trusted_proxies_configured = !sec.trusted_proxies.empty();
+        const std::string xfp = req.get_header_value("X-Forwarded-Proto");
+
+        if (vms::utils::shouldEmitHsts(trusted_proxies_configured, xfp)) {
+            // Only set if not already present — some controllers may
+            // emit their own variant via ApiUtils helpers in the future.
+            if (res.get_header_value("Strict-Transport-Security").empty()) {
+                res.set_header("Strict-Transport-Security",
+                               vms::utils::canonicalHstsValue());
+            }
+        }
+    }
+};
+
+// Define the App type with CORS, HSTS, and Auth Middleware
+using VmsApp = crow::App<CORSMiddleware, HstsMiddleware, middleware::AuthMiddleware>;
 
 } // namespace server
 } // namespace vms

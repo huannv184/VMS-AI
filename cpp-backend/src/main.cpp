@@ -336,6 +336,54 @@ int main(int argc, char* argv[]) {
             ? serverConfig.threads
             : static_cast<int>(hw_threads);
 
+        // H8: bind-safety warnings for production-mode mismatches.
+        // The backend speaks plain HTTP; TLS is terminated at a reverse
+        // proxy. The intended production shape is:
+        //   * server.host=127.0.0.1 (loopback) — only the proxy can reach
+        //     the backend, no LAN client can hit unencrypted /api/*.
+        //   * security.trusted_proxies non-empty — backend honours
+        //     X-Forwarded-Proto from the proxy, which gates HSTS + Secure
+        //     cookie + per-IP login rate limits.
+        // Misconfigurations to flag:
+        //   (1) trusted_proxies SET but host=0.0.0.0 — operator put a
+        //       proxy in front but ALSO exposed the backend directly to
+        //       the network. Any LAN client can bypass the proxy + TLS.
+        //   (2) trusted_proxies EMPTY but host=0.0.0.0 and auth enabled —
+        //       plain HTTP exposed on all interfaces; passwords + JWTs
+        //       traverse the wire unencrypted. Acceptable for dev/lab,
+        //       NOT for prod.
+        // Both are LOG_WARN only (not fatal) so existing deploys don't
+        // suddenly refuse to start. Env escape hatch
+        // VMS_ALLOW_INSECURE_BIND=1 silences them entirely.
+        {
+            const bool insecure_bind_allowed =
+                std::getenv("VMS_ALLOW_INSECURE_BIND") != nullptr &&
+                std::string(std::getenv("VMS_ALLOW_INSECURE_BIND")) == "1";
+            const bool external_bind = (host == "0.0.0.0" || host == "::");
+            const bool trusted_proxies_set =
+                !config.getSecurityConfig().trusted_proxies.empty();
+            const bool auth_enabled = config.getAuthConfig().enabled;
+
+            if (!insecure_bind_allowed) {
+                if (trusted_proxies_set && external_bind) {
+                    LOG_WARN("[H8] server.host={} AND security.trusted_proxies is set: "
+                             "backend is reachable on the network as well as via the "
+                             "reverse proxy. LAN clients can bypass TLS by hitting the "
+                             "backend directly. Set server.host=127.0.0.1 to keep the "
+                             "proxy as the only entry point. Silence with "
+                             "VMS_ALLOW_INSECURE_BIND=1.", host);
+                } else if (!trusted_proxies_set && external_bind && auth_enabled) {
+                    LOG_WARN("[H8] server.host={} AND no reverse proxy declared "
+                             "(security.trusted_proxies is empty) AND auth is enabled: "
+                             "passwords + JWTs will traverse the wire unencrypted. "
+                             "OK for dev; for prod put nginx/caddy in front and "
+                             "configure security.trusted_proxies + server.host=127.0.0.1. "
+                             "See deploy/nginx.conf.sample. Silence with "
+                             "VMS_ALLOW_INSECURE_BIND=1.", host);
+                }
+            }
+        }
+
         vms::database::DbManager& db_manager = vms::database::DbManager::getInstance();
 
         // ── Phase 1: Database Initialization ──

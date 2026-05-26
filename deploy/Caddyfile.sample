@@ -1,0 +1,63 @@
+# VMS AI Camera — production Caddy config sample
+#
+# Same architecture as deploy/nginx.conf.sample: Caddy terminates TLS,
+# forwards plain HTTP/WS to the backend on loopback. Caddy advantage:
+# automatic Let's Encrypt cert provisioning + renewal — point a public
+# DNS A/AAAA record at the host, list the domain here, and Caddy handles
+# the rest.
+#
+# Prerequisites mirror the nginx sample:
+#   * server.host=127.0.0.1
+#   * security.trusted_proxies: ["loopback"]
+#   * cors.origins: ["https://vms.example.com"]   + credentials: true
+#
+# Replace vms.example.com and the operator email.
+
+{
+    # Account email for ACME (Let's Encrypt). REQUIRED for prod —
+    # leave blank only for local testing with `tls internal`.
+    email ops@example.com
+}
+
+vms.example.com {
+    # Auto-TLS via Let's Encrypt. Replace with `tls internal` for a
+    # self-signed cert during local prod-mirror testing.
+    # tls internal
+
+    # HSTS — Caddy emits this. Backend also emits via HstsMiddleware on
+    # the trusted-proxy + XFP=https path; both is fine (browser dedupes).
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+    # Defensible defaults — uncomment to lock down further.
+    # header X-Frame-Options "SAMEORIGIN"
+    # header X-Content-Type-Options "nosniff"
+    # header Referrer-Policy "strict-origin-when-cross-origin"
+
+    # /ws  →  backend QWebSocketServer port (Caddy auto-detects upgrade)
+    @ws {
+        path /ws /ws/*
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @ws 127.0.0.1:8083 {
+        # FMP4 frames are binary — disable any buffering between proxy
+        # and backend; same lesson as the Vite dev proxy.
+        flush_interval -1
+        # WS connections live a long time; bump timeouts.
+        transport http {
+            read_timeout  168h
+            write_timeout 168h
+        }
+    }
+
+    # /api/* + SPA  →  backend HTTP port
+    reverse_proxy 127.0.0.1:8000 {
+        # X-Forwarded-{For,Proto,Host} are auto-added by Caddy. Backend
+        # honours them when peer IP is in security.trusted_proxies.
+        flush_interval -1
+        transport http {
+            read_timeout  60s
+            write_timeout 60s
+        }
+    }
+}

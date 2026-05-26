@@ -56,3 +56,24 @@ Serve options:
 - Backend HTTP: `PORT` default `8000`
 - WebSocket: `WS_PORT` default `8083`
 - Frontend build/runtime: `VITE_API_URL`, `VITE_WS_URL`
+
+## Production deployment
+
+The backend speaks plain HTTP + plain WS by design — TLS is terminated
+at a reverse proxy (nginx, caddy, IIS). See [`deploy/`](./deploy/) for
+copy-paste-ready samples and the matching `backend.yaml` snippet:
+
+- [`deploy/nginx.conf.sample`](./deploy/nginx.conf.sample) — Linux / BSD,
+  manual cert management (Let's Encrypt via certbot, internal CA, or
+  commercial).
+- [`deploy/Caddyfile.sample`](./deploy/Caddyfile.sample) — Linux /
+  Windows, automatic Let's Encrypt provisioning + renewal.
+- [`deploy/README.md`](./deploy/README.md) — full production checklist
+  including `security.trusted_proxies` setup, the WS-buffering gotcha,
+  and the bind-safety warnings emitted at boot when production mode is
+  misconfigured.
+
+For dev (single host, no proxy): defaults work as-is — backend on
+`0.0.0.0:8000`, FE via Vite proxy on `:3000`. The bind-safety warnings
+can be silenced with `VMS_ALLOW_INSECURE_BIND=1` if they're noise in a
+local environment.
