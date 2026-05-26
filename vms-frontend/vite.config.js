@@ -29,7 +29,12 @@ const createProxyErrorHandler = (contentType, bodyFactory) => (proxy) => {
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const apiTarget = ensureHttpTarget(env.VITE_API_URL, '')
+  // Dev default: when VITE_API_URL is unset (the documented same-origin
+  // dev shape), still register the /api proxy pointing at the local backend.
+  // Pre-fix the fallback was '' which left `if (apiTarget)` false and the
+  // proxy unregistered, so /api/* fell into the SPA catch-all and FE saw
+  // index.html instead of backend JSON.
+  const apiTarget = ensureHttpTarget(env.VITE_API_URL, 'http://localhost:8000')
   // Build WS proxy target: strip the /ws path suffix since Vite proxy
   // already maps the '/ws' mount-point and appends it to the target.
   const wsRawTarget = ensureHttpTarget(env.VITE_WS_URL || env.VITE_API_URL, '')
