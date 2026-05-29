@@ -3,7 +3,6 @@
 #include "database/audit_repository.h"
 #include "middleware/auth_middleware.h"
 #include "utils/api_utils.h"
-#include "utils/logger.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <filesystem>
@@ -13,15 +12,8 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
-// BUG-SNAP-AUTH-01 (audit 2026-05-09): pre-fix all 3 snapshot routes used
-// `[]` capture and never read AuthMiddleware context. Anyone reachable on
-// the API port could (a) list every snapshot in the system (camera_id +
-// filepath + metadata = sensitive surveillance PII), (b) read raw image
-// files via /api/snapshots/files/<filename>, (c) DELETE individual
-// snapshots with no auth, no audit log. Same SEC-shape as BUG-ANPR-AUTH-01
-// (5 routes, 2026-05-08), SEC-008/009 (attendance/counter unauth GETs).
-// Fix: GET = RECORDING_READ (snapshots are evidence/PII), DELETE =
-// RECORDING_DELETE, file fetch = RECORDING_READ. Audit log on DELETE.
+// Snapshot routes are evidence/PII surfaces: list/read/file fetch require
+// RECORDING_READ, delete requires RECORDING_DELETE, and deletions are audited.
 
 void SnapshotController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/snapshots
@@ -86,7 +78,7 @@ void SnapshotController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Get) {
             auto snaps = manager.getRecentSnapshots();
             auto it = std::find_if(snaps.begin(), snaps.end(), [&](const vms::Snapshot& s) { return s.id == id; });
-            if (it == snaps.end()) return ApiUtils::createErrorResponse("Not found", 404, origin);
+            if (it == snaps.end()) return ApiUtils::createErrorResponse("Snapshot not found", 404, origin);
             
             json meta = json::object();
             try {
@@ -141,7 +133,7 @@ void SnapshotController::registerRoutes(vms::server::VmsApp& app) {
         crow::response res;
         res.code = 200;
         res.set_static_file_info(filepath);
-        res.set_header("Access-Control-Allow-Origin", "*");
+        ApiUtils::applyCors(res, ApiUtils::resolveCorsOrigin(req));
         res.set_header("Cache-Control", "public, max-age=86400");
 
         // Set Content-Type based on extension SUFFIX — not substring. The

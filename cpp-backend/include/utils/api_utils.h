@@ -210,18 +210,32 @@ public:
 
     // ── Apply CORS headers to a response ──────────────────────────
     static void applyCors(crow::response& res, const std::string& origin) {
-        std::string allowed_origin = origin;
-        bool use_credentials = true;
+        const auto& cors = vms::Config::getInstance().getCorsConfig();
+        if (!cors.enabled) {
+            return;
+        }
 
-        if (allowed_origin.empty() || allowed_origin == "*") {
-             allowed_origin = "*";
-             use_credentials = false;
+        std::string allowed_origin = origin;
+        bool use_credentials = cors.credentials;
+
+        // No Origin header or not allowlisted: emit no CORS header at all.
+        // Pre-fix this fell back to "*" which turned "disabled/denied" into
+        // a public cross-origin response.
+        if (allowed_origin.empty()) {
+            return;
+        }
+
+        if (allowed_origin == "*") {
+            use_credentials = false;
         }
 
         res.set_header("Access-Control-Allow-Origin", allowed_origin);
         res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin, Range");
         res.set_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+        if (allowed_origin != "*") {
+            res.set_header("Vary", "Origin");
+        }
 
         if (use_credentials) {
             res.set_header("Access-Control-Allow-Credentials", "true");

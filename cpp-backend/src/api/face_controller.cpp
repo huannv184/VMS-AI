@@ -442,7 +442,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
             try {
                 auto p = repo.getPersonById(id);
                 if (p) return ApiUtils::createResponse(p.value(), 200, origin);
-                return ApiUtils::createErrorResponse("Not found", 404, origin);
+                return ApiUtils::createErrorResponse("Person not found", 404, origin);
             } catch (const std::exception& e) {
                 return ApiUtils::createSafeError(e, 500, origin);
             }
@@ -452,7 +452,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
         if (req.method == crow::HTTPMethod::Put) {
             try {
                 auto p_opt = repo.getPersonById(id);
-                if (!p_opt) return ApiUtils::createErrorResponse("Not found", 404, origin);
+                if (!p_opt) return ApiUtils::createErrorResponse("Person not found", 404, origin);
 
                 auto body = json::parse(req.body);
                 Person p = p_opt.value();
@@ -536,7 +536,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                     };
                     return ApiUtils::createResponse(response, 200, origin);
                 }
-                return ApiUtils::createErrorResponse("Update failed", 500, origin);
+                return ApiUtils::createErrorResponse("Failed to update person", 500, origin);
             } catch (const std::exception& e) {
                 return ApiUtils::createSafeError(e, 500, origin);
             }
@@ -556,7 +556,7 @@ void FaceController::registerRoutes(vms::server::VmsApp& app) {
                 auto p_opt = repo.getPersonById(id);
 
                 if (!repo.deletePerson(id))
-                    return ApiUtils::createErrorResponse("Delete failed", 500, origin);
+                    return ApiUtils::createErrorResponse("Failed to delete person", 500, origin);
 
                 // Workers must drop the deleted person from their in-process
                 // gallery — otherwise the now-deleted face would keep being

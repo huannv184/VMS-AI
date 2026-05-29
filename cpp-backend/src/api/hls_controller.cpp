@@ -13,14 +13,9 @@ namespace fs = std::filesystem;
 namespace vms {
 namespace api {
 
-// BUG-HLS-AUTH-01 (audit 2026-05-09): pre-fix both HLS routes used `[]`
-// capture and never read AuthMiddleware. Anyone reachable on the API port
-// could stream the live HLS feed of any camera (surveillance video PII).
-// Auth via session cookie works because <video src="..."/> includes cookies
-// for same-origin requests by default, and the cookie path landed in 2026-04
-// security pass (H5). For cross-origin video tags, the frontend must set
-// crossorigin="use-credentials". Same SEC-shape as BUG-ANPR-AUTH-01,
-// BUG-SNAP-AUTH-01.
+// HLS playlist/segment routes must read AuthMiddleware and enforce
+// CAMERA_READ. Pre-hardening they were effectively public to anyone who
+// could reach the API port.
 
 void HLSController::registerRoutes(vms::server::VmsApp& app) {
 
@@ -56,9 +51,7 @@ void HLSController::registerRoutes(vms::server::VmsApp& app) {
 
         crow::response res(200, content);
         res.set_header("Content-Type", "application/vnd.apple.mpegurl");
-        res.set_header("Access-Control-Allow-Origin", origin);
-        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+        ApiUtils::applyCors(res, origin);
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_header("Pragma", "no-cache");
         res.set_header("Expires", "0");
@@ -83,11 +76,8 @@ void HLSController::registerRoutes(vms::server::VmsApp& app) {
             return ApiUtils::createErrorResponse("Invalid segment name", 400, origin);
         }
 
-        // BUG-HLS-EXT-01 (audit 2026-05-09): pre-fix used substring `find()`
-        // for extension check — `evil.ts.exe` passed because ".ts" appears
-        // mid-string. Switch to suffix check. The hls/<id>/ dir is server-
-        // controlled (only HLS segments live there) so the practical attack
-        // surface was limited, but suffix is the correct contract.
+        // Only serve real HLS assets by suffix; substring matching would let
+        // names like `evil.ts.exe` pass the old gate.
         auto endsWithCi = [&](const std::string& suffix) {
             if (segment.size() < suffix.size()) return false;
             for (size_t i = 0; i < suffix.size(); ++i) {
@@ -125,9 +115,7 @@ void HLSController::registerRoutes(vms::server::VmsApp& app) {
 
         crow::response res(200, content);
         res.set_header("Content-Type", content_type);
-        res.set_header("Access-Control-Allow-Origin", origin);
-        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+        ApiUtils::applyCors(res, origin);
         res.set_header("Cache-Control", "no-cache");
         return res;
     });

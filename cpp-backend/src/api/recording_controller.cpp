@@ -31,14 +31,9 @@ static bool isValidRecordingId(const std::string& id) {
 namespace vms {
 namespace api {
 
-// BUG-REC-AUTH-01 (audit 2026-05-11, Batch C): 5 recording read/delete routes
-// previously captured `[]` and bypassed AuthMiddleware. Video PII (recorded
-// camera footage) was streamable + deletable by any TCP client that could
-// reach the API. Fix: all reads gated on RECORDING_READ, DELETE on
-// RECORDING_DELETE + audit log. Same shape as SEC-005 / BUG-ANPR-AUTH-01 /
-// BUG-EVENT-AUTH-01. Snapshot/HLS/export controllers were closed in the
-// 2026-05-09 RBAC bundle commit; recording_controller was deferred because
-// the live HLS surface was the highest-priority leak.
+// Recording routes serve recorded video evidence. Read/download paths require
+// RECORDING_READ; destructive paths require RECORDING_DELETE and emit audit
+// logs.
 void RecordingController::registerRoutes(vms::server::VmsApp& app) {
     // GET /api/recordings - List all recordings (events with video files)
     CROW_ROUTE(app, "/api/recordings")
@@ -195,8 +190,7 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
                 res.set_static_file_info(local_path);
                 res.set_header("Content-Type", content_type);
                 res.set_header("Accept-Ranges", "bytes");
-                std::string allowed = origin.empty() ? "*" : origin;
-                res.set_header("Access-Control-Allow-Origin", allowed);
+                ApiUtils::applyCors(res, origin);
                 return res;
             }
 
@@ -212,8 +206,7 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
                 crow::response res(416);
                 res.set_header("Accept-Ranges", "bytes");
                 res.body = R"({"error":"Range header required for cloud-stored recordings"})";
-                std::string allowed = origin.empty() ? "*" : origin;
-                res.set_header("Access-Control-Allow-Origin", allowed);
+                ApiUtils::applyCors(res, origin);
                 return res;
             }
 
@@ -264,8 +257,7 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
                 "bytes " + std::to_string(start) + "-" + std::to_string(end) +
                 "/" + std::to_string(total_size));
             res.set_header("Accept-Ranges", "bytes");
-            std::string allowed = origin.empty() ? "*" : origin;
-            res.set_header("Access-Control-Allow-Origin", allowed);
+            ApiUtils::applyCors(res, origin);
             return res;
         } catch (const std::exception& e) {
             return ApiUtils::createSafeError(e, 500, origin);
@@ -495,9 +487,7 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
                 resp.set_header("Content-Length", std::to_string(content_length));
                 resp.set_header("Content-Range", "bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" + std::to_string(file_size));
                 resp.set_header("Accept-Ranges", "bytes");
-                if (!origin.empty()) {
-                    resp.set_header("Access-Control-Allow-Origin", origin);
-                }
+                ApiUtils::applyCors(resp, origin);
                 return resp;
             }
 
@@ -510,9 +500,7 @@ void RecordingController::registerRoutes(vms::server::VmsApp& app) {
             resp.set_static_file_info(file_path.string());
             resp.set_header("Content-Type", "video/mp4");
             resp.set_header("Accept-Ranges", "bytes");
-            if (!origin.empty()) {
-                resp.set_header("Access-Control-Allow-Origin", origin);
-            }
+            ApiUtils::applyCors(resp, origin);
             return resp;
         } catch (const std::exception& e) {
             return ApiUtils::createSafeError(e, 500, origin);

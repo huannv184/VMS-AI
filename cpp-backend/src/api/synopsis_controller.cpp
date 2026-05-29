@@ -27,12 +27,8 @@ struct SynopsisJob {
     std::time_t createdAt{0};
 };
 
-// BUG-SYN-LEAK-01 (audit 2026-05-08): pre-fix g_jobs grew without bound —
-// every accepted /api/synopsis/create request added a permanent entry, no
-// cleanup on success or failure. With even a moderate operator workload
-// (10 jobs/day for 6 months) it leaks 1800+ entries plus their associated
-// recordings/<jobId>.mp4 files on disk. Cap the in-memory map; rely on
-// pruneOldJobsLocked() to evict at insert time.
+// Synopsis jobs are bounded and pruned after completion so stale metadata and
+// derived outputs do not grow without limit.
 constexpr size_t kMaxJobs = 200;
 constexpr int    kMaxJobAgeSeconds = 24 * 3600;  // 24h
 
@@ -118,35 +114,21 @@ void SynopsisController::registerRoutes(vms::server::VmsApp& app, vms::middlewar
         std::string origin = ApiUtils::resolveCorsOrigin(req);
         if (req.method == crow::HTTPMethod::OPTIONS) return ApiUtils::createResponse(json::object(), 204, origin);
 
-        // BUG-SYN-RBAC-01 (audit 2026-05-08): pre-fix gate was just
-        // `auth.validate(req)` — every logged-in user (including viewer)
-        // could spawn synopsis jobs that CPU-saturate a worker for minutes
-        // and read recording paths off the DB. Same shape as SEC-005
-        // (face/reid/videowall "is logged in" gates from 2026-05-02).
-        // Synopsis is an analytics feature → ANALYTICS_READ matches the
-        // attendance/counter/reid surface.
+        // Synopsis creation is an analytics action, so it stays on
+        // ANALYTICS_READ rather than plain "logged in".
         auto& ctx = app.get_context<vms::middleware::AuthMiddleware>(req);
         if (auto err = ApiUtils::requirePermission(ctx, Permission::ANALYTICS_READ, origin)) return std::move(*err);
 
         try {
             auto body = json::parse(req.body);
 
-            // BUG-SYN-CAMID-01: pre-fix accepted any int. Reject negatives /
-            // pathological values so a bad lookup can't probe for events
-            // across the entire camera id space.
+            // Reject pathological ids so a bad request cannot probe the camera space.
             int cameraId = body.value("cameraId", -1);
             if (cameraId < 0 || cameraId > 1000000) {
                 return ApiUtils::createErrorResponse("Missing or invalid cameraId", 400, origin);
             }
 
-            // BUG-SYN-PATH-01 (audit 2026-05-08): pre-fix the user-supplied
-            // videoPath was passed straight to cv::VideoCapture. Anyone who
-            // could reach the API could probe arbitrary paths on disk via
-            // success/failure timing; with the right combination of args the
-            // engine could even render content from a non-recording video
-            // file into the publicly served recordings/<jobId>.mp4 output.
-            // sanitizeVideoPath() canonicalises and rejects anything outside
-            // recordings/.
+            // Only accept a source path inside recordings/.
             std::string raw_path = body.value("videoPath", "");
             std::string videoPath = sanitizeVideoPath(raw_path);
             if (!raw_path.empty() && videoPath.empty()) {

@@ -1,8 +1,3 @@
-// ==============================================================
-// File: src/api/videowall_controller.cpp
-// Video Wall Layout CRUD API
-// ==============================================================
-
 #include "api/videowall_controller.h"
 #include "database/db_manager.h"
 #include "middleware/auth_middleware.h"
@@ -12,9 +7,7 @@
 #include "utils/logger.h"
 #include <nlohmann/json.hpp>
 #include <QSqlQuery>
-#include <QSqlError>
-#include <QVariant>
-#include <ctime>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -68,7 +61,7 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
         try {
             auto& db = database::DbManager::getInstance();
             QSqlDatabase conn = db.getThreadConnection();
-            if (!conn.isOpen()) return ApiUtils::createErrorResponse("DB unavailable", 500, origin);
+            if (!conn.isOpen()) return ApiUtils::createErrorResponse("Database unavailable", 500, origin);
 
             json layouts = json::array();
             QSqlQuery query(conn);
@@ -210,7 +203,7 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
 
             bool ok = db.executeParameterized(sql, params);
 
-            if (!ok) return ApiUtils::createErrorResponse("Update failed", 500, origin);
+            if (!ok) return ApiUtils::createErrorResponse("Failed to update layout", 500, origin);
             return ApiUtils::createResponse(json::object(), 200, origin);
         } catch (const std::exception& e) {
             return ApiUtils::createSafeError(e, 400, origin);
@@ -229,7 +222,7 @@ void VideoWallController::registerRoutes(vms::server::VmsApp& app) {
         auto& db = database::DbManager::getInstance();
         bool ok = db.executeParameterized("DELETE FROM videowall_layouts WHERE id = ?",
                                           {std::to_string(layout_id)});
-        if (!ok) return ApiUtils::createErrorResponse("Delete failed", 500, origin);
+        if (!ok) return ApiUtils::createErrorResponse("Failed to delete layout", 500, origin);
         return ApiUtils::createResponse(json::object(), 200, origin);
     });
 

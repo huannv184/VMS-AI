@@ -1,7 +1,4 @@
-// ==============================================================
-// File: src/api/event_engine_controller.cpp
-// Advanced Event Engine REST endpoints implementation
-// ==============================================================
+// Event engine REST endpoints: rules, zones, health, and queue stats.
 
 #include "api/event_engine_controller.h"
 #include "events/rule_engine.h"
@@ -24,9 +21,8 @@ namespace vms::api {
 
 namespace {
 
-// BUG-23: rule/zone mutate routes used to skip RBAC entirely — any logged-in
-// user (even a viewer) could create, update, or delete rules. Centralised
-// helper so the same check is applied uniformly across all mutate paths.
+// Rule/zone mutations are centralized on requireRuleAdmin() so every write
+// path shares the same admin gate.
 std::optional<crow::response> requireRuleAdmin(
         vms::server::VmsApp& app,
         const crow::request& req,

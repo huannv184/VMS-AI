@@ -1,17 +1,7 @@
-// ==============================================================
-// File: src/api/attendance_controller.cpp
-// /api/attendance — daily summary, manual punch, employee +
-// camera-role CRUD, CSV export, health stats.
-//
-// Reads/writes the attendance_events / employees / camera_roles
-// tables introduced alongside AttendanceTracker (src/core).
-//
-// Backward compat:
-//   GET /api/attendance — when attendance_events has no rows for the
-//   requested day, falls back to grouping FACE_RECOGNIZED events the
-//   way the legacy event_controller did, so historical data still
-//   surfaces in the UI during migration.
-// ==============================================================
+// /api/attendance: daily rollups, manual punch, employee/camera-role CRUD,
+// shifts/holidays, CSV export, and writer health. If attendance_events has no
+// rows for a requested day, the read path falls back to legacy face events so
+// migrated deployments still surface historical data.
 
 #include "api/attendance_controller.h"
 
@@ -51,15 +41,8 @@ namespace vms::api {
 
 namespace {
 
-// ── RBAC ─────────────────────────────────────────────────────────────────
-// Attendance mutations (manual punch, employee CRUD, camera role upsert)
-// are admin-only — same lesson as BUG-23 (event_engine_controller).
-// Reads (rollups, employee roster, camera-roles, health) require any
-// authenticated user with ANALYTICS_READ — admin/operator/viewer all qualify,
-// but anonymous network callers are rejected. Without this gate, the entire
-// employee directory + per-day check-in/check-out ledger is leaked to
-// anyone reachable on the API port.
-// AuthConfig.enabled=false (dev mode) bypasses for local development.
+// Attendance writes are admin-only. Read surfaces require ANALYTICS_READ.
+// Dev mode (auth disabled) bypasses these checks for local workflows.
 std::optional<crow::response> requireAttendanceAdmin(
         vms::server::VmsApp& app,
         const crow::request& req,
@@ -84,11 +67,6 @@ std::optional<crow::response> requireAttendanceRead(
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-// Generic 500 builder for the catch-all "DB op failed" path. Never echo
-// QSqlError::text() back to the client — it leaks SQL schema / column
-// names (same anti-pattern as the ~108 sites swept in
-// p0_production_pass_2026_05_10). Server-side log keeps the raw text for
-// debugging; client gets a safe message.
 crow::response createAttendanceDbError(const QSqlQuery& query,
                                        const std::string& origin) {
     LOG_ERROR("[DB] query failed in attendance_controller: {}",
@@ -96,14 +74,71 @@ crow::response createAttendanceDbError(const QSqlQuery& query,
     return ApiUtils::createErrorResponse("Internal database error", 500, origin);
 }
 
-// Sniff for UNIQUE-constraint failure across SQLite + PG drivers so the
-// UI can show a friendly 409 instead of a raw driver string. SQLite emits
-// "UNIQUE constraint failed: …", PG emits "duplicate key value violates
-// unique constraint …".
 bool isUniqueConstraintError(const std::string& message) {
     return message.find("UNIQUE") != std::string::npos ||
            message.find("unique") != std::string::npos ||
            message.find("duplicate key") != std::string::npos;
+}
+
+void bindJsonStringOrNull(QSqlQuery& query,
+                          int index,
+                          const json& body,
+                          const char* key) {
+    if (body.contains(key) && body[key].is_string()) {
+        query.bindValue(index, QString::fromStdString(body[key].get<std::string>()));
+    } else {
+        query.bindValue(index, QVariant(QString()));
+    }
+}
+
+void bindJsonStringOrSqlNull(QSqlQuery& query,
+                             int index,
+                             const json& body,
+                             const char* key) {
+    if (body.contains(key) && body[key].is_string()) {
+        query.bindValue(index, QString::fromStdString(body[key].get<std::string>()));
+    } else {
+        query.bindValue(index, QVariant());
+    }
+}
+
+void bindJsonIntOrNull(QSqlQuery& query,
+                       int index,
+                       const json& body,
+                       const char* key) {
+    if (body.contains(key) && body[key].is_number_integer()) {
+        query.bindValue(index, body[key].get<int>());
+    } else {
+        query.bindValue(index, QVariant(QVariant::Int));
+    }
+}
+
+void bindJsonBoolAsIntOrNull(QSqlQuery& query,
+                             int index,
+                             const json& body,
+                             const char* key) {
+    if (body.contains(key) && body[key].is_boolean()) {
+        query.bindValue(index, body[key].get<bool>() ? 1 : 0);
+    } else {
+        query.bindValue(index, QVariant(QVariant::Int));
+    }
+}
+
+std::optional<crow::response> validateOptionalIntRange(const json& body,
+                                                       const char* key,
+                                                       int min_value,
+                                                       int max_value,
+                                                       const std::string& origin) {
+    if (!body.contains(key)) return std::nullopt;
+    if (!body[key].is_number_integer() ||
+        body[key].get<int>() < min_value ||
+        body[key].get<int>() > max_value) {
+        return ApiUtils::createErrorResponse(
+            std::string(key) + " must be " + std::to_string(min_value) + ".." +
+                std::to_string(max_value),
+            400, origin);
+    }
+    return std::nullopt;
 }
 
 std::string todayLocalDate() {
@@ -673,7 +708,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             res.add_header("Content-Type", "text/csv; charset=utf-8");
             res.add_header("Content-Disposition",
                            "attachment; filename=\"attendance_" + date_str + ".csv\"");
-            res.add_header("Access-Control-Allow-Origin", origin.empty() ? "*" : origin);
+            ApiUtils::applyCors(res, origin);
             return res;
         } catch (const std::exception& e) {
             return ApiUtils::createSafeError(e, 500, origin);
@@ -743,7 +778,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                 QSqlQuery q(db);
                 if (!q.exec("SELECT id, person_id, code, full_name, dept, shift_id, active "
                             "FROM employees ORDER BY id DESC")) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 json arr = json::array();
                 while (q.next()) {
@@ -780,10 +815,11 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
 
             if (!q.exec()) {
                 const std::string msg = q.lastError().text().toStdString();
-                // person_id and code both carry UNIQUE constraints
-                // (db_manager.cpp:885-886). Map to 409 so the UI can render
-                // a field-level "already exists" error instead of a generic
-                // 500. Same pattern as shifts/holidays POST below.
+                // Both person_id and code carry UNIQUE constraints (see
+                // db_manager.cpp:885-886). Without this sniff the operator UI
+                // saw a generic 500 "Internal database error" for a duplicate
+                // person_id or code — same shape the shifts/holidays routes
+                // already handle. 409 lets the form show a field-level error.
                 if (isUniqueConstraintError(msg)) {
                     return ApiUtils::createErrorResponse(
                         "person_id or code already exists", 409, origin);
@@ -823,7 +859,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                 q.prepare("UPDATE employees SET active = 0 WHERE id = ?");
                 q.bindValue(0, id);
                 if (!q.exec()) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 vms::core::AttendanceTracker::getInstance().reloadEmployees();
                 return ApiUtils::createResponse({{"deleted", true}, {"id", id}}, 200, origin);
@@ -838,32 +874,18 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                       " shift_id = COALESCE(?, shift_id), "
                       " active = COALESCE(?, active) "
                       "WHERE id = ?");
-            const auto bindStr = [&](int idx, const char* k) {
-                if (body.contains(k) && body[k].is_string()) {
-                    q.bindValue(idx, QString::fromStdString(body[k].get<std::string>()));
-                } else {
-                    q.bindValue(idx, QVariant(QString()));
-                }
-            };
-            bindStr(0, "code");
-            bindStr(1, "full_name");
-            bindStr(2, "dept");
-            if (body.contains("shift_id") && body["shift_id"].is_number_integer()) {
-                q.bindValue(3, body["shift_id"].get<int>());
-            } else {
-                q.bindValue(3, QVariant(QVariant::Int));
-            }
-            if (body.contains("active") && body["active"].is_boolean()) {
-                q.bindValue(4, body["active"].get<bool>() ? 1 : 0);
-            } else {
-                q.bindValue(4, QVariant(QVariant::Int));
-            }
+            bindJsonStringOrNull(q, 0, body, "code");
+            bindJsonStringOrNull(q, 1, body, "full_name");
+            bindJsonStringOrNull(q, 2, body, "dept");
+            bindJsonIntOrNull(q, 3, body, "shift_id");
+            bindJsonBoolAsIntOrNull(q, 4, body, "active");
             q.bindValue(5, id);
 
             if (!q.exec()) {
                 const std::string msg = q.lastError().text().toStdString();
-                // Only `code` is editable here; person_id is anchored to the
-                // face DB pairing and not in the SET clause. Mirrors POST.
+                // Only `code` is in the SET clause that can trip UNIQUE here —
+                // person_id is not editable via PUT (face DB pairing is
+                // anchored, not renamed). Mirrors POST handler one level up.
                 if (isUniqueConstraintError(msg)) {
                     return ApiUtils::createErrorResponse(
                         "code already exists", 409, origin);
@@ -901,7 +923,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             if (req.method == crow::HTTPMethod::Get) {
                 QSqlQuery q(db);
                 if (!q.exec("SELECT camera_id, role FROM camera_roles ORDER BY camera_id ASC")) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 json arr = json::array();
                 while (q.next()) {
@@ -931,7 +953,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             q.bindValue(0, camera_id);
             q.bindValue(1, QString::fromStdString(role));
             if (!q.exec()) {
-                return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                return createAttendanceDbError(q, origin);
             }
             vms::core::AttendanceTracker::getInstance().reloadCameraRoles();
             return ApiUtils::createResponse({{"camera_id", camera_id}, {"role", role}}, 200, origin);
@@ -984,7 +1006,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                               "FROM shifts WHERE active = 1 ORDER BY name ASC");
                 }
                 if (!q.exec()) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 json arr = json::array();
                 while (q.next()) {
@@ -1069,12 +1091,10 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                 const std::string msg = q.lastError().text().toStdString();
                 // Sniff for UNIQUE-constraint failure across SQLite + PG so the
                 // UI can show a friendly 409 instead of a raw driver string.
-                if (msg.find("UNIQUE") != std::string::npos ||
-                    msg.find("unique") != std::string::npos ||
-                    msg.find("duplicate key") != std::string::npos) {
+                if (isUniqueConstraintError(msg)) {
                     return ApiUtils::createErrorResponse("shift name already exists", 409, origin);
                 }
-                return ApiUtils::createErrorResponse(msg, 500, origin);
+                return createAttendanceDbError(q, origin);
             }
 
             const int new_id = q.lastInsertId().toInt();
@@ -1114,7 +1134,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                           "FROM shifts WHERE id = ?");
                 q.bindValue(0, id);
                 if (!q.exec()) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 if (!q.next()) {
                     return ApiUtils::createErrorResponse("shift not found", 404, origin);
@@ -1141,7 +1161,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                 q.prepare("UPDATE shifts SET active = 0 WHERE id = ?");
                 q.bindValue(0, id);
                 if (!q.exec()) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 if (q.numRowsAffected() == 0) {
                     return ApiUtils::createErrorResponse("shift not found", 404, origin);
@@ -1193,19 +1213,9 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
             // ot_max) only fires when both are present in the body — a PUT
             // changing only ot_min could otherwise spuriously fail against
             // the existing-row ot_max we don't have in scope here.
-            const auto checkBounded = [&](const char* k, int lo, int hi) -> std::optional<crow::response> {
-                if (!body.contains(k)) return std::nullopt;
-                if (!body[k].is_number_integer() ||
-                    body[k].get<int>() < lo || body[k].get<int>() > hi) {
-                    return ApiUtils::createErrorResponse(
-                        std::string(k) + " must be " + std::to_string(lo) + ".." + std::to_string(hi),
-                        400, origin);
-                }
-                return std::nullopt;
-            };
-            if (auto err = checkBounded("ot_grace_min",   0,  720)) return std::move(*err);
-            if (auto err = checkBounded("ot_min_minutes", 0, 1440)) return std::move(*err);
-            if (auto err = checkBounded("ot_max_minutes", 0, 1440)) return std::move(*err);
+            if (auto err = validateOptionalIntRange(body, "ot_grace_min",   0,  720, origin)) return std::move(*err);
+            if (auto err = validateOptionalIntRange(body, "ot_min_minutes", 0, 1440, origin)) return std::move(*err);
+            if (auto err = validateOptionalIntRange(body, "ot_max_minutes", 0, 1440, origin)) return std::move(*err);
             if (body.contains("ot_min_minutes") && body.contains("ot_max_minutes")) {
                 const int omin = body["ot_min_minutes"].get<int>();
                 const int omax = body["ot_max_minutes"].get<int>();
@@ -1227,43 +1237,23 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                       " ot_max_minutes = COALESCE(?, ot_max_minutes), "
                       " active = COALESCE(?, active) "
                       "WHERE id = ?");
-            const auto bindStrOrNull = [&](int idx, const char* k) {
-                if (body.contains(k) && body[k].is_string()) {
-                    q.bindValue(idx, QString::fromStdString(body[k].get<std::string>()));
-                } else {
-                    q.bindValue(idx, QVariant(QString()));
-                }
-            };
-            const auto bindIntOrNull = [&](int idx, const char* k) {
-                if (body.contains(k) && body[k].is_number_integer()) {
-                    q.bindValue(idx, body[k].get<int>());
-                } else {
-                    q.bindValue(idx, QVariant(QVariant::Int));
-                }
-            };
-            bindStrOrNull(0, "name");
-            bindStrOrNull(1, "start_time_hm");
-            bindStrOrNull(2, "end_time_hm");
-            bindIntOrNull(3, "late_threshold_min");
-            bindIntOrNull(4, "grace_min");
-            bindIntOrNull(5, "ot_grace_min");
-            bindIntOrNull(6, "ot_min_minutes");
-            bindIntOrNull(7, "ot_max_minutes");
-            if (body.contains("active") && body["active"].is_boolean()) {
-                q.bindValue(8, body["active"].get<bool>() ? 1 : 0);
-            } else {
-                q.bindValue(8, QVariant(QVariant::Int));
-            }
+            bindJsonStringOrNull(q, 0, body, "name");
+            bindJsonStringOrNull(q, 1, body, "start_time_hm");
+            bindJsonStringOrNull(q, 2, body, "end_time_hm");
+            bindJsonIntOrNull(q, 3, body, "late_threshold_min");
+            bindJsonIntOrNull(q, 4, body, "grace_min");
+            bindJsonIntOrNull(q, 5, body, "ot_grace_min");
+            bindJsonIntOrNull(q, 6, body, "ot_min_minutes");
+            bindJsonIntOrNull(q, 7, body, "ot_max_minutes");
+            bindJsonBoolAsIntOrNull(q, 8, body, "active");
             q.bindValue(9, id);
 
             if (!q.exec()) {
                 const std::string msg = q.lastError().text().toStdString();
-                if (msg.find("UNIQUE") != std::string::npos ||
-                    msg.find("unique") != std::string::npos ||
-                    msg.find("duplicate key") != std::string::npos) {
+                if (isUniqueConstraintError(msg)) {
                     return ApiUtils::createErrorResponse("shift name already exists", 409, origin);
                 }
-                return ApiUtils::createErrorResponse(msg, 500, origin);
+                return createAttendanceDbError(q, origin);
             }
             if (q.numRowsAffected() == 0) {
                 return ApiUtils::createErrorResponse("shift not found", 404, origin);
@@ -1323,7 +1313,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                               "FROM holidays ORDER BY date ASC");
                 }
                 if (!q.exec()) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 json arr = json::array();
                 while (q.next()) {
@@ -1363,12 +1353,10 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
 
             if (!q.exec()) {
                 const std::string msg = q.lastError().text().toStdString();
-                if (msg.find("UNIQUE") != std::string::npos ||
-                    msg.find("unique") != std::string::npos ||
-                    msg.find("duplicate key") != std::string::npos) {
+                if (isUniqueConstraintError(msg)) {
                     return ApiUtils::createErrorResponse("holiday on this date already exists", 409, origin);
                 }
-                return ApiUtils::createErrorResponse(msg, 500, origin);
+                return createAttendanceDbError(q, origin);
             }
 
             const int new_id = q.lastInsertId().toInt();
@@ -1409,7 +1397,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                 q.prepare("SELECT id, date, name, description FROM holidays WHERE id = ?");
                 q.bindValue(0, id);
                 if (!q.exec()) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 if (!q.next()) {
                     return ApiUtils::createErrorResponse("holiday not found", 404, origin);
@@ -1427,7 +1415,7 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                 q.prepare("DELETE FROM holidays WHERE id = ?");
                 q.bindValue(0, id);
                 if (!q.exec()) {
-                    return ApiUtils::createErrorResponse(q.lastError().text().toStdString(), 500, origin);
+                    return createAttendanceDbError(q, origin);
                 }
                 if (q.numRowsAffected() == 0) {
                     return ApiUtils::createErrorResponse("holiday not found", 404, origin);
@@ -1463,19 +1451,17 @@ void AttendanceController::registerRoutes(vms::server::VmsApp& app) {
                 "  name = COALESCE(?, name), "
                 "  description = COALESCE(?, description) "
                 "WHERE id = ?");
-            q.bindValue(0, body.contains("date") ? QVariant(QString::fromStdString(body["date"].get<std::string>())) : QVariant());
-            q.bindValue(1, body.contains("name") ? QVariant(QString::fromStdString(body["name"].get<std::string>())) : QVariant());
-            q.bindValue(2, body.contains("description") ? QVariant(QString::fromStdString(body["description"].get<std::string>())) : QVariant());
+            bindJsonStringOrSqlNull(q, 0, body, "date");
+            bindJsonStringOrSqlNull(q, 1, body, "name");
+            bindJsonStringOrSqlNull(q, 2, body, "description");
             q.bindValue(3, id);
 
             if (!q.exec()) {
                 const std::string msg = q.lastError().text().toStdString();
-                if (msg.find("UNIQUE") != std::string::npos ||
-                    msg.find("unique") != std::string::npos ||
-                    msg.find("duplicate key") != std::string::npos) {
+                if (isUniqueConstraintError(msg)) {
                     return ApiUtils::createErrorResponse("another holiday already exists on this date", 409, origin);
                 }
-                return ApiUtils::createErrorResponse(msg, 500, origin);
+                return createAttendanceDbError(q, origin);
             }
             if (q.numRowsAffected() == 0) {
                 return ApiUtils::createErrorResponse("holiday not found", 404, origin);

@@ -230,15 +230,9 @@ static json enrichEvent(const Event& evt) {
     return j;
 }
 
-// BUG-EVENT-AUTH-01 (audit 2026-05-11, Batch C): pre-fix all 7 handlers
-// captured `[]` and bypassed AuthMiddleware. fire-test POST could be used to
-// spawn fake INTRUSION/FIRE/etc events unauth'd → SMTP/SMS/alarm-relay
-// fan-out (BUG-ALERT-02 followup is now actively wired). The 6 read-side
-// routes leak event PII (description text + metadata + snapshot paths).
-// Fix: gate fire-test on SYSTEM_ADMIN + audit log; events GET/list/stats/
-// timeline on EVENT_READ; analytics on ANALYTICS_READ (aggregate slice);
-// event video on RECORDING_READ (video content classification); DELETE on
-// EVENT_DELETE + audit log. Same shape as SEC-005 / BUG-ANPR-AUTH-01.
+// Event routes expose alert metadata, snapshots, and playback. Fire-test is
+// SYSTEM_ADMIN-only with audit log; read surfaces split across EVENT_READ,
+// ANALYTICS_READ, and RECORDING_READ; delete stays on EVENT_DELETE.
 void EventController::registerRoutes(vms::server::VmsApp& app) {
 
     // =========================================================================
@@ -525,8 +519,7 @@ void EventController::registerRoutes(vms::server::VmsApp& app) {
             crow::response res;
             res.set_static_file_info(video_path);
             res.set_header("Content-Type", "video/mp4");
-            std::string allowed_origin = origin.empty() ? "*" : origin;
-            res.set_header("Access-Control-Allow-Origin", allowed_origin);
+            ApiUtils::applyCors(res, origin);
             return res;
 
         } catch (const std::exception& e) {

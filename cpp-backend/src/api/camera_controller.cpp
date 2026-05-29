@@ -1,7 +1,6 @@
 #include "../../include/api/camera_controller.h"
 #include "core/camera_manager.h"
 #include "core/camera_pipeline_manager.h"
-#include "core/snapshot_manager.h"
 #include "core/camera_event_service.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include "utils/api_utils.h"
@@ -24,11 +23,9 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include <memory>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 #include <crow.h>
-#include "core/user.h"
 #include "core/camera_types.h"
 #include "utils/csv_parser.hpp"
 #include <sstream>
@@ -90,45 +87,102 @@ std::optional<std::string> readOptionalString(const json& body, const char* key)
     return trimCopy(body[key].get<std::string>());
 }
 
+std::optional<std::string> assignValidatedString(const json& body,
+                                                 const char* key,
+                                                 std::string& target,
+                                                 size_t max_length,
+                                                 const char* invalid_message) {
+    auto value = readOptionalString(body, key);
+    target = value.value_or("");
+    if (!target.empty() && !vms::Validator::isValidString(target, max_length)) {
+        return invalid_message;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> assignValidatedRtsp(const json& body,
+                                               const char* key,
+                                               std::string& target,
+                                               bool required,
+                                               const char* missing_message,
+                                               const char* invalid_message) {
+    auto value = readOptionalString(body, key);
+    if (required && !value.has_value()) {
+        return missing_message;
+    }
+    if (!value.has_value()) {
+        return std::nullopt;
+    }
+    if (value->empty()) {
+        target.clear();
+        return std::nullopt;
+    }
+    auto normalized = vms::Validator::normalizeRtspUrl(*value);
+    if (!normalized.has_value()) {
+        return invalid_message;
+    }
+    target = normalized.value();
+    return std::nullopt;
+}
+
+void appendCameraRuntimeFields(json& target,
+                               const vms::core::CameraStats& stats,
+                               bool camera_active,
+                               const char* stopped_status) {
+    target["fps"] = stats.is_running ? stats.fps : 0;
+    target["restart_count"] = stats.restart_count;
+    target["last_frame_time"] = stats.last_frame_ts;
+    target["status"] = stats.is_running ? "online" : (camera_active ? stopped_status : "inactive");
+    target["bitrate_kbps"] = stats.is_running ? static_cast<int>(stats.fps * 150) : 0;
+
+    if (!stats.is_running) {
+        target["cpu_usage_percent"] = 0;
+    } else if (stats.cpu_usage_percent < 0) {
+        target["cpu_usage_percent"] = nullptr;
+    } else {
+        target["cpu_usage_percent"] = std::round(stats.cpu_usage_percent * 10.0) / 10.0;
+    }
+
+    target["uptime_seconds"] = stats.is_running ? stats.last_frame_ts : 0;
+}
+
+void appendUnavailableCameraRuntimeFields(json& target) {
+    target["fps"] = 0;
+    target["restart_count"] = 0;
+    target["last_frame_time"] = 0;
+    target["status"] = "error";
+    target["bitrate_kbps"] = 0;
+    target["cpu_usage_percent"] = nullptr;
+    target["uptime_seconds"] = 0;
+}
+
 std::optional<std::string> validateCameraPayload(vms::Camera& camera, const json& body, bool is_update) {
     if (!is_update || body.contains("name")) {
-        auto name = readOptionalString(body, "name");
-        camera.name = name.value_or("");
-        if (!vms::Validator::isValidString(camera.name, 120)) {
-            return "Invalid camera name";
+        if (auto err = assignValidatedString(body, "name", camera.name, 120, "Invalid camera name")) {
+            return err;
         }
     }
 
     if (!is_update || body.contains("rtsp_url")) {
-        auto rtsp_url = readOptionalString(body, "rtsp_url");
-        if (!rtsp_url.has_value()) {
-            return "Missing required field: rtsp_url";
+        if (auto err = assignValidatedRtsp(body, "rtsp_url", camera.rtsp_url, true,
+                                           "Missing required field: rtsp_url",
+                                           "Invalid RTSP URL")) {
+            return err;
         }
-        auto normalized = vms::Validator::normalizeRtspUrl(rtsp_url.value());
-        if (!normalized.has_value()) {
-            return "Invalid RTSP URL";
-        }
-        camera.rtsp_url = normalized.value();
     }
 
     if (body.contains("sub_stream_url")) {
-        auto sub_stream_url = readOptionalString(body, "sub_stream_url");
-        if (sub_stream_url.has_value() && !sub_stream_url->empty()) {
-            auto normalized = vms::Validator::normalizeRtspUrl(sub_stream_url.value());
-            if (!normalized.has_value()) {
-                return "Invalid sub stream RTSP URL";
-            }
-            camera.sub_stream_url = normalized.value();
-        } else {
-            camera.sub_stream_url.clear();
+        if (auto err = assignValidatedRtsp(body, "sub_stream_url", camera.sub_stream_url, false,
+                                           "",
+                                           "Invalid sub stream RTSP URL")) {
+            return err;
         }
     }
 
     if (body.contains("description")) {
-        auto description = readOptionalString(body, "description");
-        camera.description = description.value_or("");
-        if (!camera.description.empty() && !vms::Validator::isValidString(camera.description, 500)) {
-            return "Invalid camera description";
+        if (auto err = assignValidatedString(body, "description", camera.description, 500,
+                                             "Invalid camera description")) {
+            return err;
         }
     }
 
@@ -217,46 +271,20 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 json cam_list = json::array();
                 for (const auto& cam : cameras) {
                     json c = cam;
-                    vms::core::CameraStats stats;
                     
-                    // Get Runtime Stats
                     try {
-                        stats = pipeline_mgr.getCameraStats(cam.id);
-                        c["fps"] = stats.is_running ? stats.fps : 0;
-                        c["restart_count"] = stats.restart_count;
-                        c["last_frame_time"] = stats.last_frame_ts;
-                        
-                        if (stats.is_running) {
-                            c["status"] = "online";
-                        } else {
-                            // Nếu camera được bật (is_active) nhưng không lên hình (is_running=false) -> ERROR
-                            c["status"] = cam.is_active ? "error" : "inactive";
-                        }
+                        appendCameraRuntimeFields(
+                            c,
+                            pipeline_mgr.getCameraStats(cam.id),
+                            cam.is_active,
+                            "error");
                     } catch (const std::exception& e) {
                         LOG_ERROR("Error getting stats for camera {}: {}", cam.id, e.what());
-                        c["fps"] = 0;
-                        c["status"] = "error";
+                        appendUnavailableCameraRuntimeFields(c);
                     }
 
                     c["resolution"] = "1920x1080"; 
                     c["codec"] = "H.264";
-                    
-                    // Detailed health/telemetry (Requirement 1.6)
-                    // Reuse the stats already fetched above so one bad camera does not
-                    // fail the entire /api/cameras response.
-                    c["bitrate_kbps"] = stats.is_running ? static_cast<int>(stats.fps * 150) : 0;
-                    // Per-pipeline CPU% sampled at 1 Hz by globalWatchdogTick
-                    // (FFmpeg child + ai_worker, normalised to host CPU).
-                    // -1 = "not yet sampled" — emit null so frontend can fallback.
-                    if (!stats.is_running) {
-                        c["cpu_usage_percent"] = 0;
-                    } else if (stats.cpu_usage_percent < 0) {
-                        c["cpu_usage_percent"] = nullptr;
-                    } else {
-                        c["cpu_usage_percent"] = std::round(stats.cpu_usage_percent * 10.0) / 10.0;
-                    }
-                    c["uptime_seconds"] = stats.is_running ? stats.last_frame_ts : 0;
-                    
                     cam_list.push_back(c);
                 }
 
@@ -320,10 +348,10 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                         LOG_INFO("[CameraController] Granted camera {} access to user {}", camera.id, caller_id);
                     }
 
-                    // FIX: Auto-start pipeline after camera creation (PUT handler did this, POST didn't)
-                    json response_json = camera;
-                    auto& pipeline_mgr = vms::core::CameraPipelineManager::getInstance();
-                    if (camera.is_active) {
+                // Keep POST aligned with update flow: active cameras should boot immediately.
+                json response_json = camera;
+                auto& pipeline_mgr = vms::core::CameraPipelineManager::getInstance();
+                if (camera.is_active) {
                         if (pipeline_mgr.startPipeline(camera.id, camera.rtsp_url)) {
                             LOG_INFO("[CameraController] Pipeline started for new camera {}", camera.id);
                             response_json["pipeline_status"] = "started";
@@ -339,7 +367,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 }
 
                 LOG_ERROR("[CameraController] addCamera() returned false for name='{}'", camera.name);
-                return ApiUtils::createErrorResponse("Failed to add camera", 500, origin);
+                return ApiUtils::createErrorResponse("Failed to create camera", 500, origin);
             } catch (const json::exception& e) {
                 return ApiUtils::createErrorResponse(std::string("Invalid JSON: ") + e.what(), 400, origin);
             } catch (const std::exception& e) {
@@ -462,7 +490,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createSafeError(e, 500, origin);
             } catch (...) {
                 LOG_ERROR("API: Unknown exception deleting camera {}", id);
-                return ApiUtils::createErrorResponse("Unknown Server Error", 500, origin);
+                return ApiUtils::createErrorResponse("Internal server error", 500, origin);
             }
         }
 
@@ -585,11 +613,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             res.code = 200;
             res.set_header("Content-Type", "image/jpeg");
             res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-            std::string allowed_origin = origin.empty() ? "*" : origin;
-            res.set_header("Access-Control-Allow-Origin", allowed_origin);
-            if (allowed_origin != "*") {
-                res.set_header("Access-Control-Allow-Credentials", "true");
-            }
+            ApiUtils::applyCors(res, origin);
             res.body.assign(frame_opt->begin(), frame_opt->end());
             return res;
         } catch (const std::exception& e) {
@@ -698,7 +722,7 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
                 if (cam_opt) return ApiUtils::createResponse(cam_opt.value(), 200, origin);
                 return ApiUtils::createResponse(json::object(), 200, origin);
             }
-            return ApiUtils::createErrorResponse("Failed to refresh advanced config.", 500, origin);
+            return ApiUtils::createErrorResponse("Failed to refresh advanced config", 500, origin);
         } catch (const std::exception& e) { return ApiUtils::createSafeError(e, 500, origin); }
     });
 
@@ -720,25 +744,12 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
             json stats_json;
             try {
                 auto stats = pipeline_mgr.getCameraStats(id);
-                stats_json["fps"] = stats.is_running ? stats.fps : 0;
-                stats_json["restart_count"] = stats.restart_count;
-                stats_json["last_frame_time"] = stats.last_frame_ts;
+                appendCameraRuntimeFields(stats_json, stats, camera_opt.value().is_active, "offline");
                 stats_json["is_running"] = stats.is_running;
-                stats_json["status"] = stats.is_running ? "online" : (camera_opt.value().is_active ? "offline" : "inactive");
-                
-                // Detailed telemetry — FIX BUG-001: Real estimates instead of random
-                stats_json["bitrate_kbps"] = stats.is_running ? static_cast<int>(stats.fps * 150) : 0;
-                if (!stats.is_running) {
-                    stats_json["cpu_usage_percent"] = 0;
-                } else if (stats.cpu_usage_percent < 0) {
-                    stats_json["cpu_usage_percent"] = nullptr;
-                } else {
-                    stats_json["cpu_usage_percent"] = std::round(stats.cpu_usage_percent * 10.0) / 10.0;
-                }
-                stats_json["uptime_seconds"] = stats.is_running ? stats.last_frame_ts : 0;
 
             } catch (...) {
-                stats_json["status"] = "error";
+                appendUnavailableCameraRuntimeFields(stats_json);
+                stats_json["is_running"] = false;
             }
             stats_json["id"] = id;
             stats_json["resolution"] = "1920x1080";
@@ -746,13 +757,9 @@ void CameraController::registerRoutes(vms::server::VmsApp& app) {
         } catch (const std::exception& e) { return ApiUtils::createSafeError(e, 500, origin); }
     });
 
-    // GET /api/cameras/:id/event_subscription_status — health snapshot of the
-    // hardware-event subscription (ONVIF PullPoint / Axis eventfeed / Dahua
-    // attach / Hanwha poll / Hikvision adapter). Returns state, last event
-    // timestamp, total events received, reconnect count, etc. so operators
-    // can distinguish "no events because scene is quiet" from "subscription
-    // wedged / brand stub / auth failed". Followup from brand_events sprint
-    // (2026-05-12).
+    // GET /api/cameras/:id/event_subscription_status — current hardware-event
+    // subscription health so operators can tell "quiet scene" from
+    // "subscription/auth/backend problem".
     CROW_ROUTE(app, "/api/cameras/<int>/event_subscription_status")
     .methods(crow::HTTPMethod::GET, crow::HTTPMethod::OPTIONS)
     ([&app](const crow::request& req, int id) {

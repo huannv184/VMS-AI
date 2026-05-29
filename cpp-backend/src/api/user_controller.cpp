@@ -438,13 +438,13 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
         database::UserRepository repo;
         if (req.method == crow::HTTPMethod::Get) {
             auto u = repo.getUserById(id);
-            if (!u) return ApiUtils::createErrorResponse("Not found", 404, origin);
+            if (!u) return ApiUtils::createErrorResponse("User not found", 404, origin);
             return ApiUtils::createResponse(u->toJson(), 200, origin);
         }
 
         if (req.method == crow::HTTPMethod::Put) {
             auto u_opt = repo.getUserById(id);
-            if (!u_opt) return ApiUtils::createErrorResponse("Not found", 404, origin);
+            if (!u_opt) return ApiUtils::createErrorResponse("User not found", 404, origin);
             auto body = json::parse(req.body);
             if (body.contains("full_name")) u_opt->full_name = body["full_name"];
             if (body.contains("role_id")) u_opt->role_id = body["role_id"];
@@ -464,7 +464,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createResponse(json::object(), 200, origin);
             }
         }
-        return ApiUtils::createErrorResponse("Operation failed", 500, origin);
+        return ApiUtils::createErrorResponse("Failed to update or delete user", 500, origin);
     });
 
     // POST /api/users/change-password
@@ -516,7 +516,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createResponse(json::object(), 200, origin);
             }
         } catch (...) {}
-        return ApiUtils::createErrorResponse("Failed", 500, origin);
+        return ApiUtils::createErrorResponse("Failed to change password", 500, origin);
     });
 
     // POST /api/users/<int>/reset-password
@@ -554,7 +554,7 @@ void UserController::registerRoutes(vms::server::VmsApp& app) {
                 return ApiUtils::createResponse(json::object(), 200, origin);
             }
         } catch (...) {}
-        return ApiUtils::createErrorResponse("Failed", 500, origin);
+        return ApiUtils::createErrorResponse("Failed to reset password", 500, origin);
     });
 
     // ============================================================================

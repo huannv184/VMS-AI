@@ -16,12 +16,9 @@ using json = nlohmann::json;
 namespace vms {
 namespace api {
 
-// BUG-TRACK-AUTH-01 (audit 2026-05-11, Batch C): 4 tracking handlers
-// pre-fix captured `[]`. Live track stream + tracking config + pipeline-reset
-// were unauth'd. Config write changes detector behaviour persistently; reset
-// kills + respawns the ai_worker subprocess (operational impact). Fix:
-// reads on CAMERA_READ / ANALYTICS_READ; config write + reset on
-// SYSTEM_ADMIN with audit log.
+// Tracking routes expose live object state and detector config. Read paths use
+// CAMERA_READ / ANALYTICS_READ; config mutation and pipeline reset stay on
+// SYSTEM_ADMIN with audit log coverage.
 void TrackingController::registerRoutes(vms::server::VmsApp& app) {
     // GET active tracks
     CROW_ROUTE(app, "/api/tracking/cameras/<int>")

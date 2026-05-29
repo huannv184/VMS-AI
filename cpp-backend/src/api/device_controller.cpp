@@ -10,10 +10,8 @@
 #include "utils/validator.h"
 #include <nlohmann/json.hpp>
 #include <QSqlQuery>
-#include <QSqlError>
 #include <QSqlRecord>
 #include <QVariant>
-#include <ctime>
 #include <optional>
 #include <unordered_set>
 
@@ -193,7 +191,7 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
 
             auto& db_mgr = database::DbManager::getInstance();
             QSqlDatabase db = db_mgr.getThreadConnection();
-            if (!db.isOpen()) return ApiUtils::createErrorResponse("Database not available", 500, origin);
+            if (!db.isOpen()) return ApiUtils::createErrorResponse("Database unavailable", 500, origin);
 
             QSqlQuery query(db);
             // strftime('%s','now') is SQLite-only — go through sqlNowEpoch()
@@ -221,7 +219,7 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             query.bindValue(8, channel_count);
 
             if (!query.exec()) {
-                return ApiUtils::createErrorResponse("Failed to insert device", 500, origin);
+                return ApiUtils::createErrorResponse("Failed to create device", 500, origin);
             }
 
             int new_id = query.lastInsertId().toInt();
@@ -255,7 +253,7 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
             auto body = json::parse(req.body);
             auto& db_mgr = database::DbManager::getInstance();
             QSqlDatabase db = db_mgr.getThreadConnection();
-            if (!db.isOpen()) return ApiUtils::createErrorResponse("Database not available", 500, origin);
+            if (!db.isOpen()) return ApiUtils::createErrorResponse("Database unavailable", 500, origin);
 
             // BUG-C4 FIX: queryDevices() now strips the password column, so we
             // can no longer pull the existing password through it. Use the body
@@ -362,7 +360,7 @@ void DeviceController::registerRoutes(vms::server::VmsApp& app) {
         if (auto err = ApiUtils::requirePermission(ctx, Permission::DEVICE_WRITE, origin)) return std::move(*err);
 
         QSqlDatabase db = database::DbManager::getInstance().getThreadConnection();
-        if (!db.isOpen()) return ApiUtils::createErrorResponse("Database not available", 500, origin);
+        if (!db.isOpen()) return ApiUtils::createErrorResponse("Database unavailable", 500, origin);
 
         QSqlQuery del_query(db);
         del_query.prepare("DELETE FROM devices WHERE id = ?");

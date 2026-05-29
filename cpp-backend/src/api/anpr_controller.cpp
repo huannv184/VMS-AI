@@ -13,17 +13,8 @@ namespace api {
 
 void ANPRController::registerRoutes(vms::server::VmsApp& app) {
 
-    // BUG-ANPR-AUTH-01 (audit 2026-05-08): pre-fix all five route variants
-    // captured `[]` and never read AuthMiddleware context. The plate table
-    // (PII: vehicle plate × camera × timestamp) was readable, writable, and
-    // wipeable by any TCP client that could reach the API port. Same shape as
-    // SEC-003/004 (devices/sites zero RBAC, 2026-05-02) and SEC-008/009/010
-    // (analytics modules unauth GETs, 2026-05-03). Fix: capture `[&app]`,
-    // gate GET on ANALYTICS_READ (matches the rest of analytics surface),
-    // gate POST/DELETE on SYSTEM_ADMIN (mutating the historical plate ledger
-    // is an admin action — the real population path is the AI worker's
-    // detection pipeline, not manual operator entry), audit-log the
-    // mutating ops.
+    // Plate history is an analytics/PII surface. GET stays on ANALYTICS_READ;
+    // manual POST/DELETE are SYSTEM_ADMIN-only and audited.
 
     // GET & POST plates
     CROW_ROUTE(app, "/api/anpr/plates")

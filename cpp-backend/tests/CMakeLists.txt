@@ -113,6 +113,35 @@ target_link_libraries(test_config_validation PRIVATE
     yaml-cpp::yaml-cpp)
 add_test(NAME ConfigValidationTests COMMAND test_config_validation)
 
+# ── ApiUtils safe-error tests (no exception text leak to clients) ───────────
+# Regression target: pre-fix ~108 catch-blocks across the controllers used
+# `createErrorResponse(e.what(), ...)` which leaked SQL column names, libcurl
+# upstream URLs, and OpenCV stack-y messages to the client. createSafeError
+# logs e.what() server-side and returns a generic message. This test pins
+# that the generic message is the only thing the client sees.
+#
+# Links REAL config.cpp + logger.cpp because ApiUtils::applyCors() reads
+# Config::getInstance().getCorsConfig() (response is run through CORS even
+# on the error path). Config defaults from config.h are enough; we don't
+# call loadFromFile in this test.
+add_executable(test_api_utils_safe_error
+    test_api_utils_safe_error.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/config.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/logger.cpp)
+target_include_directories(test_api_utils_safe_error PRIVATE
+    ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_api_utils_safe_error PRIVATE
+    GTest::gtest GTest::gtest_main
+    Crow::Crow
+    Boost::system
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
+    yaml-cpp::yaml-cpp)
+if(WIN32)
+    target_link_libraries(test_api_utils_safe_error PRIVATE Ws2_32)
+endif()
+add_test(NAME ApiUtilsSafeErrorTests COMMAND test_api_utils_safe_error)
+
 # ── jwt purpose isolation tests (SEC-002 regression) ──────────────────────────
 # Links the REAL jwt_utils.cpp + config.cpp + logger.cpp so the test fails if
 # someone refactors away the token_use claim or accepts wrong-purpose tokens.
@@ -350,6 +379,7 @@ if(WIN32)
         MetricsAuthTests
         ConfigValidationTests
         CsvEscapeTests
+        ApiUtilsSafeErrorTests
         DbPortabilityTests
         AttendanceDedupTests
         AttendanceShiftTests

@@ -2,7 +2,6 @@
 #include "database/audit_repository.h"
 #include "database/site_repository.h"
 #include "middleware/auth_middleware.h"
-#include "server/vms_app.h"
 #include "utils/api_utils.h"
 #include <nlohmann/json.hpp>
 

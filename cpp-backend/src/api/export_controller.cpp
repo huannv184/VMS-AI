@@ -24,11 +24,8 @@ namespace api {
 
 namespace {
 
-// BUG-EX-LEAK-01 (audit 2026-05-09): pre-fix exportJobs grew without bound.
-// Every accepted /api/export/create permanently inserted a job entry — no
-// cleanup on success or failure, plus the matching exports/<jobId>.<format>
-// file leaked on disk. Same shape as BUG-SYN-LEAK-01. Cap the in-memory map
-// at kMaxExportJobs and evict old finished entries on insert.
+// Export jobs are bounded in memory and pruned after completion so stale job
+// metadata and output files do not accumulate indefinitely.
 constexpr size_t kMaxExportJobs = 200;
 constexpr int    kMaxExportJobAgeSeconds = 24 * 3600;  // 24h
 
@@ -225,13 +222,8 @@ void ExportController::registerRoutes(vms::server::VmsApp& app, vms::middleware:
     (void)auth;  // legacy parameter — auth now goes via app.get_context
     LOG_INFO("Registering export routes...");
 
-    // BUG-EX-RBAC-01 (audit 2026-05-09): pre-fix all 3 routes used
-    // `auth.validate(req)` only — viewer-tier users could spawn FFmpeg
-    // jobs (CPU-expensive, share a 2-worker queue) and download other users'
-    // exports if they could guess/learn the jobId. Same SEC-005 shape as
-    // synopsis pre-fix. Switch to requirePermission(RECORDING_READ) — anyone
-    // who can read recordings can export them; the audit log tells us who
-    // exported what for forensic purposes.
+    // Export creation/download is permission-gated on RECORDING_READ and
+    // remains auditable because jobs can consume CPU and expose recording data.
 
     // POST /api/export/create - Create export job
     CROW_ROUTE(app, "/api/export/create")
@@ -390,7 +382,7 @@ void ExportController::registerRoutes(vms::server::VmsApp& app, vms::middleware:
         res.set_static_file_info(outputPath);
         res.set_header("Content-Type", "video/mp4");
         res.set_header("Content-Disposition", "attachment; filename=\"" + jobId + ".mp4\"");
-        res.set_header("Access-Control-Allow-Origin", origin);
+        ApiUtils::applyCors(res, origin);
 
         return res;
     });
