@@ -82,7 +82,6 @@ const useWebSocket = () => {
     disconnect();
 
     const wsUrl = await resolveWsUrl();
-    console.log('[WS] URL:', wsUrl);
     socket.current = new WebSocket(wsUrl);
 
     const handleMessage = (msg) => {
@@ -214,7 +213,6 @@ const useWebSocket = () => {
       // 1008 = Policy Violation (auth rejected); also check authRejected flag set by AUTH_FAILED message
       const authDenied = event.code === 1008 || authRejected.current;
       if (!authDenied && !authRejected.current) {
-        console.log('[WS] scheduling reconnect in 5s');
         reconnectRef.current = setTimeout(() => connectRef.current?.(), 5000);
       }
     };

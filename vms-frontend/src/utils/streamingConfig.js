@@ -32,7 +32,6 @@ export async function resolveWsUrl() {
             : window.location.hostname;
           const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
           const url = `${wsProtocol}//${apiHost}:${port}/ws`;
-          console.log('[streamingConfig] WS URL resolved from backend:', url);
           _resolvedUrl = url;
           return url;
         }

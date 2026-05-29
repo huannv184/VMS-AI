@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
+option(VMS_BUILD_AI_WORKER "Build the TensorRT/CUDA ai_worker_v2 target" ON)
+
 # Dependencies
 find_package(Crow CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -144,11 +146,13 @@ target_compile_definitions(vms_backend PRIVATE VMS_HAS_ARGON2)
 
 # Force re-configure to pick up moved headers
 
-# AI Worker Executable (separate target, requires TensorRT + CUDA)
-add_subdirectory(src/ai_worker)
-
-# Reuse shared AI inference implementation in backend runtime.
-target_link_libraries(vms_backend PRIVATE inference)
+# AI worker + shared inference stack. CI can disable the worker path on hosted
+# runners that lack TensorRT/CUDA while still building the backend target.
+if(VMS_BUILD_AI_WORKER)
+    add_subdirectory(src/ai_worker)
+    # Reuse shared AI inference implementation in backend runtime.
+    target_link_libraries(vms_backend PRIVATE inference)
+endif()
 
 # ─── Controller RBAC lint (configure-time guard) ──────────────────────────
 # Forward-leverage check that catches the `[]`-capture / `auth.validate`
