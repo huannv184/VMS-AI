@@ -2,6 +2,7 @@
 #include "database/audit_repository.h"
 #include "database/db_manager.h"
 #include "utils/api_utils.h"
+#include "utils/csv_writer.h"
 #include "utils/logger.h"
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -54,7 +55,7 @@ void ReportingController::registerRoutes(vms::server::VmsApp& app) {
         auto res = crow::response(csv_content);
         res.add_header("Content-Type", "text/csv; charset=utf-8");
         res.add_header("Content-Disposition", "attachment; filename=" + filename);
-        res.add_header("Access-Control-Allow-Origin", origin);
+        ApiUtils::applyCors(res, origin);
         return res;
     });
 
@@ -99,18 +100,22 @@ std::string ReportingController::formatTrafficToCsv(const std::vector<vms::Traff
     std::stringstream ss;
     ss << "\xEF\xBB\xBF"; // UTF-8 BOM for Excel
     ss << "ID,Camera ID,Vùng (ROI),Hướng,Loại phương tiện,Số lượng,Bắt đầu,Kết thúc,Ngày tạo\n";
-    
+
+    using vms::utils::escapeCsvField;
     for (const auto& row : data) {
         char start_time[32], end_time[32], created_at[32];
         std::strftime(start_time, sizeof(start_time), "%Y-%m-%d %H:%M:%S", std::localtime(&row.period_start));
         std::strftime(end_time, sizeof(end_time), "%Y-%m-%d %H:%M:%S", std::localtime(&row.period_end));
         std::strftime(created_at, sizeof(created_at), "%Y-%m-%d %H:%M:%S", std::localtime(&row.created_at));
 
-        ss << row.id << "," 
+        // All textual columns (direction, vehicle_type) escaped — operator
+        // can name a vehicle class with a comma or formula-trigger and the
+        // CSV still parses + is safe to open in Excel.
+        ss << row.id << ","
            << row.camera_id << ","
            << row.roi_id << ","
-           << row.direction << ","
-           << row.vehicle_type << ","
+           << escapeCsvField(row.direction) << ","
+           << escapeCsvField(row.vehicle_type) << ","
            << row.count << ","
            << start_time << ","
            << end_time << ","
@@ -123,17 +128,22 @@ std::string ReportingController::formatEventsToCsv(const std::vector<vms::Event>
     std::stringstream ss;
     ss << "\xEF\xBB\xBF"; // UTF-8 BOM
     ss << "ID,Camera ID,Loại sự kiện,Mô tả,Thời gian,Đường dẫn video\n";
-    
+
+    using vms::utils::escapeCsvField;
     for (const auto& row : data) {
         char ts[32];
         std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&row.timestamp));
 
-        ss << row.id << "," 
+        // description + event_type + video_path are operator/user-influenced
+        // (event_type from ai_worker class label; description from RuleEngine
+        // template; video_path from filesystem). All three escaped to defend
+        // against CSV injection when opened in Excel.
+        ss << row.id << ","
            << row.camera_id << ","
-           << row.event_type << ","
-           << "\"" << row.description << "\","
+           << escapeCsvField(row.event_type) << ","
+           << escapeCsvField(row.description) << ","
            << ts << ","
-           << row.video_path << "\n";
+           << escapeCsvField(row.video_path) << "\n";
     }
     return ss.str();
 }

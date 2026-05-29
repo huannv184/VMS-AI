@@ -78,6 +78,16 @@ target_include_directories(test_hsts_header PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_hsts_header PRIVATE GTest::gtest GTest::gtest_main)
 add_test(NAME HstsHeaderTests COMMAND test_hsts_header)
 
+# ── CSV escape tests (report export hardening) ────────────────────────────────
+# Pins escapeCsvField against the three failure modes pre-fix
+# reporting_controller hit: (1) `,` / `"` / newline breaking column alignment,
+# (2) `=` / `+` / `-` / `@` triggering Excel formula execution on open, and
+# (3) compound cases. Header-only, no link against backend code.
+add_executable(test_csv_escape test_csv_escape.cpp)
+target_include_directories(test_csv_escape PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_csv_escape PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME CsvEscapeTests COMMAND test_csv_escape)
+
 # ── metrics auth bearer-token gate tests (H9) ────────────────────────────────
 # Pins the policy matrix for /api/v1/metrics: empty token → public, configured
 # token → "Bearer <token>" exact match required, no scheme case variation, no
@@ -339,6 +349,7 @@ if(WIN32)
         HstsHeaderTests
         MetricsAuthTests
         ConfigValidationTests
+        CsvEscapeTests
         DbPortabilityTests
         AttendanceDedupTests
         AttendanceShiftTests
