@@ -223,6 +223,17 @@ public:
     // "loopback" is a convenience alias expanded to 127.0.0.1 + ::1.
     struct SecurityConfig {
         std::vector<std::string> trusted_proxies;
+        // H9: optional bearer token for /api/v1/metrics. Empty (default)
+        // leaves the endpoint JWT-gated like every other /api/* path,
+        // which is unworkable for Prometheus (its bearer_token_file
+        // wants a STATIC token, not a JWT that expires every 8 hours).
+        // Setting this string makes /api/v1/metrics accept a single
+        // static bearer token (constant-time compared) AND nothing else
+        // — JWT path is bypassed for this one route. Env override:
+        // VMS_METRICS_TOKEN. Prometheus side: bearer_token_file pointing
+        // at a single-line file with the same value. See
+        // deploy/prometheus/scrape_config.yml.sample.
+        std::string metrics_token;
     };
 
     // 2026-05-19 BUG-ALERT-CASCADE-POOL-01 phase 2: operator-tunable pool

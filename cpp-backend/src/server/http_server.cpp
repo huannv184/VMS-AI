@@ -37,6 +37,8 @@
 #include <sstream>
 
 #include "utils/rate_limiter.h"
+#include "utils/metrics_auth.h"
+#include "utils/config.h"
 #include "ipc/zmq_event_bridge.h"
 
 namespace vms {
@@ -331,10 +333,31 @@ void HttpServer::registerRoutes() {
 
     // Old hardcoded auth routes replaced by UserController
 
-    // GET /api/v1/metrics — Prometheus scrape endpoint (no auth — restrict via network ACL)
+    // GET /api/v1/metrics — Prometheus scrape endpoint.
+    //
+    // H9: optional static-bearer-token gate. When SecurityConfig::metrics_token
+    // is empty the endpoint stays unauthenticated at the route level —
+    // operators rely on a network ACL (firewall / k8s NetworkPolicy / nginx
+    // location block) for restriction. When the token is configured (yaml
+    // security.metrics_token or VMS_METRICS_TOKEN env), requests must carry
+    // `Authorization: Bearer <token>` matching it (constant-time compared in
+    // isMetricsRequestAuthorized — guards against timing/length oracles).
+    // AuthMiddleware allowlists this path so JWT is bypassed here; the bearer
+    // gate IS the entire auth for this one route.
+    //
+    // Why a separate token vs JWT: Prometheus scrapes every 15-60 s and
+    // expects a static bearer (`bearer_token_file`). A short-lived JWT
+    // would need an external refresher (operationally painful).
     CROW_ROUTE(app_, "/api/v1/metrics")
     .methods(crow::HTTPMethod::Get)
-    ([]() {
+    ([](const crow::request& req) {
+        const auto& token = vms::Config::getInstance().getSecurityConfig().metrics_token;
+        const std::string auth = req.get_header_value("Authorization");
+        if (!vms::utils::isMetricsRequestAuthorized(token, auth)) {
+            crow::response res(401);
+            res.set_header("WWW-Authenticate", "Bearer realm=\"vms-metrics\"");
+            return res;
+        }
         crow::response res(200, buildPrometheusMetrics());
         res.set_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         return res;

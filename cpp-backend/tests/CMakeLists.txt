@@ -78,6 +78,15 @@ target_include_directories(test_hsts_header PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_hsts_header PRIVATE GTest::gtest GTest::gtest_main)
 add_test(NAME HstsHeaderTests COMMAND test_hsts_header)
 
+# ── metrics auth bearer-token gate tests (H9) ────────────────────────────────
+# Pins the policy matrix for /api/v1/metrics: empty token → public, configured
+# token → "Bearer <token>" exact match required, no scheme case variation, no
+# length oracle. Header-only helper — same shape as HstsHeaderTests.
+add_executable(test_metrics_auth test_metrics_auth.cpp)
+target_include_directories(test_metrics_auth PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_metrics_auth PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME MetricsAuthTests COMMAND test_metrics_auth)
+
 # ── jwt purpose isolation tests (SEC-002 regression) ──────────────────────────
 # Links the REAL jwt_utils.cpp + config.cpp + logger.cpp so the test fails if
 # someone refactors away the token_use claim or accepts wrong-purpose tokens.
@@ -312,6 +321,7 @@ if(WIN32)
         ReadinessStateTests
         StorageBackoffTests
         HstsHeaderTests
+        MetricsAuthTests
         DbPortabilityTests
         AttendanceDedupTests
         AttendanceShiftTests

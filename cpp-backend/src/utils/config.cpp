@@ -345,6 +345,23 @@ bool Config::loadFromFile(const std::string& filepath) {
                     }
                 }
             }
+            // H9: optional bearer token for /api/v1/metrics. YAML is the
+            // baseline; the env override below wins if set so prod can keep
+            // the secret out of committed config.
+            if (sec["metrics_token"]) {
+                security_.metrics_token = sec["metrics_token"].as<std::string>(security_.metrics_token);
+            }
+        }
+        // H9: env override for metrics token. Preferred over YAML in prod so
+        // the secret stays out of committed config. Length is logged but not
+        // the value itself.
+        {
+            const auto metrics_token_env = getEnvStr("VMS_METRICS_TOKEN");
+            if (!metrics_token_env.empty()) {
+                security_.metrics_token = metrics_token_env;
+                LOG_INFO("Loaded metrics bearer token from VMS_METRICS_TOKEN env var ({} chars)",
+                         security_.metrics_token.size());
+            }
         }
 
         // Parse logging configuration

@@ -116,6 +116,7 @@ void AuthMiddleware::before_handle(crow::request& req, crow::response& res, cont
         path == "/api/health" ||
         path == "/api/health/live" ||  // liveness probe: orchestrator must hit without creds
         path == "/api/health/ready" || // readiness probe: LB must hit without creds
+        path == "/api/v1/metrics" ||   // H9: gate is route-level bearer token, not JWT
         path == "/api/system/streaming-config") {  // PUBLIC: frontend cần trước khi login
         return;
     }
