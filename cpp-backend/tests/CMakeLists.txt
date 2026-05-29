@@ -87,6 +87,22 @@ target_include_directories(test_metrics_auth PRIVATE ${CMAKE_SOURCE_DIR}/include
 target_link_libraries(test_metrics_auth PRIVATE GTest::gtest GTest::gtest_main)
 add_test(NAME MetricsAuthTests COMMAND test_metrics_auth)
 
+# ── config validation tests (SEC-MINIO + SEC-CORS guards + legacy DB-key compat) ──
+# Pins the fail-fast matrix for storage.driver=minio + default credentials,
+# cors.origins=["*"] + credentials:true, and the legacy flat-key WARN path.
+# Links REAL config.cpp + logger.cpp so the test fails if loader logic drifts.
+add_executable(test_config_validation
+    test_config_validation.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/config.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/logger.cpp)
+target_include_directories(test_config_validation PRIVATE
+    ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_config_validation PRIVATE
+    GTest::gtest GTest::gtest_main
+    spdlog::spdlog
+    yaml-cpp::yaml-cpp)
+add_test(NAME ConfigValidationTests COMMAND test_config_validation)
+
 # ── jwt purpose isolation tests (SEC-002 regression) ──────────────────────────
 # Links the REAL jwt_utils.cpp + config.cpp + logger.cpp so the test fails if
 # someone refactors away the token_use claim or accepts wrong-purpose tokens.
@@ -322,6 +338,7 @@ if(WIN32)
         StorageBackoffTests
         HstsHeaderTests
         MetricsAuthTests
+        ConfigValidationTests
         DbPortabilityTests
         AttendanceDedupTests
         AttendanceShiftTests

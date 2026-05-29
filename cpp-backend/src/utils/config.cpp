@@ -84,6 +84,26 @@ bool Config::loadFromFile(const std::string& filepath) {
                 database_.path = db["path"].as<std::string>(database_.path);
                 database_.sqlite.path = database_.path;
             }
+
+            // Legacy flat keys for back-compat with operator-tuned YAML
+            // pre-nesting. Loader pre-fix only read database.postgresql.*
+            // and database.sqlite.* — operators who tuned the flat shape
+            // (connection_pool_size at top level) saw their config ignored
+            // silently. Honour both shapes; loud WARN nudges operators
+            // toward the nested shape so this back-compat can eventually
+            // be retired.
+            if (db["connection_pool_size"]) {
+                const int legacy = db["connection_pool_size"].as<int>(database_.postgres.pool_size);
+                database_.postgres.pool_size = legacy;
+                LOG_WARN("[config] database.connection_pool_size is deprecated — "
+                         "use database.postgresql.pool_size (applied legacy value: {})", legacy);
+            }
+            if (db["busy_timeout_ms"]) {
+                const int legacy = db["busy_timeout_ms"].as<int>(database_.sqlite.busy_timeout_ms);
+                database_.sqlite.busy_timeout_ms = legacy;
+                LOG_WARN("[config] database.busy_timeout_ms is deprecated — "
+                         "use database.sqlite.busy_timeout_ms (applied legacy value: {})", legacy);
+            }
         }
 
         // Parse storage configuration
@@ -204,7 +224,34 @@ bool Config::loadFromFile(const std::string& filepath) {
                 return false;
             }
         }
-        
+
+        // SEC-MINIO (2026-05-22): mirror the JWT sentinel. If the operator
+        // flipped storage.driver to "minio" but forgot to inject
+        // VMS_MINIO_ACCESS_KEY / VMS_MINIO_SECRET_KEY, the in-memory
+        // defaults from config.h (minioadmin/minioadmin) silently rode
+        // into production. Same failure shape as default JWT — fail-fast
+        // here so the operator notices before exposing the bucket. Env
+        // bypass for local dev (genuinely using a MinIO container with
+        // the same defaults).
+        if (storage_.driver == "minio") {
+            const bool ak_default = (storage_.minio.access_key == "minioadmin");
+            const bool sk_default = (storage_.minio.secret_key == "minioadmin");
+            if (ak_default || sk_default) {
+                const auto allow_default = getEnvStr("VMS_ALLOW_DEFAULT_MINIO_SECRET");
+                if (allow_default == "1") {
+                    LOG_CRITICAL("SEC-MINIO BYPASS ACTIVE: MinIO credentials are still the "
+                                 "factory default (minioadmin). Set VMS_MINIO_ACCESS_KEY + "
+                                 "VMS_MINIO_SECRET_KEY for any non-local deployment.");
+                } else {
+                    LOG_ERROR("Refusing to start: storage.driver=minio but credentials are still "
+                              "the factory default (minioadmin/minioadmin). Set "
+                              "VMS_MINIO_ACCESS_KEY + VMS_MINIO_SECRET_KEY env vars, or set "
+                              "VMS_ALLOW_DEFAULT_MINIO_SECRET=1 for local development only.");
+                    return false;
+                }
+            }
+        }
+
         // Parse CORS configuration
         if (config_["cors"]) {
             auto cors = config_["cors"];
@@ -233,7 +280,38 @@ bool Config::loadFromFile(const std::string& filepath) {
             
             cors_.credentials = cors["credentials"].as<bool>(cors_.credentials);
         }
-        
+
+        // SEC-CORS (2026-05-22): reject the wildcard + credentials combo.
+        // Pre-fix backend.yaml shipped with origins:["*"] + credentials:true
+        // and api_utils::resolveCorsOrigin would reflect the request Origin
+        // — so the browser saw both
+        //   Access-Control-Allow-Origin: <attacker.com>
+        //   Access-Control-Allow-Credentials: true
+        // which is the textbook CSRF goldmine. The W3C spec explicitly
+        // forbids the combination but the runtime did it anyway. Fail-fast
+        // here so misdeploys can't happen silently. Env bypass for the
+        // dev-server-on-localhost case (rare — operator should use
+        // origins:["http://localhost:5173"] instead).
+        if (cors_.enabled && cors_.credentials) {
+            for (const auto& o : cors_.origins) {
+                if (o == "*") {
+                    const auto allow = getEnvStr("VMS_ALLOW_WILDCARD_CORS");
+                    if (allow == "1") {
+                        LOG_CRITICAL("SEC-CORS BYPASS ACTIVE: wildcard origins:[\"*\"] combined with "
+                                     "credentials:true. Browsers may refuse, but reflective servers "
+                                     "echo arbitrary Origin headers — this is a CSRF vector. "
+                                     "Replace cors.origins with an explicit allowlist.");
+                    } else {
+                        LOG_ERROR("Refusing to start: cors.origins contains \"*\" while cors.credentials=true. "
+                                  "Set cors.origins to an explicit allowlist (e.g. [\"https://vms.example.com\"]) "
+                                  "or set VMS_ALLOW_WILDCARD_CORS=1 for local development only.");
+                        return false;
+                    }
+                    break;
+                }
+            }
+        }
+
         // Parse WebSocket configuration
         if (config_["websocket"]) {
             auto ws = config_["websocket"];
