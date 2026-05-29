@@ -33,12 +33,17 @@
 
 #include <filesystem>
 #include <QSqlQuery>
+#include <QSqlError>
 #include <chrono>
 #include <sstream>
 
 #include "utils/rate_limiter.h"
+#include "utils/storage_manager.h"
 #include "utils/metrics_auth.h"
 #include "utils/config.h"
+#include "core/readiness_state.h"
+#include "database/db_state.h"
+#include "events/alert_delivery.h"
 #include "ipc/zmq_event_bridge.h"
 
 namespace vms {
@@ -61,18 +66,37 @@ static std::string buildPrometheusMetrics() {
     out << "vms_db_up " << (db_up ? 1 : 0) << "\n";
 
     // ── cameras ───────────────────────────────────────────────────────────────
+    // Pre-fix this queried `WHERE status='online'` but the cameras schema
+    // has no `status` column (only `is_active` — see db_manager.cpp
+    // initializeTables). The query failed, the empty `catch(...){}` swallowed
+    // the exception, and vms_cameras_active was always 0 → dashboard
+    // appeared "no cameras running" forever. Use is_active (the operator's
+    // intent flag) and surface query failure instead of swallowing.
+    //
+    // Note: is_active is the "configured to be on" flag, not "currently
+    // streaming". A future enhancement could query PipelineStateStore for
+    // true runtime state, but that requires touching the metrics endpoint
+    // hot path with a different lock — defer.
     int total_cameras = 0, active_cameras = 0;
     if (db_up) {
         try {
             QSqlDatabase conn = db.getThreadConnection();
             if (conn.isOpen()) {
                 QSqlQuery q(conn);
-                if (q.exec("SELECT COUNT(*) FROM cameras") && q.next())
+                if (q.exec("SELECT COUNT(*) FROM cameras") && q.next()) {
                     total_cameras = q.value(0).toInt();
-                if (q.exec("SELECT COUNT(*) FROM cameras WHERE status='online'") && q.next())
+                } else {
+                    LOG_WARN("[metrics] cameras total query failed: {}", q.lastError().text().toStdString());
+                }
+                if (q.exec("SELECT COUNT(*) FROM cameras WHERE is_active=1") && q.next()) {
                     active_cameras = q.value(0).toInt();
+                } else {
+                    LOG_WARN("[metrics] cameras active query failed: {}", q.lastError().text().toStdString());
+                }
             }
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            LOG_WARN("[metrics] cameras count exception: {}", e.what());
+        }
     }
     out << "# HELP vms_cameras_total Total registered cameras\n";
     out << "# TYPE vms_cameras_total gauge\n";
@@ -120,6 +144,114 @@ static std::string buildPrometheusMetrics() {
     out << "# HELP vms_zmq_messages_dropped Total ZMQ messages dropped due to invalid JSON or HMAC\n";
     out << "# TYPE vms_zmq_messages_dropped counter\n";
     out << "vms_zmq_messages_dropped " << zmq.getMessagesDropped() << "\n";
+
+    // ── storage (H7) ─────────────────────────────────────────────────────────
+    auto& storage = vms::utils::StorageManager::getInstance();
+    const bool storage_up = storage.isAvailable();
+    const bool storage_required = storage.isRequired();
+    out << "# HELP vms_storage_up Storage backend reachable (1=up, 0=down). Local driver is always 1.\n";
+    out << "# TYPE vms_storage_up gauge\n";
+    out << "vms_storage_up " << (storage_up ? 1 : 0) << "\n";
+    out << "# HELP vms_storage_required Operator policy: 1=fail readiness on outage, 0=degraded-but-serving.\n";
+    out << "# TYPE vms_storage_required gauge\n";
+    out << "vms_storage_required " << (storage_required ? 1 : 0) << "\n";
+
+    // ── readiness (H6 health split — derived from same snapshot the /api/health/ready route uses) ──
+    vms::core::ReadinessSnapshot ready_snap{};
+    ready_snap.db_ready = db_up;
+    ready_snap.storage_ready = storage_up;
+    ready_snap.storage_required = storage_required;
+    const bool ready = vms::core::computeReady(ready_snap);
+    out << "# HELP vms_ready Backend is ready to serve traffic (1=ready, 0=not_ready). Mirrors /api/health/ready.\n";
+    out << "# TYPE vms_ready gauge\n";
+    out << "vms_ready " << (ready ? 1 : 0) << "\n";
+
+    // ── alert delivery pools (per-channel + aggregate) ────────────────────────
+    // Source-of-truth: events::deliveryStats() returns the same JSON shape
+    // operators see on /api/rules/stats.delivery. We re-emit it as Prometheus
+    // gauges/counters so alerts can fire on queue backpressure or drop rate
+    // without hitting the higher-RBAC /api/rules/stats endpoint.
+    try {
+        const auto delivery_json = vms::events::deliveryStats();
+        for (const char* channel : {"webhook", "sms", "telegram", "alarm"}) {
+            const auto& ch = delivery_json[channel];
+            const std::uint64_t cur_q = ch.value("current_queue_depth", static_cast<std::uint64_t>(0));
+            const std::uint64_t max_q = ch.value("max_queue_size", static_cast<std::uint64_t>(0));
+            const std::uint64_t peak_q = ch.value("peak_queue_depth", static_cast<std::uint64_t>(0));
+            const std::uint64_t submitted = ch.value("submitted_total", static_cast<std::uint64_t>(0));
+            const std::uint64_t dropped = ch.value("dropped_total", static_cast<std::uint64_t>(0));
+            out << "vms_alert_delivery_queue_depth{channel=\"" << channel << "\"} " << cur_q << "\n";
+            out << "vms_alert_delivery_queue_capacity{channel=\"" << channel << "\"} " << max_q << "\n";
+            out << "vms_alert_delivery_peak_queue_depth{channel=\"" << channel << "\"} " << peak_q << "\n";
+            out << "vms_alert_delivery_submitted_total{channel=\"" << channel << "\"} " << submitted << "\n";
+            out << "vms_alert_delivery_dropped_total{channel=\"" << channel << "\"} " << dropped << "\n";
+        }
+        out << "# HELP vms_alert_delivery_queue_depth Current queued jobs per channel.\n";
+        out << "# TYPE vms_alert_delivery_queue_depth gauge\n";
+        out << "# HELP vms_alert_delivery_queue_capacity Per-channel queue size (drop threshold).\n";
+        out << "# TYPE vms_alert_delivery_queue_capacity gauge\n";
+        out << "# HELP vms_alert_delivery_peak_queue_depth Peak observed queue depth (high water).\n";
+        out << "# TYPE vms_alert_delivery_peak_queue_depth gauge\n";
+        out << "# HELP vms_alert_delivery_submitted_total Jobs accepted into the per-channel pool.\n";
+        out << "# TYPE vms_alert_delivery_submitted_total counter\n";
+        out << "# HELP vms_alert_delivery_dropped_total Jobs dropped (queue full + not-accepting).\n";
+        out << "# TYPE vms_alert_delivery_dropped_total counter\n";
+    } catch (...) {
+        // deliveryStats() is best-effort here — scrape must not 500 if a
+        // runner is transitioning state mid-scrape.
+    }
+
+    // ── DB batch writer ──────────────────────────────────────────────────────
+    const auto bw = db.batchWriterStats();
+    out << "# HELP vms_db_batch_queue_depth Current event-batch-writer queue depth.\n";
+    out << "# TYPE vms_db_batch_queue_depth gauge\n";
+    out << "vms_db_batch_queue_depth " << bw.current_queue_depth << "\n";
+    out << "# HELP vms_db_batch_peak_queue_depth Peak observed queue depth (high water).\n";
+    out << "# TYPE vms_db_batch_peak_queue_depth gauge\n";
+    out << "vms_db_batch_peak_queue_depth " << bw.peak_queue_depth << "\n";
+    out << "# HELP vms_db_batch_enqueued_total Events accepted into the batch queue.\n";
+    out << "# TYPE vms_db_batch_enqueued_total counter\n";
+    out << "vms_db_batch_enqueued_total " << bw.enqueued_total << "\n";
+    out << "# HELP vms_db_batch_dropped_total Events dropped (queue full or not-accepting).\n";
+    out << "# TYPE vms_db_batch_dropped_total counter\n";
+    out << "vms_db_batch_dropped_total " << bw.dropped_total << "\n";
+    out << "# HELP vms_db_batch_flushed_total Events successfully persisted.\n";
+    out << "# TYPE vms_db_batch_flushed_total counter\n";
+    out << "vms_db_batch_flushed_total " << bw.flushed_total << "\n";
+    out << "# HELP vms_db_batch_flush_failures_total Batch commit failures (transaction aborts).\n";
+    out << "# TYPE vms_db_batch_flush_failures_total counter\n";
+    out << "vms_db_batch_flush_failures_total " << bw.flush_failures_total << "\n";
+    out << "# HELP vms_db_batch_row_failures_total Per-row insert failures (poisoned events).\n";
+    out << "# TYPE vms_db_batch_row_failures_total counter\n";
+    out << "vms_db_batch_row_failures_total " << bw.row_failures_total << "\n";
+
+    // ── WebSocket connection caps + lifecycle ─────────────────────────────────
+    try {
+        const auto ws = vms::streaming::CameraStreamManager::getInstance().connectionStats();
+        out << "# HELP vms_ws_connections_current Active WebSocket connections.\n";
+        out << "# TYPE vms_ws_connections_current gauge\n";
+        out << "vms_ws_connections_current " << ws.connections_current << "\n";
+        out << "# HELP vms_ws_peak_connections Peak concurrent WS connections since boot.\n";
+        out << "# TYPE vms_ws_peak_connections gauge\n";
+        out << "vms_ws_peak_connections " << ws.peak_connections << "\n";
+        out << "# HELP vms_ws_connections_total Total WS connections accepted since boot.\n";
+        out << "# TYPE vms_ws_connections_total counter\n";
+        out << "vms_ws_connections_total " << ws.connections_total << "\n";
+        out << "# HELP vms_ws_authed_total Connections that completed AUTH handshake.\n";
+        out << "# TYPE vms_ws_authed_total counter\n";
+        out << "vms_ws_authed_total " << ws.authed_total << "\n";
+        out << "# HELP vms_ws_auth_failed_total Connections rejected for bad/missing token.\n";
+        out << "# TYPE vms_ws_auth_failed_total counter\n";
+        out << "vms_ws_auth_failed_total " << ws.auth_failed_total << "\n";
+        out << "# HELP vms_ws_conn_cap_rejected_total Connections rejected by accept-time cap (max_connections_*).\n";
+        out << "# TYPE vms_ws_conn_cap_rejected_total counter\n";
+        out << "vms_ws_conn_cap_rejected_total " << ws.conn_cap_rejected_total << "\n";
+        out << "# HELP vms_ws_disconnects_total Lifecycle: total disconnects since boot.\n";
+        out << "# TYPE vms_ws_disconnects_total counter\n";
+        out << "vms_ws_disconnects_total " << ws.disconnects_total << "\n";
+    } catch (...) {
+        // CameraStreamManager may be mid-shutdown; tolerate.
+    }
 
     return out.str();
 }

@@ -1,0 +1,68 @@
+# Prometheus scrape configuration sample for VMS backend `/api/v1/metrics`.
+#
+# Drop this fragment under `scrape_configs:` in prometheus.yml. Tune the
+# `targets:` host:port to match your backend bind. Default backend port is
+# 8000 (config: server.port in backend.yaml).
+#
+# Auth model (chosen at backend boot via SecurityConfig.metrics_token):
+#
+#   1. Network-ACL only (default for dev): leave `security.metrics_token`
+#      unset in backend.yaml and DO NOT set VMS_METRICS_TOKEN. The endpoint
+#      is reachable from anyone who can route to the backend port —
+#      restrict access via firewall / k8s NetworkPolicy / nginx location
+#      block. In this mode, OMIT the `authorization:` block below.
+#
+#   2. Bearer token (recommended for prod): set the same secret on both
+#      sides and bind the backend to loopback behind a reverse proxy.
+#
+#        Backend:    VMS_METRICS_TOKEN=<random-32-bytes-base64>
+#                    (or set security.metrics_token in backend.yaml — env
+#                    wins if both are set; env keeps the secret out of
+#                    committed config).
+#        Prometheus: bearer_token_file pointing at a single-line file
+#                    containing the same value. Mode 0600 + owned by
+#                    the prometheus user.
+#
+# Generate a secret:
+#   openssl rand -base64 32 | tr -d '=' > /etc/prometheus/vms_metrics.token
+#   chmod 600 /etc/prometheus/vms_metrics.token
+#   chown prometheus:prometheus /etc/prometheus/vms_metrics.token
+#
+# Metric families emitted by /api/v1/metrics (as of H9B):
+#   - vms_db_up, vms_db_batch_*       (database state + batch writer)
+#   - vms_cameras_total, vms_cameras_active
+#   - vms_events_24h
+#   - vms_uptime_seconds
+#   - vms_rate_limiter_tracked_entries
+#   - vms_zmq_messages_{received,dropped}
+#   - vms_storage_up, vms_storage_required
+#   - vms_ready
+#   - vms_alert_delivery_{queue_depth,queue_capacity,peak_queue_depth,
+#                        submitted_total,dropped_total}{channel="..."}
+#   - vms_ws_{connections_current,peak_connections,connections_total,
+#             authed_total,auth_failed_total,conn_cap_rejected_total,
+#             disconnects_total}
+#
+# Recommended scrape_interval: 30s. The endpoint runs SELECT COUNT(*) on
+# cameras + events tables on every scrape; sub-15s intervals would add
+# noticeable read load on busy DBs.
+
+- job_name: 'vms-backend'
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  metrics_path: '/api/v1/metrics'
+  scheme: 'https'                          # use 'http' only on localhost
+  authorization:
+    type: 'Bearer'
+    credentials_file: '/etc/prometheus/vms_metrics.token'
+  static_configs:
+    - targets:
+        - 'vms-backend.internal:443'       # adjust to your deploy
+      labels:
+        environment: 'production'
+        service: 'vms-backend'
+  # If the backend is behind a reverse proxy with a self-signed cert
+  # internally, uncomment this block:
+  # tls_config:
+  #   ca_file: '/etc/prometheus/internal-ca.crt'
+  #   server_name: 'vms-backend.internal'
