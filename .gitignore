@@ -52,6 +52,7 @@ CTestTestfile.cmake
 RUN_TESTS.cmake
 install_manifest.txt
 vcpkg_installed/
+Testing/
 
 # Frontend build output
 vms-frontend/dist/
@@ -67,3 +68,4 @@ external_services/minio.exe
 
 # Claude Code settings (local only)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock

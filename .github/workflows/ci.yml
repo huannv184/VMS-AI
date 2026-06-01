@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vms-frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vms-frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  backend:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: cpp-backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: cpp-backend/vcpkg_installed
+          key: ${{ runner.os }}-vcpkg-x64-windows-${{ hashFiles('cpp-backend/vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-x64-windows-
+
+      - name: Configure
+        run: >
+          cmake --preset default
+          -DVMS_BUILD_AI_WORKER=OFF
+
+      - name: Build backend
+        run: >
+          cmake --build build
+          --config Release
+          --target vms_backend
+
+      - name: Run backend tests
+        run: >
+          ctest --test-dir build
+          -C Release
+          --output-on-failure
