@@ -77,6 +77,7 @@ bool Config::loadFromFile(const std::string& filepath) {
                 auto sq = db["sqlite"];
                 database_.sqlite.path = sq["path"].as<std::string>(database_.sqlite.path);
                 database_.sqlite.busy_timeout_ms = sq["busy_timeout_ms"].as<int>(database_.sqlite.busy_timeout_ms);
+                database_.sqlite.wal_checkpoint_seconds = sq["wal_checkpoint_seconds"].as<int>(database_.sqlite.wal_checkpoint_seconds);
             }
             
             // Legacy path support

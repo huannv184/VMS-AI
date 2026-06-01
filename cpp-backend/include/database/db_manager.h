@@ -24,6 +24,15 @@
 namespace vms {
 namespace database {
 
+// 2026-06-01 BUG-DB-WAL-UNBOUNDED-GROWTH-01: pure policy helper, exposed in
+// header so test_wal_checkpoint_policy.cpp can link via header alone. Returns
+// true iff DbManager should spawn the wal_checkpoint thread for the given
+// driver + interval. Postgres has no WAL pragma equivalent; non-positive
+// interval is the "disabled" sentinel.
+inline bool shouldRunWalCheckpoint(const std::string& driver, int seconds) noexcept {
+    return driver == "sqlite" && seconds > 0;
+}
+
 /**
  * @brief Database manager using Qt6 QSqlDatabase
  * Singleton pattern with thread-local connections for safe concurrent access.
@@ -297,6 +306,30 @@ private:
     static constexpr size_t kBatchFlushSize = 50;
     static constexpr int kBatchFlushIntervalMs = 100;
     static constexpr size_t kMaxQueueSize = 10000;
+
+    // ── WAL Checkpoint Thread (SQLite only) ────────────────────────────────
+    // 2026-06-01 BUG-DB-WAL-UNBOUNDED-GROWTH-01: runs PRAGMA wal_checkpoint
+    // (TRUNCATE) every config_.sqlite.wal_checkpoint_seconds. Dedicated thread
+    // with its own QSqlDatabase via getThreadConnection(). Spawned at the end
+    // of init() (after primary + batch writer); joined at the START of close()
+    // BEFORE connection teardown so the thread can never deref a torn-down
+    // connection. Counters are admin-observable via batchWriterStats's
+    // sibling RPC if we wire one — for now they're shutdown log lines.
+    void startWalCheckpoint();
+    void stopWalCheckpoint();
+    void walCheckpointLoop();
+
+    std::thread             wal_checkpoint_thread_;
+    std::mutex              wal_checkpoint_mu_;
+    std::condition_variable wal_checkpoint_cv_;
+    std::atomic<bool>       wal_checkpoint_running_{false};
+
+    // Diagnostics: total = successful TRUNCATE (busy=0, work done);
+    //              busy  = readers held the lock at tick time (file did not shrink);
+    //              fail  = exec error or no connection.
+    std::atomic<std::uint64_t> wal_checkpoint_total_{0};
+    std::atomic<std::uint64_t> wal_checkpoint_busy_{0};
+    std::atomic<std::uint64_t> wal_checkpoint_failures_{0};
 };
 
 // ── RAII Transaction Guard ─────────────────────────────────────────────────

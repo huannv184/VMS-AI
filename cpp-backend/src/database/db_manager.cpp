@@ -150,6 +150,7 @@ bool DbManager::init(const Config::DatabaseConfig& config) {
     initialized_.store(true, std::memory_order_release);
     db_ready.store(true, std::memory_order_release);
     startBatchWriter();
+    startWalCheckpoint();
     return true;
 }
 
@@ -1098,6 +1099,9 @@ void DbManager::initializeTables(QSqlDatabase& primary) {
 }
 
 void DbManager::close() {
+    // Join wal-checkpoint thread BEFORE batch writer + connection teardown so
+    // it cannot deref a torn-down per-thread QSqlDatabase mid-PRAGMA.
+    stopWalCheckpoint();
     stopBatchWriter();
 
     initialized_.store(false, std::memory_order_release);
@@ -1751,6 +1755,117 @@ DbManager::BatchWriterStats DbManager::batchWriterStats() const {
         s.current_queue_depth = event_queue_.size();
     }
     return s;
+}
+
+// ── WAL Checkpoint Thread (SQLite only) ─────────────────────────────────────
+// 2026-06-01 BUG-DB-WAL-UNBOUNDED-GROWTH-01.
+//
+// SQLite's built-in wal_autocheckpoint runs PASSIVE every ~1000 pages (~4MB
+// WAL growth). PASSIVE never shrinks the .wal file — under sustained reader
+// load (analytics, dashboard polls) the WAL keeps growing because PASSIVE
+// can't reclaim space while readers hold a snapshot. TRUNCATE is the only
+// mode that returns space to the filesystem.
+//
+// This thread runs TRUNCATE every wal_checkpoint_seconds. On a busy DB
+// TRUNCATE may return busy=1 (no work done, retry next tick); on a quieter
+// tick it succeeds and the .wal file shrinks. Worst-case behaviour under
+// 100x load: the file grows during sustained writes, shrinks during quiet
+// windows. Operator can lower the interval to checkpoint more aggressively.
+//
+// busy_timeout (set on this thread's own connection) bounds how long TRUNCATE
+// waits for readers before giving up — already 5s by default. Dedicated
+// thread; never blocks the producer hot path.
+void DbManager::startWalCheckpoint() {
+    if (!shouldRunWalCheckpoint(config_.driver, config_.sqlite.wal_checkpoint_seconds)) {
+        LOG_INFO("WalCheckpoint: disabled (driver={}, seconds={})",
+                 config_.driver, config_.sqlite.wal_checkpoint_seconds);
+        return;
+    }
+    if (wal_checkpoint_running_.exchange(true)) return;  // Already running
+    wal_checkpoint_thread_ = std::thread(&DbManager::walCheckpointLoop, this);
+    LOG_INFO("WalCheckpoint: started (interval={}s)",
+             config_.sqlite.wal_checkpoint_seconds);
+}
+
+void DbManager::stopWalCheckpoint() {
+    if (!wal_checkpoint_running_.exchange(false)) return;  // Not running
+    wal_checkpoint_cv_.notify_all();
+    if (wal_checkpoint_thread_.joinable()) {
+        wal_checkpoint_thread_.join();
+    }
+    LOG_INFO("WalCheckpoint: stopped (truncated={}, busy={}, failed={})",
+             wal_checkpoint_total_.load(std::memory_order_relaxed),
+             wal_checkpoint_busy_.load(std::memory_order_relaxed),
+             wal_checkpoint_failures_.load(std::memory_order_relaxed));
+}
+
+void DbManager::walCheckpointLoop() {
+    const auto interval = std::chrono::seconds(
+        config_.sqlite.wal_checkpoint_seconds);
+    LOG_INFO("WalCheckpoint: thread started (interval={}s)", interval.count());
+
+    while (wal_checkpoint_running_.load(std::memory_order_acquire)) {
+        // Wait for either the interval to elapse or shutdown notification.
+        // CV lock is released BEFORE the PRAGMA so it cannot serialise the
+        // shutdown signal behind a long-running TRUNCATE.
+        {
+            std::unique_lock<std::mutex> lk(wal_checkpoint_mu_);
+            wal_checkpoint_cv_.wait_for(lk, interval, [this] {
+                return !wal_checkpoint_running_.load(std::memory_order_acquire);
+            });
+        }
+        if (!wal_checkpoint_running_.load(std::memory_order_acquire)) break;
+
+        try {
+            auto db = getThreadConnection();
+            if (!db.isValid() || !db.isOpen()) {
+                LOG_THROTTLED_WARN(5000,
+                    "WalCheckpoint: no DB connection — skip tick");
+                wal_checkpoint_failures_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            QSqlQuery q(db);
+            // wal_checkpoint(TRUNCATE) result columns:
+            //   0: busy flag (1 = readers held the WAL lock; no work done)
+            //   1: total pages currently in WAL
+            //   2: pages successfully checkpointed
+            if (!q.exec("PRAGMA wal_checkpoint(TRUNCATE)")) {
+                LOG_THROTTLED_WARN(5000,
+                    "WalCheckpoint: PRAGMA exec failed: {}",
+                    q.lastError().text().toStdString());
+                wal_checkpoint_failures_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (q.next()) {
+                const int busy  = q.value(0).toInt();
+                const int total = q.value(1).toInt();
+                const int done  = q.value(2).toInt();
+                if (busy != 0) {
+                    wal_checkpoint_busy_.fetch_add(1, std::memory_order_relaxed);
+                    LOG_THROTTLED_INFO(60000,
+                        "WalCheckpoint: busy — readers hold WAL lock "
+                        "(total_pages={}, checkpointed={})",
+                        total, done);
+                } else {
+                    wal_checkpoint_total_.fetch_add(1, std::memory_order_relaxed);
+                    if (total > 0) {
+                        LOG_THROTTLED_INFO(60000,
+                            "WalCheckpoint: truncated {} of {} pages",
+                            done, total);
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_THROTTLED_WARN(5000, "WalCheckpoint: exception: {}", e.what());
+            wal_checkpoint_failures_.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+            LOG_THROTTLED_WARN(5000, "WalCheckpoint: unknown exception");
+            wal_checkpoint_failures_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    LOG_INFO("WalCheckpoint: thread exiting");
 }
 
 } // namespace database

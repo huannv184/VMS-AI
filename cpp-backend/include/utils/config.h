@@ -41,6 +41,15 @@ public:
         struct SqliteConfig {
             std::string path = "./data/events.db";
             int busy_timeout_ms = 5000;
+            // 2026-06-01 BUG-DB-WAL-UNBOUNDED-GROWTH-01: WAL file recovery cadence.
+            // SQLite's built-in wal_autocheckpoint only does PASSIVE checkpoints
+            // at ~1000 pages (~4MB) and never shrinks the .wal file. Under
+            // continuous reader load (dashboard polling + analytics queries) the
+            // file can grow to GB before a process restart. A dedicated thread
+            // periodically runs PRAGMA wal_checkpoint(TRUNCATE) which is the only
+            // mode that returns space to the OS. Set 0 to disable. SQLite only
+            // (Postgres has no WAL pragma equivalent).
+            int wal_checkpoint_seconds = 60;
         } sqlite;
         
         // Legacy support/alias

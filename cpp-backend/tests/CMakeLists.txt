@@ -169,6 +169,18 @@ target_include_directories(test_db_portability PRIVATE ${CMAKE_SOURCE_DIR}/inclu
 target_link_libraries(test_db_portability PRIVATE GTest::gtest GTest::gtest_main Qt6::Core Qt6::Sql)
 add_test(NAME DbPortabilityTests COMMAND test_db_portability)
 
+# ── WAL checkpoint policy tests (BUG-DB-WAL-UNBOUNDED-GROWTH-01) ─────────────
+# Pins shouldRunWalCheckpoint(driver, seconds) — the gate that decides whether
+# DbManager spawns the periodic PRAGMA wal_checkpoint(TRUNCATE) thread. Header-
+# only inline helper; tests link via header alone without pulling Qt SQL.
+# Locks down: sqlite-only (postgres has its own checkpointer), seconds > 0
+# (0 is the opt-out sentinel), exact case match. See db_manager.h.
+add_executable(test_wal_checkpoint_policy test_wal_checkpoint_policy.cpp)
+target_include_directories(test_wal_checkpoint_policy PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_wal_checkpoint_policy PRIVATE
+    GTest::gtest GTest::gtest_main Qt6::Core Qt6::Sql)
+add_test(NAME WalCheckpointPolicyTests COMMAND test_wal_checkpoint_policy)
+
 # ── attendance dedup tests ────────────────────────────────────────────────────
 # Inline reproduction of AttendanceTracker dedup core (no link against backend
 # code). Exercises packKey collision behaviour, cooldown drop, and resolveKind
@@ -381,6 +393,7 @@ if(WIN32)
         CsvEscapeTests
         ApiUtilsSafeErrorTests
         DbPortabilityTests
+        WalCheckpointPolicyTests
         AttendanceDedupTests
         AttendanceShiftTests
         LineCrossingTests
