@@ -104,5 +104,12 @@ export default defineConfig(({ mode }) => {
       strictPort: true,
       proxy,
     },
+    test: {
+      environment: 'jsdom',
+      globals: true,
+      setupFiles: ['./tests/setup.js'],
+      include: ['tests/**/*.test.{js,jsx}'],
+      css: false,
+    },
   }
 })
