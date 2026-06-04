@@ -181,6 +181,19 @@ target_link_libraries(test_wal_checkpoint_policy PRIVATE
     GTest::gtest GTest::gtest_main Qt6::Core Qt6::Sql)
 add_test(NAME WalCheckpointPolicyTests COMMAND test_wal_checkpoint_policy)
 
+# ── lock contention monitor tests (PSS measurement gate) ─────────────────────
+# Pins WriterGuard / ReaderGuard accounting against a vanilla shared_mutex.
+# Lock-monitor is the primitive PipelineStateStore uses to expose lock_stats
+# via /api/rules/stats.pipeline_state — operators consult it to decide whether
+# per-camera mutex sharding (deferred since 2026-05-15) is worth doing.
+# Header-only — no link against PSS to keep the test target free of Qt + the
+# inference dependency chain. PSS's actual wiring is checked by the main
+# backend compile + integration smoke.
+add_executable(test_lock_monitor test_lock_monitor.cpp)
+target_include_directories(test_lock_monitor PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_lock_monitor PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME LockMonitorTests COMMAND test_lock_monitor)
+
 # ── attendance dedup tests ────────────────────────────────────────────────────
 # Inline reproduction of AttendanceTracker dedup core (no link against backend
 # code). Exercises packKey collision behaviour, cooldown drop, and resolveKind

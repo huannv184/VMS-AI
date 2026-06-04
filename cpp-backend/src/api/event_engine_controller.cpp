@@ -5,6 +5,7 @@
 #include "events/alert_delivery.h"
 #include "events/zone_manager.h"
 #include "database/db_manager.h"
+#include "core/pipeline_state_store.h"
 #include "core/roi_manager.h"
 #include "streaming/camera_stream_manager_qt.h"
 #include "middleware/auth_middleware.h"
@@ -428,6 +429,24 @@ void EventEngineController::registerRoutes(vms::server::VmsApp& app) {
                  {"distinct_ips",            ws.distinct_ips},
                  {"max_connections_global",  ws.max_connections_global},
                  {"max_connections_per_ip",  ws.max_connections_per_ip}
+             };
+             // Merge PipelineStateStore lock-contention counters (2026-06-04
+             // measurement gate). Per-camera mutex sharding has been deferred
+             // "measure first" since 2026-05-15; this snapshot lets operators
+             // check writer/reader contention ratios + max-wait to decide
+             // whether the sharding refactor pays off under their real load.
+             const auto pss = vms::core::PipelineStateStore::getInstance().lockStats();
+             out["pipeline_state"] = {
+                 {"lock_stats", {
+                     {"writer_acquisitions",  pss.writer_acquisitions},
+                     {"writer_contended",     pss.writer_contended},
+                     {"writer_wait_ns_total", pss.writer_wait_ns_total},
+                     {"writer_wait_ns_max",   pss.writer_wait_ns_max},
+                     {"reader_acquisitions",  pss.reader_acquisitions},
+                     {"reader_contended",     pss.reader_contended},
+                     {"reader_wait_ns_total", pss.reader_wait_ns_total},
+                     {"reader_wait_ns_max",   pss.reader_wait_ns_max}
+                 }}
              };
              return ApiUtils::createResponse(out, 200, origin);
         } catch (const std::exception& e) {

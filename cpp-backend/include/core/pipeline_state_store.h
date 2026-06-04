@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/camera_runtime_types.h"
+#include "core/lock_monitor.h"
 #include "inference/tracking.h"
 
 #include <cstdint>
@@ -90,10 +91,18 @@ public:
     nlohmann::json latestMetadata(int camera_id) const;
     std::optional<PipelineStateSnapshot> snapshot(int camera_id) const;
 
+    // 2026-06-04 contention measurement. Each call to a write or read
+    // method increments the matching counter via WriterGuard / ReaderGuard
+    // (see core/lock_monitor.h). The snapshot returned here is consumed by
+    // /api/rules/stats so operators can decide whether per-camera mutex
+    // sharding (deferred since 2026-05-15) is worth the refactor cost.
+    LockStatsSnapshot lockStats() const { return snapshotLockStats(lock_stats_); }
+
 private:
     PipelineStateSnapshot& getOrCreateLocked(int camera_id);
 
     mutable std::shared_mutex mutex_;
+    mutable LockStats lock_stats_;
     std::unordered_map<int, PipelineStateSnapshot> snapshots_;
 };
 

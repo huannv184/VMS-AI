@@ -1,8 +1,6 @@
 #include "core/pipeline_state_store.h"
 #include "core/runtime_state.h"
 
-#include <mutex>
-
 namespace vms::core {
 
 namespace {
@@ -31,7 +29,7 @@ PipelineStateStore& PipelineStateStore::getInstance() {
 
 void PipelineStateStore::registerCamera(int camera_id) {
     if (shuttingDown()) return;
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    WriterGuard lock(mutex_, lock_stats_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.state = CameraState::CONNECTING;
     snapshot.is_running = false;
@@ -42,7 +40,7 @@ void PipelineStateStore::removeCamera(int camera_id) {
     // removeCamera is the cleanup path — must run even during shutdown
     // so per-camera teardown completes (e.g. MediaPipeline::stop calling
     // removeCamera as part of its destructor).
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    WriterGuard lock(mutex_, lock_stats_);
     snapshots_.erase(camera_id);
 }
 
@@ -65,7 +63,7 @@ void PipelineStateStore::updateFrame(int camera_id,
     auto new_objects = std::make_shared<const std::vector<inference::TrackedObject>>(objects);
     auto new_metadata = std::make_shared<const nlohmann::json>(metadata);
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    WriterGuard lock(mutex_, lock_stats_);
     auto& snapshot = getOrCreateLocked(camera_id);
     if (new_jpeg) {
         // Preserve "don't clobber the last good frame with an empty one" —
@@ -81,7 +79,7 @@ void PipelineStateStore::updateMetadata(int camera_id, const nlohmann::json& met
     if (shuttingDown()) return;
     // Build the immutable copy outside the lock — same shape as updateFrame.
     auto new_metadata = std::make_shared<const nlohmann::json>(metadata);
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    WriterGuard lock(mutex_, lock_stats_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.latest_metadata = std::move(new_metadata);
 }
@@ -93,7 +91,7 @@ void PipelineStateStore::updateStats(int camera_id,
                                      CameraState state,
                                      bool is_running) {
     if (shuttingDown()) return;
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    WriterGuard lock(mutex_, lock_stats_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.fps = fps;
     snapshot.restart_count = restart_count;
@@ -107,14 +105,14 @@ void PipelineStateStore::updateStats(int camera_id,
 
 void PipelineStateStore::updateCpuUsage(int camera_id, double percent) {
     if (shuttingDown()) return;
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    WriterGuard lock(mutex_, lock_stats_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.cpu_usage_percent = percent;
 }
 
 void PipelineStateStore::setState(int camera_id, CameraState state, const std::string& last_error) {
     if (shuttingDown()) return;
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    WriterGuard lock(mutex_, lock_stats_);
     auto& snapshot = getOrCreateLocked(camera_id);
     snapshot.state = state;
     snapshot.is_running = (state != CameraState::FAILED);
@@ -132,7 +130,7 @@ std::optional<std::vector<char>> PipelineStateStore::latestFrameJpeg(int camera_
     // Callers that want zero-copy can use latestFrameJpegShared() instead.
     std::shared_ptr<const std::vector<char>> handle;
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        ReaderGuard lock(mutex_, lock_stats_);
         auto it = snapshots_.find(camera_id);
         if (it == snapshots_.end() || !it->second.latest_frame_jpeg ||
             it->second.latest_frame_jpeg->empty()) {
@@ -145,7 +143,7 @@ std::optional<std::vector<char>> PipelineStateStore::latestFrameJpeg(int camera_
 
 std::shared_ptr<const std::vector<char>>
 PipelineStateStore::latestFrameJpegShared(int camera_id) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    ReaderGuard lock(mutex_, lock_stats_);
     auto it = snapshots_.find(camera_id);
     if (it == snapshots_.end()) return nullptr;
     return it->second.latest_frame_jpeg;
@@ -154,7 +152,7 @@ PipelineStateStore::latestFrameJpegShared(int camera_id) const {
 std::vector<inference::TrackedObject> PipelineStateStore::latestObjects(int camera_id) const {
     std::shared_ptr<const std::vector<inference::TrackedObject>> handle;
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        ReaderGuard lock(mutex_, lock_stats_);
         auto it = snapshots_.find(camera_id);
         if (it == snapshots_.end() || !it->second.latest_objects) {
             return {};
@@ -171,7 +169,7 @@ nlohmann::json PipelineStateStore::latestMetadata(int camera_id) const {
     // nlohmann::json's value semantics are baked into the call sites).
     std::shared_ptr<const nlohmann::json> handle;
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        ReaderGuard lock(mutex_, lock_stats_);
         auto it = snapshots_.find(camera_id);
         if (it == snapshots_.end() || !it->second.latest_metadata) {
             return nlohmann::json::object();
@@ -182,7 +180,7 @@ nlohmann::json PipelineStateStore::latestMetadata(int camera_id) const {
 }
 
 std::optional<PipelineStateSnapshot> PipelineStateStore::snapshot(int camera_id) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    ReaderGuard lock(mutex_, lock_stats_);
     auto it = snapshots_.find(camera_id);
     if (it == snapshots_.end()) {
         return std::nullopt;
